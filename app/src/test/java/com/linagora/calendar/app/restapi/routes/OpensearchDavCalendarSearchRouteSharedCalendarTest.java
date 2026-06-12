@@ -60,6 +60,7 @@ import com.linagora.calendar.restapi.RestApiServerProbe;
 import com.linagora.calendar.storage.CalendarURL;
 import com.linagora.calendar.storage.OpenPaaSId;
 import com.linagora.calendar.storage.OpenPaaSUser;
+import com.linagora.calendar.storage.eventsearch.EventUid;
 import com.linagora.calendar.storage.model.Resource;
 
 import io.restassured.RestAssured;
@@ -143,7 +144,7 @@ class OpensearchDavCalendarSearchRouteSharedCalendarTest {
     void searchShouldReturnSourceCalendarEventForSubscribedCalendar() {
         // Given Alice owns a readable source calendar Alice/Alice containing an indexed event.
         CalendarURL sourceCalendar = CalendarURL.from(alice.id());
-        String eventUid = "event-subscription-" + UUID.randomUUID();
+        EventUid eventUid = new EventUid("event-subscription-" + UUID.randomUUID());
         String summary = "subscribed searchable event " + UUID.randomUUID();
         davTestHelper.upsertCalendar(alice, generateCalendarData(eventUid, summary, alice), eventUid);
         calDavClient.updateCalendarAcl(alice.username(), sourceCalendar, CalDavClient.PublicRight.READ).block();
@@ -167,8 +168,8 @@ class OpensearchDavCalendarSearchRouteSharedCalendarTest {
                 .statusCode(200)
                 .contentType(ContentType.JSON)
                 .body("_total_hits", equalTo(1))
-                .body("_embedded.events._links.self.href", contains(expectedHref(sourceCalendar, eventUid)))
-                .body("_embedded.events.data.uid", contains(eventUid))
+                .body("_embedded.events._links.self.href", contains(sourceCalendar.asUri().toASCIIString() + "/" + eventUid.value() + ".ics"))
+                .body("_embedded.events.data.uid", contains(eventUid.value()))
                 .body("_embedded.events.data.userId", contains(sourceCalendar.base().value()))
                 .body("_embedded.events.data.calendarId", contains(sourceCalendar.calendarId().value()))));
     }
@@ -177,7 +178,7 @@ class OpensearchDavCalendarSearchRouteSharedCalendarTest {
     void searchShouldReturnSourceCalendarEventForDelegatedCalendar() {
         // Given Alice delegates her source calendar Alice/Alice containing an indexed event to Bob.
         CalendarURL sourceCalendar = CalendarURL.from(alice.id());
-        String eventUid = "event-delegation-" + UUID.randomUUID();
+        EventUid eventUid = new EventUid("event-delegation-" + UUID.randomUUID());
         String summary = "delegated searchable event " + UUID.randomUUID();
         davTestHelper.upsertCalendar(alice, generateCalendarData(eventUid, summary, alice), eventUid);
         davTestHelper.grantDelegation(alice, sourceCalendar, bob, "dav:read");
@@ -193,8 +194,8 @@ class OpensearchDavCalendarSearchRouteSharedCalendarTest {
                 .statusCode(200)
                 .contentType(ContentType.JSON)
                 .body("_total_hits", equalTo(1))
-                .body("_embedded.events._links.self.href", contains(expectedHref(sourceCalendar, eventUid)))
-                .body("_embedded.events.data.uid", contains(eventUid))
+                .body("_embedded.events._links.self.href", contains(sourceCalendar.asUri().toASCIIString() + "/" + eventUid.value() + ".ics"))
+                .body("_embedded.events.data.uid", contains(eventUid.value()))
                 .body("_embedded.events.data.userId", contains(sourceCalendar.base().value()))
                 .body("_embedded.events.data.calendarId", contains(sourceCalendar.calendarId().value()))));
     }
@@ -203,7 +204,7 @@ class OpensearchDavCalendarSearchRouteSharedCalendarTest {
     void searchShouldFilterPrivateSourceCalendarForOtherUser() {
         // Given Alice owns a private source calendar Alice/Alice containing an indexed event.
         CalendarURL sourceCalendar = CalendarURL.from(alice.id());
-        String eventUid = "event-private-" + UUID.randomUUID();
+        EventUid eventUid = new EventUid("event-private-" + UUID.randomUUID());
         String summary = "private searchable event " + UUID.randomUUID();
         davTestHelper.upsertCalendar(alice, generateCalendarData(eventUid, summary, alice), eventUid);
         calDavClient.updateCalendarAcl(alice.username(), sourceCalendar, CalDavClient.PublicRight.HIDE_ALL_EVENT).block();
@@ -219,8 +220,8 @@ class OpensearchDavCalendarSearchRouteSharedCalendarTest {
             .statusCode(200)
             .contentType(ContentType.JSON)
             .body("_total_hits", equalTo(1))
-            .body("_embedded.events._links.self.href", contains(expectedHref(sourceCalendar, eventUid)))
-            .body("_embedded.events.data.uid", contains(eventUid)));
+            .body("_embedded.events._links.self.href", contains(sourceCalendar.asUri().toASCIIString() + "/" + eventUid.value() + ".ics"))
+            .body("_embedded.events.data.uid", contains(eventUid.value())));
 
         // When Bob searches Alice's private source calendar.
         // Then the route filters the unreadable calendar and returns no event.
@@ -238,7 +239,7 @@ class OpensearchDavCalendarSearchRouteSharedCalendarTest {
     void searchShouldReturnEmptyWhenRequestedCalendarListIsEmpty() {
         // Given Alice owns an indexed event in her default calendar Alice/Alice.
         CalendarURL sourceCalendar = CalendarURL.from(alice.id());
-        String eventUid = "event-empty-calendar-list-" + UUID.randomUUID();
+        EventUid eventUid = new EventUid("event-empty-calendar-list-" + UUID.randomUUID());
         String summary = "empty calendar list searchable event " + UUID.randomUUID();
         davTestHelper.upsertCalendar(alice, generateCalendarData(eventUid, summary, alice), eventUid);
 
@@ -252,7 +253,7 @@ class OpensearchDavCalendarSearchRouteSharedCalendarTest {
             .statusCode(200)
             .contentType(ContentType.JSON)
             .body("_total_hits", equalTo(1))
-            .body("_embedded.events.data.uid", contains(eventUid)));
+            .body("_embedded.events.data.uid", contains(eventUid.value())));
 
         // When Alice searches all terms with an empty requested calendar list.
         // Then the route returns no result instead of searching every source calendar.
@@ -277,7 +278,7 @@ class OpensearchDavCalendarSearchRouteSharedCalendarTest {
     void searchShouldFilterSubscribedCalendarEventAfterPublicReadRevoke() {
         // Given Alice owns a public readable source calendar Alice/Alice containing an indexed event.
         CalendarURL sourceCalendar = CalendarURL.from(alice.id());
-        String eventUid = "event-subscription-revoked-" + UUID.randomUUID();
+        EventUid eventUid = new EventUid("event-subscription-revoked-" + UUID.randomUUID());
         String summary = "revoked subscription searchable event " + UUID.randomUUID();
         davTestHelper.upsertCalendar(alice, generateCalendarData(eventUid, summary, alice), eventUid);
         calDavClient.updateCalendarAcl(alice.username(), sourceCalendar, CalDavClient.PublicRight.READ).block();
@@ -300,8 +301,8 @@ class OpensearchDavCalendarSearchRouteSharedCalendarTest {
             .statusCode(200)
             .contentType(ContentType.JSON)
             .body("_total_hits", equalTo(1))
-            .body("_embedded.events._links.self.href", contains(expectedHref(sourceCalendar, eventUid)))
-            .body("_embedded.events.data.uid", contains(eventUid)));
+            .body("_embedded.events._links.self.href", contains(sourceCalendar.asUri().toASCIIString() + "/" + eventUid.value() + ".ics"))
+            .body("_embedded.events.data.uid", contains(eventUid.value())));
 
         calDavClient.updateCalendarAcl(alice.username(), sourceCalendar, CalDavClient.PublicRight.HIDE_ALL_EVENT).block();
 
@@ -328,10 +329,10 @@ class OpensearchDavCalendarSearchRouteSharedCalendarTest {
             "#123456",
             "Delegated source calendar for search test")).block();
 
-        String eventUid = "event-delegation-revoked-" + UUID.randomUUID();
+        EventUid eventUid = new EventUid("event-delegation-revoked-" + UUID.randomUUID());
         String summary = "revoked delegation searchable event " + UUID.randomUUID();
         davTestHelper.upsertCalendar(alice.username(),
-            URI.create(sourceCalendar.asUri().toASCIIString() + "/" + eventUid + ".ics"),
+            URI.create(sourceCalendar.asUri().toASCIIString() + "/" + eventUid.value() + ".ics"),
             generateCalendarData(eventUid, summary, alice)).block();
         davTestHelper.grantDelegation(alice, sourceCalendar, bob, "dav:read");
         CalendarURL delegatedCalendar = findMirrorCalendar(bob);
@@ -345,8 +346,8 @@ class OpensearchDavCalendarSearchRouteSharedCalendarTest {
             .statusCode(200)
             .contentType(ContentType.JSON)
             .body("_total_hits", equalTo(1))
-            .body("_embedded.events._links.self.href", contains(expectedHref(sourceCalendar, eventUid)))
-            .body("_embedded.events.data.uid", contains(eventUid)));
+            .body("_embedded.events._links.self.href", contains(sourceCalendar.asUri().toASCIIString() + "/" + eventUid.value() + ".ics"))
+            .body("_embedded.events.data.uid", contains(eventUid.value())));
 
         davTestHelper.revokeDelegation(alice, sourceCalendar, bob);
 
@@ -368,7 +369,7 @@ class OpensearchDavCalendarSearchRouteSharedCalendarTest {
         Resource resource = server.getProbe(ResourceProbe.class)
             .save(alice, "search admin resource " + UUID.randomUUID(), "projector", List.of());
         CalendarURL resourceCalendar = CalendarURL.from(resource.id().asOpenPaaSId());
-        String eventUid = "event-resource-admin-" + UUID.randomUUID();
+        EventUid eventUid = new EventUid("event-resource-admin-" + UUID.randomUUID());
         String summary = "resource admin searchable event " + UUID.randomUUID();
         calDavClient.grantReadWriteRights(resource.domain(), resource.id(), List.of(bob.username())).block();
         davTestHelper.upsertCalendar(alice, generateCalendarData(eventUid, summary, alice, resource), eventUid);
@@ -385,8 +386,8 @@ class OpensearchDavCalendarSearchRouteSharedCalendarTest {
             .statusCode(200)
             .contentType(ContentType.JSON)
             .body("_total_hits", equalTo(1))
-            .body("_embedded.events._links.self.href", contains(expectedHref(resourceCalendar, resourceEventId)))
-            .body("_embedded.events.data.uid", contains(eventUid))
+            .body("_embedded.events._links.self.href", contains(resourceCalendar.asUri().toASCIIString() + "/" + resourceEventId + ".ics"))
+            .body("_embedded.events.data.uid", contains(eventUid.value()))
             .body("_embedded.events.data.userId", contains(resourceCalendar.base().value()))
             .body("_embedded.events.data.calendarId", contains(resourceCalendar.calendarId().value())));
     }
@@ -397,7 +398,7 @@ class OpensearchDavCalendarSearchRouteSharedCalendarTest {
         Resource resource = server.getProbe(ResourceProbe.class)
             .save(alice, "search subscribed resource " + UUID.randomUUID(), "projector", List.of());
         CalendarURL resourceCalendar = CalendarURL.from(resource.id().asOpenPaaSId());
-        String eventUid = "event-resource-subscription-" + UUID.randomUUID();
+        EventUid eventUid = new EventUid("event-resource-subscription-" + UUID.randomUUID());
         String summary = "resource subscription searchable event " + UUID.randomUUID();
         davTestHelper.upsertCalendar(alice, generateCalendarData(eventUid, summary, alice, resource), eventUid);
         String resourceEventId = awaitAtMost.until(
@@ -422,13 +423,13 @@ class OpensearchDavCalendarSearchRouteSharedCalendarTest {
             .statusCode(200)
             .contentType(ContentType.JSON)
             .body("_total_hits", equalTo(1))
-            .body("_embedded.events._links.self.href", contains(expectedHref(resourceCalendar, resourceEventId)))
-            .body("_embedded.events.data.uid", contains(eventUid))
+            .body("_embedded.events._links.self.href", contains(resourceCalendar.asUri().toASCIIString() + "/" + resourceEventId + ".ics"))
+            .body("_embedded.events.data.uid", contains(eventUid.value()))
             .body("_embedded.events.data.userId", contains(resourceCalendar.base().value()))
             .body("_embedded.events.data.calendarId", contains(resourceCalendar.calendarId().value())));
     }
 
-    private String generateCalendarData(String eventUid, String summary, OpenPaaSUser organizer) {
+    private String generateCalendarData(EventUid eventUid, String summary, OpenPaaSUser organizer) {
         return """
             BEGIN:VCALENDAR\r
             VERSION:2.0\r
@@ -445,12 +446,12 @@ class OpensearchDavCalendarSearchRouteSharedCalendarTest {
             DTSTAMP:20251231T100000Z\r
             END:VEVENT\r
             END:VCALENDAR\r
-            """.replace("{eventUid}", eventUid)
+            """.replace("{eventUid}", eventUid.value())
             .replace("{summary}", summary)
             .replace("{organizer}", organizer.username().asString());
     }
 
-    private String generateCalendarData(String eventUid, String summary, OpenPaaSUser organizer, Resource resource) {
+    private String generateCalendarData(EventUid eventUid, String summary, OpenPaaSUser organizer, Resource resource) {
         String resourceEmail = Username.fromLocalPartWithDomain(resource.id().value(), organizer.username().getDomainPart().orElseThrow()).asString();
 
         return """
@@ -471,7 +472,7 @@ class OpensearchDavCalendarSearchRouteSharedCalendarTest {
             DTSTAMP:20251231T100000Z\r
             END:VEVENT\r
             END:VCALENDAR\r
-            """.replace("{eventUid}", eventUid)
+            """.replace("{eventUid}", eventUid.value())
             .replace("{summary}", summary)
             .replace("{organizer}", organizer.username().asString())
             .replace("{resource}", resourceEmail);
@@ -498,10 +499,4 @@ class OpensearchDavCalendarSearchRouteSharedCalendarTest {
             """.formatted(calendarURL.base().value(), calendarURL.calendarId().value(), query);
     }
 
-    private String expectedHref(CalendarURL calendarURL, String eventUid) {
-        return "/calendars/%s/%s/%s.ics".formatted(
-            calendarURL.base().value(),
-            calendarURL.calendarId().value(),
-            eventUid);
-    }
 }
