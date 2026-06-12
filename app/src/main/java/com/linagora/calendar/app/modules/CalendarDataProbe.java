@@ -33,7 +33,6 @@ import org.apache.james.domainlist.api.DomainList;
 import org.apache.james.mailbox.MailboxSession;
 import org.apache.james.user.api.UsersRepository;
 import org.apache.james.utils.GuiceProbe;
-import org.apache.james.vacation.api.AccountId;
 import org.awaitility.Awaitility;
 import org.awaitility.Durations;
 import org.awaitility.core.ConditionFactory;
@@ -176,24 +175,21 @@ public class CalendarDataProbe implements GuiceProbe {
     }
 
     public void indexCalendar(Username username, CalendarEvents calendarEvents) {
-        AccountId accountId = AccountId.fromUsername(username);
-        calendarSearchService.index(accountId, calendarEvents).block();
+        calendarSearchService.index(calendarEvents).block();
 
-        CALMLY_AWAIT.until(() -> !calendarSearchService.search(accountId,
-                new EventSearchQuery(calendarEvents.events().iterator().next().summary(), Optional.empty(),
-                    Optional.empty(), Optional.empty(),
-                    MAX_LIMIT, 0))
+        CALMLY_AWAIT.until(() -> !calendarSearchService.search(
+                simpleQuery(calendarEvents.events().iterator().next().summary(), calendarEvents.calendarURL()))
             .collectList().block().isEmpty());
     }
 
     public List<EventFields> searchEvents(Username username, String query) {
-        AccountId accountId = AccountId.fromUsername(username);
-        return calendarSearchService.search(accountId, simpleQuery(query))
+        CalendarURL calendarURL = CalendarURL.from(usersDAO.retrieve(username).block().id());
+        return calendarSearchService.search(simpleQuery(query, calendarURL))
             .collectList().block();
     }
 
-    private EventSearchQuery simpleQuery(String query) {
-        return new EventSearchQuery(query, Optional.empty(),
+    private EventSearchQuery simpleQuery(String query, CalendarURL calendarURL) {
+        return new EventSearchQuery(query, Optional.of(List.of(calendarURL)),
             Optional.empty(), Optional.empty(),
             MAX_LIMIT, 0);
     }
