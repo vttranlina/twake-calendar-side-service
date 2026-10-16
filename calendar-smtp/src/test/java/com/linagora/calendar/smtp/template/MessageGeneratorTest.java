@@ -19,8 +19,12 @@
 package com.linagora.calendar.smtp.template;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.mockito.ArgumentMatchers.anyMap;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.when;
 
 import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
@@ -43,6 +47,8 @@ import org.apache.james.mime4j.message.DefaultMessageBuilder;
 import org.apache.james.mime4j.message.DefaultMessageWriter;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import com.google.common.collect.ImmutableMap;
 import com.linagora.calendar.smtp.i18n.I18NTranslator;
@@ -94,20 +100,49 @@ class MessageGeneratorTest {
 
     @Test
     void textAlternativeShouldBeRenderedFromTextTemplate() throws Exception {
-        Message message = reparse(generate(textBodyRenderer(), List.of()));
+        Message generated = generate(textBodyRenderer(), List.of());
+        assertThat(new String(DefaultMessageWriter.asBytes(generated), StandardCharsets.US_ASCII))
+            .doesNotContainPattern("(?<!\\r)\\n|\\r(?!\\n)");
+        Message message = reparse(generated);
 
         Entity textPart = multipart(multipart(message).getBodyParts().getFirst()).getBodyParts().getFirst();
 
         assertThat(textPart.getCharset()).isEqualTo("UTF-8");
         assertThat(textPart.getHeader().getField("Content-Language").getBody()).isEqualTo("en");
         assertThat(IOUtils.toString(((TextBody) textPart.getBody()).getReader()))
-            .isEqualToNormalizingNewlines("""
+            .isEqualTo("""
                 Import Report
 
                 Your Import is done see below the report :
                 - 9 Contact(s) imported successfully
                 - 0 Contact(s) not imported
-                """);
+                """.replace("\n", "\r\n"));
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"\n", "\r\n", "\r"})
+    void textAlternativeShouldPreserveWhitespaceAndUnicodeWithCanonicalLineBreaks(String newline) throws Exception {
+        String text = "Notes: café & <meeting> " + newline + "Bring snacks.\t" + newline
+            + "https://calendar.example.com/event/" + "a".repeat(120) + "?yes=1&lang=fr" + newline;
+        TextBodyRenderer renderer = mock(TextBodyRenderer.class);
+        when(renderer.render(anyMap())).thenReturn(text);
+
+        Message generated = generate(Optional.of(renderer), List.of());
+        Multipart alternative = multipart(multipart(generated).getBodyParts().getFirst());
+        Entity textPart = alternative.getBodyParts().getFirst();
+        ByteArrayOutputStream output = new ByteArrayOutputStream();
+        new DefaultMessageWriter().writeEntity(textPart, output);
+        String encodedPart = output.toString(StandardCharsets.US_ASCII);
+
+        assertThat(encodedPart)
+            .doesNotContainPattern("(?<!\\r)\\n|\\r(?!\\n)")
+            .contains("=20\r\n", "=09\r\n");
+        String encodedBody = encodedPart.substring(encodedPart.indexOf("\r\n\r\n") + 4);
+        assertThat(encodedBody.split("\r\n"))
+            .allSatisfy(line -> assertThat(line.length()).isLessThanOrEqualTo(76));
+        Entity decodedTextPart = multipart(multipart(reparse(generated)).getBodyParts().getFirst()).getBodyParts().getFirst();
+        assertThat(IOUtils.toString(((TextBody) decodedTextPart.getBody()).getReader()))
+            .isEqualTo(text.replace(newline, "\r\n"));
     }
 
     @Test

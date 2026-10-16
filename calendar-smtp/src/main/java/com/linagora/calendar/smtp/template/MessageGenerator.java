@@ -21,6 +21,7 @@ package com.linagora.calendar.smtp.template;
 import java.io.File;
 import java.io.FileNotFoundException;
 import java.io.IOException;
+import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.nio.file.Paths;
@@ -34,12 +35,15 @@ import java.util.concurrent.ExecutionException;
 
 import jakarta.mail.internet.InternetAddress;
 
+import org.apache.commons.io.IOUtils;
 import org.apache.commons.lang3.StringUtils;
 import org.apache.james.core.Domain;
 import org.apache.james.core.MailAddress;
 import org.apache.james.core.Username;
 import org.apache.james.filesystem.api.FileSystem;
 import org.apache.james.mime4j.dom.Message;
+import org.apache.james.mime4j.io.EOLConvertingInputStream;
+import org.apache.james.mime4j.io.InputStreams;
 import org.apache.james.mime4j.message.BodyPart;
 import org.apache.james.mime4j.message.BodyPartBuilder;
 import org.apache.james.mime4j.message.MultipartBuilder;
@@ -187,7 +191,7 @@ public class MessageGenerator {
             BodyPart htmlBodyPart = textualBodyPart(htmlBodyRenderer.render(scopedVariableFinal), "html", "base64");
             Optional<BodyPart> textBodyPart = textBodyRenderer
                 .map(renderer -> renderer.render(scopedVariableFinal))
-                .map(Throwing.function((String text) -> textualBodyPart(text, "plain", "quoted-printable")).sneakyThrow());
+                .map(Throwing.function(this::plainBodyPart).sneakyThrow());
 
             MultipartBuilder multipartBuilder = buildMultipart(htmlBodyPart, textBodyPart, mimeAttachments);
 
@@ -202,6 +206,13 @@ public class MessageGenerator {
                 .setTo(recipient.toString())
                 .build();
         });
+    }
+
+    private BodyPart plainBodyPart(String content) throws IOException {
+        // Canonicalize before quoted-printable encoding (RFC 2046 section 4.1.1), including trailing whitespace handling.
+        try (InputStream canonicalText = new EOLConvertingInputStream(InputStreams.create(content, StandardCharsets.UTF_8))) {
+            return textualBodyPart(IOUtils.toString(canonicalText, StandardCharsets.UTF_8), "plain", "quoted-printable");
+        }
     }
 
     private BodyPart textualBodyPart(String content, String subtype, String transferEncoding) throws IOException {
