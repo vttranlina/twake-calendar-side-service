@@ -47,6 +47,7 @@ import org.apache.james.mime4j.io.InputStreams;
 import org.apache.james.mime4j.message.BodyPart;
 import org.apache.james.mime4j.message.BodyPartBuilder;
 import org.apache.james.mime4j.message.MultipartBuilder;
+import org.apache.james.mime4j.stream.NameValuePair;
 import org.apache.james.mime4j.stream.RawField;
 
 import com.github.fge.lambdas.Throwing;
@@ -254,6 +255,8 @@ public class MessageGenerator {
             return htmlBodyPart;
         }
         MultipartBuilder related = MultipartBuilder.create(MULTIPART_RELATED)
+            // RFC 2387 requires the root media type; without a start parameter the first part is the root.
+            .addContentTypeParameter(new NameValuePair("type", htmlBodyPart.getMimeType()))
             .addBodyPart(htmlBodyPart);
         inlineAttachments.forEach(Throwing.consumer(attachment -> related.addBodyPart(attachment.asBodyPart())));
         return asBodyPart(related);

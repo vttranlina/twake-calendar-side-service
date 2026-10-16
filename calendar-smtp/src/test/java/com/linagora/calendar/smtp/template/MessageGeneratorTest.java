@@ -43,6 +43,7 @@ import org.apache.james.mime4j.dom.Entity;
 import org.apache.james.mime4j.dom.Message;
 import org.apache.james.mime4j.dom.Multipart;
 import org.apache.james.mime4j.dom.TextBody;
+import org.apache.james.mime4j.dom.field.ContentTypeField;
 import org.apache.james.mime4j.message.DefaultMessageBuilder;
 import org.apache.james.mime4j.message.DefaultMessageWriter;
 import org.junit.jupiter.api.BeforeEach;
@@ -163,6 +164,8 @@ class MessageGeneratorTest {
         assertThat(related.getBodyParts())
             .extracting(Entity::getMimeType)
             .containsExactly("text/html", "image/png");
+        ContentTypeField relatedContentType = (ContentTypeField) related.getParent().getHeader().getField("Content-Type");
+        assertThat(relatedContentType.getParameter("type")).isEqualTo("text/html");
     }
 
     @Test
@@ -178,6 +181,8 @@ class MessageGeneratorTest {
         assertThat(related.getBodyParts())
             .extracting(Entity::getMimeType)
             .containsExactly("text/html", "image/png");
+        ContentTypeField relatedContentType = (ContentTypeField) related.getParent().getHeader().getField("Content-Type");
+        assertThat(relatedContentType.getParameter("type")).isEqualTo("text/html");
     }
 
     private Optional<TextBodyRenderer> textBodyRenderer() throws IOException {
