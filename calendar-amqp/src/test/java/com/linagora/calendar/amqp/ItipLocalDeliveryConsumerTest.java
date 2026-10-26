@@ -562,6 +562,61 @@ public class ItipLocalDeliveryConsumerTest {
     }
 
     @Test
+    void shouldPublishInvitationWhenSingleEventBecomesRecurring() throws Exception {
+        when(localRecipientResolver.resolve(Username.of(ALICE)))
+            .thenReturn(Mono.just(Optional.of(new LocalRecipientResolver.ResolvedRecipient.LocalUser(new OpenPaaSId(LOCAL_USER_ID)))));
+        stubItipNoContent();
+        declareQueueBoundToExchange(EventEmailConsumer.EXCHANGE_NAME, testEmailQueue);
+        List<JsonNode> emailMessages = consumeJsonMessages(testEmailQueue);
+
+        String recurringIcal = """
+            BEGIN:VCALENDAR
+            VERSION:2.0
+            PRODID:-//Test//Test//EN
+            METHOD:REQUEST
+            BEGIN:VEVENT
+            UID:{UID}
+            SUMMARY:Test Meeting
+            DTSTART;TZID=Europe/Paris:20260401T100000
+            DTEND;TZID=Europe/Paris:20260401T110000
+            RRULE:FREQ=WEEKLY;COUNT=3
+            ORGANIZER:mailto:{ORGANIZER}
+            ATTENDEE;PARTSTAT=NEEDS-ACTION:mailto:{ATTENDEE}
+            END:VEVENT
+            END:VCALENDAR
+            """
+            .replace("{UID}", EVENT_UID)
+            .replace("{ORGANIZER}", BOB)
+            .replace("{ATTENDEE}", ALICE);
+        String payload = """
+            {
+              "sender": "mailto:%s",
+              "method": "REQUEST",
+              "uid": "%s",
+              "calendarId": "%s",
+              "message": %s,
+              "oldMessage": %s,
+              "hasChange": true,
+              "recipients": ["mailto:%s"]
+            }
+            """.formatted(BOB, EVENT_UID, CALENDAR_ID, jsonString(recurringIcal), jsonString(SIMPLE_ICAL), ALICE);
+
+        publishToConsumer(payload);
+
+        AWAIT_AT_MOST.untilAsserted(() -> {
+            WireMock.verify(WireMock.postRequestedFor(WireMock.urlEqualTo("/itip"))
+                .withRequestBody(WireMock.matchingJsonPath("$.recipient", WireMock.equalTo(ALICE))));
+            assertThat(emailMessages).singleElement().satisfies(emailPayload -> {
+                assertThat(emailPayload.at("/recipientEmail").asText()).isEqualTo(ALICE);
+                assertThat(emailPayload.at("/method").asText()).isEqualTo("REQUEST");
+                assertThat(emailPayload.at("/isNewEvent").asBoolean()).isTrue();
+                assertThat(emailPayload.at("/event").asText()).isEqualTo(recurringIcal);
+            });
+        });
+        assertThat(channel.basicGet(ItipLocalDeliveryConsumer.DEAD_LETTER_QUEUE, true)).isNull();
+    }
+
+    @Test
     void shouldRouteToDeadLetterWhenItipReturns5xx() {
         when(localRecipientResolver.resolve(Username.of(ALICE)))
             .thenReturn(Mono.just(Optional.of(new LocalRecipientResolver.ResolvedRecipient.LocalUser(new OpenPaaSId(LOCAL_USER_ID)))));
