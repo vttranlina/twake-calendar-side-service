@@ -184,6 +184,8 @@ class ItipEmailNotificationPublisher {
                 case Method.VALUE_REPLY ->
                     buildNotificationsByOccurrence(localDelivery, eventPath, newCalendar, !MARK_AS_NEW_EVENT);
                 case Method.VALUE_REQUEST -> oldCalendar
+                    // A single event becoming a series needs invitations even when only RRULE changed.
+                    .filter(EventParseUtils::isRecurringEvent)
                     .map(old -> buildDiffWithCancellations(localDelivery, eventPath, newCalendar, old))
                     .orElseGet(() -> buildNotificationsByOccurrence(localDelivery, eventPath, newCalendar, MARK_AS_NEW_EVENT));
                 default -> oldCalendar
