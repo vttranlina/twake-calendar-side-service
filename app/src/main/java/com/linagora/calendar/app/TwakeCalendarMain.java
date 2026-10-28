@@ -75,6 +75,7 @@ import com.linagora.calendar.commoncontacts.api.CommonContactsApiModule;
 import com.linagora.calendar.dav.DavModule;
 import com.linagora.calendar.restapi.MeetRestApiModule;
 import com.linagora.calendar.restapi.RestApiModule;
+import com.linagora.calendar.restapi.attachment.AttachmentUploadModule;
 import com.linagora.calendar.saas.TWPCalendarUserDeletionModule;
 import com.linagora.calendar.smtp.SmtpModule;
 import com.linagora.calendar.storage.CaffeineOIDCTokenCache;
@@ -157,6 +158,7 @@ public class TwakeCalendarMain {
                 new FileUploadConfigurationModule(),
                 new RestApiModule(),
                 new CommonContactsApiModule(),
+                new AttachmentUploadModule(),
                 new TaskManagerModule(),
                 new DavModule(),
                 new CalendarAmqpModule(),
