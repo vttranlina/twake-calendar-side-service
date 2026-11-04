@@ -35,6 +35,7 @@ import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.github.fge.lambdas.Throwing;
 import com.linagora.calendar.dav.dto.SubscribedCalendarRequest;
+import com.linagora.calendar.storage.AddressBookURL;
 import com.linagora.calendar.storage.CalendarURL;
 import com.linagora.calendar.storage.OpenPaaSId;
 import com.linagora.calendar.storage.OpenPaaSUser;
@@ -51,6 +52,17 @@ import reactor.util.retry.Retry;
 public class DavTestHelper extends DavClient {
 
     private static final ObjectMapper MAPPER = new ObjectMapper();
+    private static final String DOMAIN_ADDRESS_BOOK_ID = "dab";
+    private static final byte[] CREATE_DOMAIN_ADDRESS_BOOK_PAYLOAD = """
+        {
+            "id": "%s",
+            "dav:name": "Domain address book",
+            "carddav:description": "Domain address book",
+            "dav:acl": [ "{DAV:}read" ],
+            "type": "group",
+            "state": "enabled"
+        }
+        """.formatted(DOMAIN_ADDRESS_BOOK_ID).getBytes(StandardCharsets.UTF_8);
 
     public record CounterRequest(String calendarData,
                                  String sender,
@@ -121,6 +133,30 @@ public class DavTestHelper extends DavClient {
             });
     }
 
+    public Mono<Void> upsertCalendar(OpenPaaSId domainId, URI uri, String calendarData) {
+        return httpClientWithTechnicalToken(domainId)
+            .flatMap(client -> client.headers(headers ->
+                    headers.add(HttpHeaderNames.CONTENT_TYPE, "text/plain"))
+                .request(HttpMethod.PUT)
+                .uri(uri.toString())
+                .send(Mono.just(Unpooled.wrappedBuffer(calendarData.getBytes(StandardCharsets.UTF_8))))
+                .responseSingle((response, responseContent) -> {
+                    if (response.status().code() == 201 || response.status().code() == 204) {
+                        return Mono.empty();
+                    }
+                    return responseContent.asString(StandardCharsets.UTF_8)
+                        .switchIfEmpty(Mono.just(StringUtils.EMPTY))
+                        .flatMap(responseBody -> Mono.error(new DavClientException("""
+                            Unexpected status code: %d when create/update calendar object '%s'
+                            %s
+                            """.formatted(response.status().code(), uri.toString(), responseBody))));
+                }));
+    }
+
+    public Mono<DavCalendarObject> fetchCalendarEvent(OpenPaaSId domainId, URI calendarEventHref) {
+        return calDavClient.fetchCalendarEvent(httpClientWithTechnicalToken(domainId), calendarEventHref);
+    }
+
     public Mono<Void> postCounter(OpenPaaSUser openPaaSUser, String attendeeEventUid, CounterRequest counterRequest) {
         URI uri = URI.create("/calendars/" + openPaaSUser.id().value() + "/" + openPaaSUser.id().value() + "/" + attendeeEventUid + ".ics");
         return httpClientWithImpersonation(openPaaSUser.username()).headers(headers -> headers
@@ -176,6 +212,26 @@ public class DavTestHelper extends DavClient {
                         %s
                         """.formatted(response.status().code(), homeBaseId.value(), username, responseBody))));
             });
+    }
+
+    public Mono<Void> createDomainAddressBook(OpenPaaSId domainId) {
+        return httpClientWithTechnicalToken(domainId)
+            .flatMap(httpClient -> httpClient.headers(headers ->
+                    headers.add(HttpHeaderNames.CONTENT_TYPE, "application/json;charset=UTF-8")
+                        .add(HttpHeaderNames.ACCEPT, "application/json"))
+                .post()
+                .uri("/addressbooks/%s.json".formatted(domainId.value()))
+                .send(Mono.fromCallable(() -> Unpooled.wrappedBuffer(CREATE_DOMAIN_ADDRESS_BOOK_PAYLOAD)))
+                .responseSingle((response, responseContent) -> {
+                    if (response.status().code() == HttpStatus.SC_CREATED) {
+                        return Mono.empty();
+                    }
+                    return responseContent.asString(StandardCharsets.UTF_8)
+                        .filter(body -> !body.contains("The resource you tried to create already exists"))
+                        .switchIfEmpty(Mono.empty())
+                        .flatMap(body -> Mono.error(new DavClientException("Failed to create domain address book for domain %s: %s"
+                            .formatted(domainId.value(), body))));
+                }));
     }
 
     public Optional<String> findFirstEventId(OpenPaaSUser openPaaSUser) {
@@ -257,7 +313,7 @@ public class DavTestHelper extends DavClient {
             }).block();
     }
 
-    public void subscribeToSharedCalendar(OpenPaaSUser user, SubscribedCalendarRequest subscribedCalendarRequest) {
+    public CalendarURL subscribeToSharedCalendar(OpenPaaSUser user, SubscribedCalendarRequest subscribedCalendarRequest) {
         String uri = CalendarURL.CALENDAR_URL_PATH_PREFIX + "/" + user.id().value() + ".json";
 
         httpClientWithImpersonation(user.username())
@@ -278,6 +334,8 @@ public class DavTestHelper extends DavClient {
                         %s
                         """.formatted(response.status().code(), uri, errorBody))));
             }).block();
+
+        return new CalendarURL(user.id(), new OpenPaaSId(subscribedCalendarRequest.id()));
     }
 
 
@@ -430,6 +488,38 @@ public class DavTestHelper extends DavClient {
                     .switchIfEmpty(Mono.just(StringUtils.EMPTY))
                     .flatMap(error -> Mono.error(new DavClientException("""
                         Unexpected status code: %d when fetching events by sync-token '%s'
+                        %s
+                        """.formatted(response.status().code(), syncToken, error))));
+            });
+    }
+
+    public Mono<String> fetchContactsBySyncToken(OpenPaaSUser user, AddressBookURL addressBookURL, String syncToken) {
+        String body = """
+            <?xml version="1.0" encoding="utf-8" ?>
+            <d:sync-collection xmlns:d="DAV:">
+              <d:sync-token>{syncToken}</d:sync-token>
+              <d:sync-level>1</d:sync-level>
+              <d:prop>
+                <d:getetag/>
+              </d:prop>
+            </d:sync-collection>
+            """.replace("{syncToken}", syncToken);
+
+        return httpClientWithImpersonation(user.username())
+            .headers(headers -> headers
+                .add(HttpHeaderNames.ACCEPT, "application/xml")
+                .add(HttpHeaderNames.CONTENT_TYPE, "application/xml"))
+            .request(HttpMethod.valueOf("REPORT"))
+            .uri(addressBookURL.asUri().toASCIIString())
+            .send(Mono.just(Unpooled.wrappedBuffer(body.getBytes(StandardCharsets.UTF_8))))
+            .responseSingle((response, content) -> {
+                if (response.status().code() == HttpStatus.SC_MULTI_STATUS) {
+                    return content.asString(StandardCharsets.UTF_8);
+                }
+                return content.asString(StandardCharsets.UTF_8)
+                    .switchIfEmpty(Mono.just(StringUtils.EMPTY))
+                    .flatMap(error -> Mono.error(new DavClientException("""
+                        Unexpected status code: %d when fetching contacts by sync-token '%s'
                         %s
                         """.formatted(response.status().code(), syncToken, error))));
             });

@@ -18,6 +18,7 @@
 
 package com.linagora.calendar.storage.opensearch;
 
+import static org.assertj.core.api.Assertions.assertThatCode;
 import static org.assertj.core.api.AssertionsForInterfaceTypes.assertThat;
 
 import java.util.List;
@@ -39,10 +40,13 @@ import org.opensearch.client.opensearch.OpenSearchAsyncClient;
 import org.opensearch.client.transport.rest_client.RestClientTransport;
 
 import com.linagora.calendar.storage.event.EventFields;
+import com.linagora.calendar.storage.event.EventFields.Person;
 import com.linagora.calendar.storage.eventsearch.CalendarEvents;
 import com.linagora.calendar.storage.eventsearch.CalendarSearchService;
 import com.linagora.calendar.storage.eventsearch.CalendarSearchServiceContract;
 import com.linagora.calendar.storage.eventsearch.EventSearchQuery;
+
+import reactor.core.publisher.Flux;
 
 public class OpensearchCalendarSearchServiceTest implements CalendarSearchServiceContract {
     @RegisterExtension
@@ -85,22 +89,22 @@ public class OpensearchCalendarSearchServiceTest implements CalendarSearchServic
             .calendarURL(generateCalendarURL())
             .build();
 
-        testee().index(accountId, CalendarEvents.of(event)).block();
+        testee().index(CalendarEvents.of(event)).block();
 
         // Search for a prefix that is not over the max n-gram length
-        EventSearchQuery query = simpleQuery("anticon");
+        EventSearchQuery query = simpleQuery("anticon", event.calendarURL());
 
         // Search for a prefix that is over the max n-gram length
-        EventSearchQuery query2 = simpleQuery("anticons");
+        EventSearchQuery query2 = simpleQuery("anticons", event.calendarURL());
 
         CALMLY_AWAIT.untilAsserted(() -> {
-            List<EventFields> searchResults = testee().search(accountId, query)
+            List<EventFields> searchResults = testee().search(query)
                 .collectList().block();
 
             assertThat(searchResults).hasSize(1)
                 .containsExactly(event);
 
-            List<EventFields> searchResults2 = testee().search(accountId, query2)
+            List<EventFields> searchResults2 = testee().search(query2)
                 .collectList().block();
 
             assertThat(searchResults2).hasSize(0);
@@ -118,12 +122,12 @@ public class OpensearchCalendarSearchServiceTest implements CalendarSearchServic
             .calendarURL(generateCalendarURL())
             .build();
 
-        testee().index(accountId, CalendarEvents.of(event)).block();
+        testee().index(CalendarEvents.of(event)).block();
 
-        EventSearchQuery query = simpleQuery(search);
+        EventSearchQuery query = simpleQuery(search, event.calendarURL());
 
         CALMLY_AWAIT.untilAsserted(() -> {
-            List<EventFields> searchResults = testee().search(accountId, query)
+            List<EventFields> searchResults = testee().search(query)
                 .collectList().block();
 
             assertThat(searchResults).hasSize(1)
@@ -142,12 +146,12 @@ public class OpensearchCalendarSearchServiceTest implements CalendarSearchServic
             .calendarURL(generateCalendarURL())
             .build();
 
-        testee().index(accountId, CalendarEvents.of(event)).block();
+        testee().index(CalendarEvents.of(event)).block();
 
         // Verify that document has been indexed
-        EventSearchQuery query = simpleQuery("sprint");
+        EventSearchQuery query = simpleQuery("sprint", event.calendarURL());
         CALMLY_AWAIT.untilAsserted(() -> {
-            List<EventFields> searchResults = testee().search(accountId, query)
+            List<EventFields> searchResults = testee().search(query)
                 .collectList().block();
 
             assertThat(searchResults).hasSize(1)
@@ -155,9 +159,9 @@ public class OpensearchCalendarSearchServiceTest implements CalendarSearchServic
         });
 
         // Now test with fuzzy input
-        EventSearchQuery query2 = simpleQuery(search);
+        EventSearchQuery query2 = simpleQuery(search, event.calendarURL());
 
-        List<EventFields> searchResults = testee().search(accountId, query2)
+        List<EventFields> searchResults = testee().search(query2)
             .collectList().block();
 
         assertThat(searchResults).hasSize(0);
@@ -172,12 +176,12 @@ public class OpensearchCalendarSearchServiceTest implements CalendarSearchServic
             .calendarURL(generateCalendarURL())
             .build();
 
-        testee().index(accountId, CalendarEvents.of(event)).block();
+        testee().index(CalendarEvents.of(event)).block();
 
-        EventSearchQuery query = simpleQuery(search);
+        EventSearchQuery query = simpleQuery(search, event.calendarURL());
 
         CALMLY_AWAIT.untilAsserted(() -> {
-            List<EventFields> searchResults = testee().search(accountId, query)
+            List<EventFields> searchResults = testee().search(query)
                 .collectList().block();
 
             assertThat(searchResults).hasSize(1)
@@ -194,12 +198,12 @@ public class OpensearchCalendarSearchServiceTest implements CalendarSearchServic
             .calendarURL(generateCalendarURL())
             .build();
 
-        testee().index(accountId, CalendarEvents.of(event)).block();
+        testee().index(CalendarEvents.of(event)).block();
 
         // Verify that document has been indexed
-        EventSearchQuery query = simpleQuery("sprint");
+        EventSearchQuery query = simpleQuery("sprint", event.calendarURL());
         CALMLY_AWAIT.untilAsserted(() -> {
-            List<EventFields> searchResults = testee().search(accountId, query)
+            List<EventFields> searchResults = testee().search(query)
                 .collectList().block();
 
             assertThat(searchResults).hasSize(1)
@@ -207,11 +211,78 @@ public class OpensearchCalendarSearchServiceTest implements CalendarSearchServic
         });
 
         // Now test with query string query
-        EventSearchQuery query2 = simpleQuery(search);
+        EventSearchQuery query2 = simpleQuery(search, event.calendarURL());
 
-        List<EventFields> searchResults = testee().search(accountId, query2)
+        List<EventFields> searchResults = testee().search(query2)
             .collectList().block();
 
         assertThat(searchResults).hasSize(0);
+    }
+
+    @Test
+    void searchShouldNotEdgeNgramTheQueryAgainstNames() throws Exception {
+        // Reproduces issue #996: the query used to be edge-ngrammed at search time too, so "Point collaboration"
+        // produced the gram "poi" which matched the unrelated attendee name "Poizat".
+        EventFields event = EventFields.builder()
+            .uid(generateEventUid())
+            .summary("Kickoff - AI")
+            .attendees(List.of(Person.of("Theo Poizat", "tpoizat@domain.tld")))
+            .calendarURL(generateCalendarURL())
+            .build();
+
+        testee().index(CalendarEvents.of(event)).block();
+
+        // Verify that the document has been indexed and that a multi-word name search still matches
+        EventSearchQuery nameQuery = simpleQuery("Theo Poizat", event.calendarURL());
+        CALMLY_AWAIT.untilAsserted(() -> {
+            List<EventFields> searchResults = testee().search(nameQuery)
+                .collectList().block();
+
+            assertThat(searchResults).hasSize(1)
+                .containsExactly(event);
+        });
+
+        EventSearchQuery unrelatedQuery = simpleQuery("Point collaboration", event.calendarURL());
+
+        List<EventFields> searchResults = testee().search(unrelatedQuery)
+            .collectList().block();
+
+        assertThat(searchResults).hasSize(0);
+    }
+
+    @Test
+    void deleteShouldNotFailWhenEventIsConcurrentlyReindexed() {
+        // Reproduces issue #934: a delete-by-query racing with concurrent re-indexing of the same event used to
+        // abort with a version conflict (HTTP 409). The delete must now proceed past the conflict rather than fail.
+        EventFields event = EventFields.builder()
+            .uid(generateEventUid())
+            .summary("concurrent")
+            .calendarURL(generateCalendarURL())
+            .build();
+
+        CalendarEvents events = CalendarEvents.of(event);
+
+        Flux<Void> reindexing = Flux.range(0, 300)
+            .flatMap(i -> testee().reindex(events), 8);
+
+        Flux<Void> deleting = Flux.range(0, 100)
+            .concatMap(i -> testee().delete(event.calendarURL(), event.uid()));
+
+        assertThatCode(() -> Flux.merge(reindexing, deleting).blockLast())
+            .doesNotThrowAnyException();
+
+        // Whether the event survives the race depends on which operation ran last, so delete it once more now
+        // that no writer competes, and check the document is effectively gone. The delete is retried: it is a
+        // delete-by-query, whose search phase only sees documents already refreshed, so a document written by
+        // the very last re-indexing may still be invisible to the first delete attempt.
+        EventSearchQuery query = simpleQuery("concurrent", event.calendarURL());
+        CALMLY_AWAIT.untilAsserted(() -> {
+            testee().delete(event.calendarURL(), event.uid()).block();
+
+            List<EventFields> searchResults = testee().search(query)
+                .collectList().block();
+
+            assertThat(searchResults).hasSize(0);
+        });
     }
 }

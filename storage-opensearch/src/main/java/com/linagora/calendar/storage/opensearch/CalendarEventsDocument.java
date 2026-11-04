@@ -24,14 +24,12 @@ import java.util.Optional;
 
 import jakarta.mail.internet.AddressException;
 
-import org.apache.james.vacation.api.AccountId;
-
 import com.fasterxml.jackson.annotation.JsonProperty;
 import com.linagora.calendar.storage.CalendarURL;
 import com.linagora.calendar.storage.event.EventFields;
 import com.linagora.calendar.storage.opensearch.CalendarEventIndexMappingFactory.CalendarFields;
 
-public record CalendarEventsDocument(@JsonProperty(CalendarFields.ACCOUNT_ID) String accountId,
+public record CalendarEventsDocument(@JsonProperty(CalendarFields.BASE_CALENDAR_ID) String baseCalendarId,
                                      @JsonProperty(CalendarFields.EVENT_UID) String eventUid,
                                      @JsonProperty(CalendarFields.SUMMARY) String summary,
                                      @JsonProperty(CalendarFields.LOCATION) String location,
@@ -46,9 +44,17 @@ public record CalendarEventsDocument(@JsonProperty(CalendarFields.ACCOUNT_ID) St
                                      @JsonProperty(CalendarFields.ATTENDEES) List<SimplePerson> attendees,
                                      @JsonProperty(CalendarFields.RESOURCES) List<SimplePerson> resources,
                                      @JsonProperty(CalendarFields.VIDEOCONFERENCE_URL) String videoconferenceUrl,
+                                     @JsonProperty(CalendarFields.BOOKING_LINK_ID) String bookingLinkId,
                                      @JsonProperty(CalendarFields.CALENDAR_URL) String calendarURL,
                                      @JsonProperty(CalendarFields.SEQUENCE) Integer sequence,
-                                     @JsonProperty(CalendarFields.RESOURCE_NAME) String resourceName) {
+                                     @JsonProperty(CalendarFields.RESOURCE_NAME) String resourceName,
+                                     @JsonProperty(CalendarFields.RECURRENCE_ID) String recurrenceId,
+                                     @JsonProperty(CalendarFields.COLLAPSE_RANK) Integer collapseRank) {
+
+    // Representative rank used to keep the recurrence master (or a standalone event) when collapsing
+    // search results on the event uid: an overridden occurrence sorts after the master.
+    private static final int MASTER_COLLAPSE_RANK = 0;
+    private static final int OVERRIDDEN_OCCURRENCE_COLLAPSE_RANK = 1;
 
     public static class DeserializeException extends RuntimeException {
         public DeserializeException(String message, Throwable cause) {
@@ -74,9 +80,9 @@ public record CalendarEventsDocument(@JsonProperty(CalendarFields.ACCOUNT_ID) St
         }
     }
 
-    public static CalendarEventsDocument fromEventFields(AccountId accountId, EventFields eventFields) {
+    public static CalendarEventsDocument fromEventFields(EventFields eventFields) {
         return new CalendarEventsDocument(
-            accountId.getIdentifier(),
+            eventFields.calendarURL().base().value(),
             eventFields.uid().value(),
             eventFields.summary(),
             eventFields.location(),
@@ -95,9 +101,18 @@ public record CalendarEventsDocument(@JsonProperty(CalendarFields.ACCOUNT_ID) St
                 .map(SimplePerson::from)
                 .toList(),
             eventFields.videoconferenceUrl(),
+            eventFields.bookingLinkId(),
             eventFields.calendarURL().serialize(),
             eventFields.sequence().orElse(null),
-            eventFields.resourceName().orElse(null));
+            eventFields.resourceName().orElse(null),
+            eventFields.recurrenceId().orElse(null),
+            computeCollapseRank(eventFields));
+    }
+
+    private static int computeCollapseRank(EventFields eventFields) {
+        return Boolean.FALSE.equals(eventFields.isRecurrentMaster())
+            ? OVERRIDDEN_OCCURRENCE_COLLAPSE_RANK
+            : MASTER_COLLAPSE_RANK;
     }
 
     public EventFields toEventFields() {
@@ -120,6 +135,7 @@ public record CalendarEventsDocument(@JsonProperty(CalendarFields.ACCOUNT_ID) St
                 .map(SimplePerson::toEventPerson)
                 .toList())
             .videoconferenceUrl(videoconferenceUrl)
+            .bookingLinkId(bookingLinkId)
             .calendarURL(CalendarURL.deserialize(calendarURL));
 
         if (allDay != null) {
@@ -133,6 +149,9 @@ public record CalendarEventsDocument(@JsonProperty(CalendarFields.ACCOUNT_ID) St
         }
         if (resourceName != null) {
             builder.resourceName(resourceName);
+        }
+        if (recurrenceId != null) {
+            builder.recurrenceId(recurrenceId);
         }
 
         return builder.build();

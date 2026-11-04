@@ -18,6 +18,7 @@
 
 package com.linagora.calendar.webadmin;
 
+import static com.linagora.calendar.dav.CalDavClient.ICS_EXTENSION;
 import static com.linagora.calendar.storage.TestFixture.TECHNICAL_TOKEN_SERVICE_TESTING;
 import static com.linagora.calendar.storage.event.EventParseUtils.UTC_DATE_TIME_FORMATTER;
 import static com.linagora.calendar.storage.eventsearch.EventSearchQuery.MAX_LIMIT;
@@ -30,7 +31,9 @@ import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.spy;
 
+import java.net.URI;
 import java.nio.charset.StandardCharsets;
+import java.time.Clock;
 import java.time.Instant;
 import java.util.List;
 import java.util.Optional;
@@ -42,6 +45,7 @@ import javax.net.ssl.SSLException;
 import jakarta.mail.internet.AddressException;
 
 import org.apache.james.core.MailAddress;
+import org.apache.james.core.Username;
 import org.apache.james.json.DTOConverter;
 import org.apache.james.server.task.json.dto.AdditionalInformationDTO;
 import org.apache.james.server.task.json.dto.AdditionalInformationDTOModule;
@@ -49,9 +53,7 @@ import org.apache.james.task.Hostname;
 import org.apache.james.task.MemoryTaskManager;
 import org.apache.james.task.TaskExecutionDetails;
 import org.apache.james.task.TaskManager;
-import org.apache.james.vacation.api.AccountId;
 import org.apache.james.webadmin.WebAdminServer;
-import org.apache.james.webadmin.WebAdminUtils;
 import org.apache.james.webadmin.routes.TasksRoutes;
 import org.apache.james.webadmin.utils.JsonTransformer;
 import org.junit.jupiter.api.AfterEach;
@@ -61,18 +63,22 @@ import org.junit.jupiter.api.extension.RegisterExtension;
 
 import com.google.common.collect.ImmutableSet;
 import com.linagora.calendar.dav.CalDavClient;
-import com.linagora.calendar.dav.DockerSabreDavSetup;
+import com.linagora.calendar.dav.DavTestHelper;
 import com.linagora.calendar.dav.SabreDavExtension;
 import com.linagora.calendar.storage.CalendarURL;
+import com.linagora.calendar.storage.OpenPaaSDomain;
 import com.linagora.calendar.storage.OpenPaaSUser;
 import com.linagora.calendar.storage.OpenPaaSUserDAO;
+import com.linagora.calendar.storage.ResourceInsertRequest;
 import com.linagora.calendar.storage.event.EventFields;
 import com.linagora.calendar.storage.eventsearch.CalendarEvents;
 import com.linagora.calendar.storage.eventsearch.CalendarSearchService;
 import com.linagora.calendar.storage.eventsearch.EventSearchQuery;
 import com.linagora.calendar.storage.eventsearch.MemoryCalendarSearchService;
+import com.linagora.calendar.storage.model.ResourceId;
 import com.linagora.calendar.storage.mongodb.MongoDBOpenPaaSDomainDAO;
 import com.linagora.calendar.storage.mongodb.MongoDBOpenPaaSUserDAO;
+import com.linagora.calendar.storage.mongodb.MongoDBResourceDAO;
 import com.linagora.calendar.webadmin.service.CalendarEventsReindexService;
 import com.linagora.calendar.webadmin.task.CalendarEventsReindexTaskAdditionalInformationDTO;
 import com.mongodb.reactivestreams.client.MongoDatabase;
@@ -83,28 +89,31 @@ import reactor.core.publisher.Mono;
 public class CalendarRoutesTest {
 
     @RegisterExtension
-    static SabreDavExtension sabreDavExtension = new SabreDavExtension(DockerSabreDavSetup.SINGLETON);
+    static SabreDavExtension sabreDavExtension = SabreDavExtension.shared();
 
     private WebAdminServer webAdminServer;
     private OpenPaaSUserDAO userDAO;
+    private MongoDBOpenPaaSDomainDAO domainDAO;
+    private MongoDBResourceDAO resourceDAO;
     private CalendarSearchService calendarSearchService;
     private CalDavClient calDavClient;
+    private DavTestHelper davTestHelper;
     private CalendarEventsReindexService reindexService;
 
     private OpenPaaSUser openPaaSUser;
-    private OpenPaaSUser openPaaSUser2;
 
     @BeforeEach
     void setUp() throws SSLException {
         MongoDatabase mongoDB = sabreDavExtension.dockerSabreDavSetup().getMongoDB();
-        MongoDBOpenPaaSDomainDAO domainDAO = new MongoDBOpenPaaSDomainDAO(mongoDB);
+        domainDAO = new MongoDBOpenPaaSDomainDAO(mongoDB);
         userDAO = new MongoDBOpenPaaSUserDAO(mongoDB, domainDAO);
+        resourceDAO = new MongoDBResourceDAO(mongoDB, Clock.systemUTC());
         calendarSearchService = spy(new MemoryCalendarSearchService());
         calDavClient = new CalDavClient(sabreDavExtension.dockerSabreDavSetup().davConfiguration(), TECHNICAL_TOKEN_SERVICE_TESTING);
-        reindexService = new CalendarEventsReindexService(userDAO, calendarSearchService, calDavClient);
+        davTestHelper = new DavTestHelper(sabreDavExtension.dockerSabreDavSetup().davConfiguration(), TECHNICAL_TOKEN_SERVICE_TESTING);
+        reindexService = new CalendarEventsReindexService(userDAO, resourceDAO, calendarSearchService, calDavClient);
 
         this.openPaaSUser = sabreDavExtension.newTestUser();
-        this.openPaaSUser2 = sabreDavExtension.newTestUser();
 
         TaskManager taskManager = new MemoryTaskManager(new Hostname("foo"));
 
@@ -132,6 +141,8 @@ public class CalendarRoutesTest {
     void shouldShowAllInformationInResponse() {
         String taskId = given()
             .queryParam("task", "reindex")
+            .queryParam("eventsPerSecond", 12)
+            .queryParam("calendarsConcurrency", 3)
             .when()
             .post()
             .jsonPath()
@@ -147,6 +158,8 @@ public class CalendarRoutesTest {
             .body("type", is("reindex-calendar-events"))
             .body("additionalInformation.processedEventCount", is(0))
             .body("additionalInformation.failedEventCount", is(0))
+            .body("additionalInformation.runningOptions.eventsPerSecond", is(12))
+            .body("additionalInformation.runningOptions.calendarsConcurrency", is(3))
             .body("additionalInformation.timestamp", is(notNullValue()))
             .body("additionalInformation.type", is("reindex-calendar-events"))
             .body("startedDate", is(notNullValue()))
@@ -176,9 +189,6 @@ public class CalendarRoutesTest {
             END:VCALENDAR
             """.formatted(eventId, openPaaSUser.username().asString(), openPaaSUser.username().asString());
         CalendarURL calendarURL = CalendarURL.from(openPaaSUser.id());
-
-        // To trigger calendar directory activation
-        calDavClient.export(calendarURL, openPaaSUser.username()).block();
 
         calDavClient.importCalendar(calendarURL, eventId, openPaaSUser.username(), ics.getBytes(StandardCharsets.UTF_8)).block();
 
@@ -214,15 +224,79 @@ public class CalendarRoutesTest {
             .attendees(List.of(person))
             .resources(List.of(new EventFields.Person("Projector", new MailAddress("projector@open-paas.org"))))
             .calendarURL(calendarURL)
+            .resourceName(eventId + ICS_EXTENSION)
             .build();
 
-        List<EventFields> actual = calendarSearchService.search(AccountId.fromUsername(openPaaSUser.username()), simpleQuery(""))
+        List<EventFields> actual = calendarSearchService.search(simpleQuery("", calendarURL))
             .collectList().block();
         assertThat(actual).hasSize(1);
         assertThat(actual.getFirst())
             .usingRecursiveComparison()
             .ignoringFields("attendees.partStat", "resources.partStat", "organizer.partStat")
             .isEqualTo(expected);
+    }
+
+    @Test
+    void reindexShouldIndexResourceCalendarEvent() {
+        OpenPaaSDomain domain = domainDAO.retrieve(openPaaSUser.username().getDomainPart().orElseThrow()).block();
+        ResourceId resourceId = resourceDAO.insert(new ResourceInsertRequest(
+            openPaaSUser.id(),
+            "Resource calendar used by reindex tests",
+            domain.id(),
+            "projector",
+            "Resource calendar used by reindex tests"))
+            .block();
+        CalendarURL resourceCalendarURL = CalendarURL.from(resourceId.asOpenPaaSId());
+
+        String eventId = "resource-event-" + UUID.randomUUID();
+        String resourceEmail = Username.fromLocalPartWithDomain(resourceId.value(), openPaaSUser.username().getDomainPart().orElseThrow()).asString();
+        String ics = """
+            BEGIN:VCALENDAR
+            VERSION:2.0
+            CALSCALE:GREGORIAN
+            PRODID:-//SabreDAV//SabreDAV 3.2.2//EN
+            BEGIN:VEVENT
+            UID:%s
+            TRANSP:OPAQUE
+            DTSTAMP:20250101T100000Z
+            DTSTART:20250102T120000Z
+            DTEND:20250102T130000Z
+            SUMMARY:Resource Test Event
+            ORGANIZER;CN=john doe:mailto:%s
+            ATTENDEE;PARTSTAT=TENTATIVE;RSVP=TRUE;ROLE=REQ-PARTICIPANT;CUTYPE=RESOURCE;CN=Projector:mailto:%s
+            CLASS:PUBLIC
+            END:VEVENT
+            END:VCALENDAR
+            """.formatted(eventId, openPaaSUser.username().asString(), resourceEmail);
+        davTestHelper.upsertCalendar(openPaaSUser, ics, eventId);
+        URI resourceEventUri = URI.create("/calendars/" + resourceId.value() + "/" + resourceId.value() + "/" + eventId + ICS_EXTENSION);
+        davTestHelper.upsertCalendar(domain.id(), resourceEventUri, ics).block();
+        String resourceEventId = eventId;
+
+        String taskId = given()
+            .queryParam("task", "reindex")
+            .when()
+            .post()
+            .jsonPath()
+            .get("taskId");
+
+        given()
+            .basePath(TasksRoutes.BASE)
+        .when()
+            .get(taskId + "/await")
+        .then()
+            .body("status", is("completed"))
+            .body("type", is("reindex-calendar-events"))
+            .body("additionalInformation.processedEventCount", is(2))
+            .body("additionalInformation.failedEventCount", is(0));
+
+        List<EventFields> actual = calendarSearchService.search(simpleQuery("", resourceCalendarURL))
+            .collectList().block();
+        assertThat(actual).hasSize(1);
+        assertThat(actual.getFirst().uid().value()).isEqualTo(eventId);
+        assertThat(actual.getFirst().summary()).isEqualTo("Resource Test Event");
+        assertThat(actual.getFirst().calendarURL()).isEqualTo(resourceCalendarURL);
+        assertThat(actual.getFirst().resourceName()).contains(resourceEventId + ICS_EXTENSION);
     }
 
     @Test
@@ -295,9 +369,6 @@ public class CalendarRoutesTest {
             .getBytes(StandardCharsets.UTF_8);
         CalendarURL calendarURL = CalendarURL.from(openPaaSUser.id());
 
-        // To trigger calendar directory activation
-        calDavClient.export(calendarURL, openPaaSUser.username()).block();
-
         calDavClient.importCalendar(calendarURL, uid1, openPaaSUser.username(), ics).block();
         calDavClient.importCalendar(calendarURL, uid2, openPaaSUser.username(), ics2).block();
 
@@ -334,24 +405,7 @@ public class CalendarRoutesTest {
             .attendees(List.of(person))
             .resources(List.of())
             .calendarURL(calendarURL)
-            .build();
-
-        EventFields expected2 = EventFields.builder()
-            .uid(uid1)
-            .summary("recur222")
-            .location(null)
-            .description(null)
-            .clazz("PUBLIC")
-            .start(Instant.parse("2025-05-15T05:00:00Z")) // Asia/Saigon 12:00 = UTC+7
-            .end(Instant.parse("2025-05-15T05:30:00Z"))
-            .dtStamp(Instant.parse("2025-05-15T07:39:30Z"))
-            .allDay(false)
-            .isRecurrentMaster(false)
-            .organizer(person)
-            .attendees(List.of(person))
-            .resources(List.of())
-            .calendarURL(calendarURL)
-            .sequence(1)
+            .resourceName(uid1 + ICS_EXTENSION)
             .build();
 
         EventFields expected3 = EventFields.builder()
@@ -368,27 +422,29 @@ public class CalendarRoutesTest {
             .attendees(List.of(person))
             .resources(List.of())
             .calendarURL(calendarURL)
+            .resourceName(uid2 + ICS_EXTENSION)
             .build();
 
-        List<EventFields> actual = calendarSearchService.search(AccountId.fromUsername(openPaaSUser.username()), simpleQuery(""))
+        List<EventFields> actual = calendarSearchService.search(simpleQuery("", calendarURL))
             .collectList().block();
+        // Search collapses occurrences on the uid and keeps the recurrence master as the representative:
+        // the recur222 overridden occurrence is not surfaced separately.
         assertThat(actual)
             .usingRecursiveFieldByFieldElementComparator(builder()
                 .withIgnoredFields("attendees.partStat", "resources.partStat", "organizer.partStat", "recurrenceId")
                 .build())
-            .containsExactlyInAnyOrder(expected1, expected2, expected3);
+            .containsExactlyInAnyOrder(expected1, expected3);
     }
 
     @Test
     void reindexShouldRemoveOldEvents() {
         CalendarURL calendarURL = CalendarURL.from(openPaaSUser.id());
-        AccountId accountId = AccountId.fromUsername(openPaaSUser.username());
         EventFields event1 = EventFields.builder()
             .uid("event-1")
             .summary("Event1")
             .calendarURL(calendarURL)
             .build();
-        calendarSearchService.index(accountId, CalendarEvents.of(event1)).block();
+        calendarSearchService.index(CalendarEvents.of(event1)).block();
 
         String taskId = given()
             .queryParam("task", "reindex")
@@ -407,7 +463,49 @@ public class CalendarRoutesTest {
             .body("additionalInformation.processedEventCount", is(0))
             .body("additionalInformation.failedEventCount", is(0));
 
-        List<EventFields> actual = calendarSearchService.search(accountId, simpleQuery(""))
+        List<EventFields> actual = calendarSearchService.search(simpleQuery("", calendarURL))
+            .collectList().block();
+        assertThat(actual).isEmpty();
+    }
+
+    @Test
+    void reindexShouldRemoveOldEventsForDeletedResource() {
+        OpenPaaSDomain domain = domainDAO.retrieve(openPaaSUser.username().getDomainPart().orElseThrow()).block();
+        ResourceId resourceId = resourceDAO.insert(new ResourceInsertRequest(
+            openPaaSUser.id(),
+            "Deleted resource calendar used by reindex tests",
+            domain.id(),
+            "projector",
+            "Deleted resource calendar used by reindex tests"))
+            .block();
+        CalendarURL resourceCalendarURL = CalendarURL.from(resourceId.asOpenPaaSId());
+
+        EventFields staleEvent = EventFields.builder()
+            .uid("stale-resource-event-" + UUID.randomUUID())
+            .summary("Stale resource event")
+            .calendarURL(resourceCalendarURL)
+            .build();
+        calendarSearchService.index(CalendarEvents.of(staleEvent)).block();
+        resourceDAO.softDelete(resourceId).block();
+
+        String taskId = given()
+            .queryParam("task", "reindex")
+            .when()
+            .post()
+            .jsonPath()
+            .get("taskId");
+
+        given()
+            .basePath(TasksRoutes.BASE)
+        .when()
+            .get(taskId + "/await")
+        .then()
+            .body("status", is("completed"))
+            .body("type", is("reindex-calendar-events"))
+            .body("additionalInformation.processedEventCount", is(0))
+            .body("additionalInformation.failedEventCount", is(0));
+
+        List<EventFields> actual = calendarSearchService.search(simpleQuery("", resourceCalendarURL))
             .collectList().block();
         assertThat(actual).isEmpty();
     }
@@ -482,20 +580,16 @@ public class CalendarRoutesTest {
             .getBytes(StandardCharsets.UTF_8);
         CalendarURL calendarURL = CalendarURL.from(openPaaSUser.id());
 
-        // To trigger calendar directory activation
-        calDavClient.export(calendarURL, openPaaSUser.username()).block();
-
         calDavClient.importCalendar(calendarURL, uid1, openPaaSUser.username(), ics).block();
         calDavClient.importCalendar(calendarURL, uid2, openPaaSUser.username(), ics2).block();
 
         doAnswer(invocation -> {
-            AccountId accountId = invocation.getArgument(0);
-            CalendarEvents events = invocation.getArgument(1);
+            CalendarEvents events = invocation.getArgument(0);
             if (events.eventUid().value().equals(uid2)) {
                 return Mono.error(new RuntimeException("Simulated failure for uid2"));
             }
             return Mono.empty();
-        }).when(calendarSearchService).reindex(any(), any());
+        }).when(calendarSearchService).reindex(any(CalendarEvents.class));
 
         String taskId = given()
             .queryParam("task", "reindex")
@@ -515,9 +609,82 @@ public class CalendarRoutesTest {
             .body("additionalInformation.failedEventCount", is(1));
     }
 
-    private EventSearchQuery simpleQuery(String query) {
-        return new EventSearchQuery(query, Optional.empty(),
-            Optional.empty(), Optional.empty(),
+    @Test
+    void reindexShouldIndexEventWithCorrectIcsResourceName() throws AddressException {
+        // Given an event with an ics resource name that is not the same as its UID
+        String eventId = "event-1";
+        String icsResourceName = "sabre-event-1";
+        String ics = """
+            BEGIN:VCALENDAR
+            BEGIN:VEVENT
+            UID:%s
+            TRANSP:OPAQUE
+            DTSTAMP:20250101T100000Z
+            DTSTART:20250102T120000Z
+            DTEND:20250102T130000Z
+            SUMMARY:Test Event
+            ORGANIZER;CN=john doe:mailto:%s
+            ATTENDEE;PARTSTAT=accepted;RSVP=false;ROLE=chair;CN=john doe;CUTYPE=individual:mailto:%s
+            ATTENDEE;PARTSTAT=TENTATIVE;RSVP=TRUE;ROLE=REQ-PARTICIPANT;CUTYPE=RESOURCE;CN=Projector;SCHEDULE-STATUS=5.1:mailto:projector@open-paas.org
+            DESCRIPTION:This is a test event
+            LOCATION:office
+            CLASS:PUBLIC
+            END:VEVENT
+            END:VCALENDAR
+            """.formatted(eventId, openPaaSUser.username().asString(), openPaaSUser.username().asString());
+        CalendarURL calendarURL = CalendarURL.from(openPaaSUser.id());
+
+        calDavClient.importCalendar(calendarURL, icsResourceName, openPaaSUser.username(), ics.getBytes(StandardCharsets.UTF_8)).block();
+
+        // When reindexing calendar events
+        String taskId = given()
+            .queryParam("task", "reindex")
+            .when()
+            .post()
+            .jsonPath()
+            .get("taskId");
+
+        given()
+            .basePath(TasksRoutes.BASE)
+            .when()
+            .get(taskId + "/await")
+            .then()
+            .body("status", is("completed"))
+            .body("type", is("reindex-calendar-events"))
+            .body("additionalInformation.processedEventCount", is(1))
+            .body("additionalInformation.failedEventCount", is(0));
+
+        // Then the event should be indexed with the correct ics resource name
+        EventFields.Person person = new EventFields.Person("john doe", new MailAddress(openPaaSUser.username().asString()));
+        EventFields expected = EventFields.builder()
+            .uid(eventId)
+            .summary("Test Event")
+            .location("office")
+            .description("This is a test event")
+            .clazz("PUBLIC")
+            .dtStamp(Instant.from(UTC_DATE_TIME_FORMATTER.parse("20250101T100000Z")))
+            .start(Instant.from(UTC_DATE_TIME_FORMATTER.parse("20250102T120000Z")))
+            .end(Instant.from(UTC_DATE_TIME_FORMATTER.parse("20250102T130000Z")))
+            .allDay(false)
+            .organizer(person)
+            .attendees(List.of(person))
+            .resources(List.of(new EventFields.Person("Projector", new MailAddress("projector@open-paas.org"))))
+            .calendarURL(calendarURL)
+            .resourceName(icsResourceName + ICS_EXTENSION)
+            .build();
+
+        List<EventFields> actual = calendarSearchService.search(simpleQuery("", calendarURL))
+            .collectList().block();
+        assertThat(actual).hasSize(1);
+        assertThat(actual.getFirst())
+            .usingRecursiveComparison()
+            .ignoringFields("attendees.partStat", "resources.partStat", "organizer.partStat")
+            .isEqualTo(expected);
+    }
+
+    private EventSearchQuery simpleQuery(String query, CalendarURL calendarURL) {
+        return new EventSearchQuery(query, Optional.of(List.of(calendarURL)),
+            Optional.empty(), Optional.empty(), Optional.empty(),
             MAX_LIMIT, 0);
     }
 }

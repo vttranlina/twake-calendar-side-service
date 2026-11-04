@@ -48,7 +48,6 @@ import org.apache.james.backends.rabbitmq.SimpleConnectionPool;
 import org.apache.james.core.Username;
 import org.apache.james.metrics.api.NoopGaugeRegistry;
 import org.apache.james.metrics.tests.RecordingMetricFactory;
-import org.apache.james.vacation.api.AccountId;
 import org.bson.types.ObjectId;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.AfterEach;
@@ -60,26 +59,23 @@ import org.junit.jupiter.api.extension.RegisterExtension;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 import org.mockito.Mockito;
-import org.testcontainers.shaded.org.awaitility.Awaitility;
-import org.testcontainers.shaded.org.awaitility.core.ConditionFactory;
+import org.awaitility.Awaitility;
+import org.awaitility.core.ConditionFactory;
 
 import com.linagora.calendar.dav.DavTestHelper;
 import com.linagora.calendar.dav.DockerSabreDavSetup;
-import com.linagora.calendar.dav.SabreDavExtension;
 import com.linagora.calendar.storage.CalendarURL;
+import com.linagora.calendar.storage.OpenPaaSDomain;
 import com.linagora.calendar.storage.OpenPaaSId;
 import com.linagora.calendar.storage.OpenPaaSUser;
-import com.linagora.calendar.storage.OpenPaaSUserDAO;
-import com.linagora.calendar.storage.ResourceDAO;
+import com.linagora.calendar.storage.ResourceInsertRequest;
 import com.linagora.calendar.storage.event.EventFields;
 import com.linagora.calendar.storage.eventsearch.CalendarSearchService;
 import com.linagora.calendar.storage.eventsearch.EventSearchQuery;
 import com.linagora.calendar.storage.eventsearch.EventUid;
 import com.linagora.calendar.storage.eventsearch.MemoryCalendarSearchService;
-import com.linagora.calendar.storage.mongodb.MongoDBOpenPaaSDomainDAO;
-import com.linagora.calendar.storage.mongodb.MongoDBOpenPaaSUserDAO;
+import com.linagora.calendar.storage.model.ResourceId;
 import com.linagora.calendar.storage.mongodb.MongoDBResourceDAO;
-import com.mongodb.reactivestreams.client.MongoDatabase;
 
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
@@ -97,7 +93,7 @@ public class EventIndexerConsumerTest {
     private final ConditionFactory awaitAtMost = calmlyAwait.atMost(30, TimeUnit.SECONDS);
 
     @RegisterExtension
-    static SabreDavExtension sabreDavExtension = new SabreDavExtension(DockerSabreDavSetup.SINGLETON);
+    static SabreDavWithAsyncSchedulingExtension sabreDavExtension = new SabreDavWithAsyncSchedulingExtension();
 
     private static ReactorRabbitMQChannelPool channelPool;
     private static SimpleConnectionPool connectionPool;
@@ -135,28 +131,26 @@ public class EventIndexerConsumerTest {
     private OpenPaaSUser attendee2;
     private CalendarSearchService calendarSearchService;
     private Sender sender;
+    private EventIndexerConsumer eventIndexerConsumer;
 
     @BeforeEach
-    public void setUp(DockerSabreDavSetup dockerSabreDavSetup) {
+    public void setUp() {
         openPaasUser = sabreDavExtension.newTestUser();
         attendee1 = sabreDavExtension.newTestUser();
         attendee2 = sabreDavExtension.newTestUser();
         calendarSearchService = Mockito.spy(new MemoryCalendarSearchService());
 
-        MongoDatabase mongoDB = dockerSabreDavSetup.getMongoDB();
-        MongoDBOpenPaaSDomainDAO domainDAO = new MongoDBOpenPaaSDomainDAO(mongoDB);
-        OpenPaaSUserDAO openPaaSUserDAO = new MongoDBOpenPaaSUserDAO(mongoDB, domainDAO);
-        ResourceDAO resourceDAO = new MongoDBResourceDAO(mongoDB, Clock.systemUTC());
-
-        EventIndexerConsumer calendarEventConsumer = new EventIndexerConsumer(channelPool, calendarSearchService, openPaaSUserDAO,
-            QueueArguments.Builder::new, resourceDAO, new RecordingMetricFactory());
-        calendarEventConsumer.init();
+        eventIndexerConsumer = new EventIndexerConsumer(channelPool, calendarSearchService,
+            QueueArguments.Builder::new, new RecordingMetricFactory());
+        eventIndexerConsumer.init();
 
         sender = channelPool.getSender();
     }
 
     @AfterEach
     void afterEach() {
+        eventIndexerConsumer.close();
+
         Arrays.stream(EventIndexerConsumer.Queue
                 .values())
             .map(EventIndexerConsumer.Queue::queueName)
@@ -245,7 +239,7 @@ public class EventIndexerConsumerTest {
 
         assertEventExistsInSearch(openPaasUser.username(), summary, eventUid);
 
-        EventFields eventFields = calendarSearchService.search(AccountId.fromUsername(openPaasUser.username()), simpleQuery(summary))
+        EventFields eventFields = calendarSearchService.search(simpleQuery(summary, CalendarURL.from(openPaasUser.id())))
             .next()
             .block();
 
@@ -337,15 +331,9 @@ public class EventIndexerConsumerTest {
 
         davTestHelper.upsertCalendar(openPaasUser, calendarData, eventUid);
 
-        try {
-            Thread.sleep(2000);
-        } catch (InterruptedException e) {
-            throw new RuntimeException(e);
-        }
-
         assertEventExistsInSearch(openPaasUser.username(), summary, eventUid);
 
-        List<EventFields> eventFields = calendarSearchService.search(AccountId.fromUsername(openPaasUser.username()), simpleQuery(summary))
+        List<EventFields> eventFields = calendarSearchService.search(simpleQuery(summary, CalendarURL.from(openPaasUser.id())))
             .collectList()
             .block();
 
@@ -367,39 +355,21 @@ public class EventIndexerConsumerTest {
             .resourceName(eventUid + ".ics")
             .build();
 
-        EventFields recurrenceEvent = EventFields.builder()
-            .calendarURL(new CalendarURL(new OpenPaaSId(openPaasUser.id().value()), new OpenPaaSId(openPaasUser.id().value())))
-            .uid(new EventUid(eventUid))
-            .isRecurrentMaster(false)
-            .summary(summary)
-            .location(location)
-            .description(description)
-            .clazz("PUBLIC")
-            .start(Instant.parse("2025-05-23T07:30:00Z"))
-            .end(Instant.parse("2025-05-23T08:00:00Z"))
-            .dtStamp(Instant.parse("2025-05-16T06:03:20Z"))
-            .allDay(false)
-            .organizer(EventFields.Person.of("John1 Doe1", openPaasUser.username().asString()))
-            .addAttendee(EventFields.Person.of("John2 Doe2", attendee1.username().asString()))
-            .addAttendee(EventFields.Person.of("John1 Doe1", openPaasUser.username().asString()))
-            .sequence(1)
-            .resourceName(eventUid + ".ics")
-            .build();
-
+        // Search collapses occurrences on the uid and keeps the recurrence master as the representative.
         assertThat(eventFields)
             .usingRecursiveFieldByFieldElementComparatorIgnoringFields("recurrenceId")
-            .containsExactlyInAnyOrder(masterEvent, recurrenceEvent);
+            .containsExactly(masterEvent);
 
         // Check that the recurrence event is indexed for the attendee
         assertEventExistsInSearch(attendee1.username(), summary, eventUid);
 
-        List<EventFields> eventFieldsAttendee = calendarSearchService.search(AccountId.fromUsername(openPaasUser.username()), simpleQuery(summary))
+        List<EventFields> eventFieldsAttendee = calendarSearchService.search(simpleQuery(summary, CalendarURL.from(openPaasUser.id())))
             .collectList()
             .block();
 
         assertThat(eventFieldsAttendee)
             .usingRecursiveFieldByFieldElementComparatorIgnoringFields("recurrenceId")
-            .containsExactlyInAnyOrder(masterEvent, recurrenceEvent);
+            .containsExactly(masterEvent);
     }
 
     @Test
@@ -488,11 +458,12 @@ public class EventIndexerConsumerTest {
 
         davTestHelper.upsertCalendar(openPaasUser, calendarData, eventUid);
 
-        Supplier<Set<EventFields>> searchSupplier = () -> Flux.from(calendarSearchService.search(AccountId.fromUsername(openPaasUser.username()), simpleQuery(summary)))
+        Supplier<Set<EventFields>> searchSupplier = () -> Flux.from(calendarSearchService.search(simpleQuery(summary, CalendarURL.from(openPaasUser.id()))))
             .collect(Collectors.toSet())
             .block();
 
-        awaitAtMost.untilAsserted(() -> assertThat(searchSupplier.get()).hasSize(3));
+        // Occurrences collapse on the uid, keeping the master as the single representative.
+        awaitAtMost.untilAsserted(() -> assertThat(searchSupplier.get()).hasSize(1));
 
         // Update the event (removed one recurrence event)
         String updatedCalendar = """
@@ -554,7 +525,111 @@ public class EventIndexerConsumerTest {
 
         davTestHelper.upsertCalendar(openPaasUser, updatedCalendar, eventUid);
 
-        awaitAtMost.untilAsserted(() -> assertThat(searchSupplier.get()).hasSize(2));
+        awaitAtMost.untilAsserted(() -> assertThat(searchSupplier.get()).hasSize(1));
+    }
+
+    @Test
+    void shouldNotKeepRemovedRecurrenceInstanceSearchableAfterUpdate() {
+        String eventUid = UUID.randomUUID().toString();
+        String masterSummary = "Recurring meeting";
+        String keptOccurrenceSummary = "Kept occurrence";
+        String removedOccurrenceSummary = "Removed occurrence";
+        String organizer = openPaasUser.username().asString();
+
+        // Given a recurring event with two overridden occurrences.
+        String initialCalendar = """
+            BEGIN:VCALENDAR
+            VERSION:2.0
+            PRODID:-//SabreDAV//SabreDAV 3.2.2//EN
+            BEGIN:VEVENT
+            UID:{eventUid}
+            TRANSP:OPAQUE
+            DTSTART:20250515T043000Z
+            DTEND:20250515T050000Z
+            CLASS:PUBLIC
+            SUMMARY:{masterSummary}
+            RRULE:FREQ=WEEKLY;COUNT=14;BYDAY=FR
+            ORGANIZER;CN=John1 Doe1:mailto:{organizer}
+            DTSTAMP:20250516T060320Z
+            SEQUENCE:1
+            END:VEVENT
+            BEGIN:VEVENT
+            UID:{eventUid}
+            TRANSP:OPAQUE
+            DTSTART:20250523T073000Z
+            DTEND:20250523T080000Z
+            CLASS:PUBLIC
+            SUMMARY:{keptOccurrenceSummary}
+            ORGANIZER;CN=John1 Doe1:mailto:{organizer}
+            DTSTAMP:20250516T060320Z
+            RECURRENCE-ID:20250523T043000Z
+            SEQUENCE:1
+            END:VEVENT
+            BEGIN:VEVENT
+            UID:{eventUid}
+            TRANSP:OPAQUE
+            DTSTART:20250530T073000Z
+            DTEND:20250530T080000Z
+            CLASS:PUBLIC
+            SUMMARY:{removedOccurrenceSummary}
+            ORGANIZER;CN=John1 Doe1:mailto:{organizer}
+            DTSTAMP:20250516T060320Z
+            RECURRENCE-ID:20250530T043000Z
+            SEQUENCE:1
+            END:VEVENT
+            END:VCALENDAR
+            """.replace("{eventUid}", eventUid)
+            .replace("{masterSummary}", masterSummary)
+            .replace("{keptOccurrenceSummary}", keptOccurrenceSummary)
+            .replace("{removedOccurrenceSummary}", removedOccurrenceSummary)
+            .replace("{organizer}", organizer);
+
+        davTestHelper.upsertCalendar(openPaasUser, initialCalendar, eventUid);
+
+        assertEventExistsInSearch(openPaasUser.username(), removedOccurrenceSummary, eventUid);
+
+        // When the event is updated and one overridden occurrence is removed from the calendar payload.
+        String updatedCalendar = """
+            BEGIN:VCALENDAR
+            VERSION:2.0
+            PRODID:-//SabreDAV//SabreDAV 3.2.2//EN
+            BEGIN:VEVENT
+            UID:{eventUid}
+            TRANSP:OPAQUE
+            DTSTART:20250515T043000Z
+            DTEND:20250515T050000Z
+            CLASS:PUBLIC
+            SUMMARY:{masterSummary}
+            RRULE:FREQ=WEEKLY;COUNT=14;BYDAY=FR
+            ORGANIZER;CN=John1 Doe1:mailto:{organizer}
+            DTSTAMP:20250516T060320Z
+            SEQUENCE:2
+            END:VEVENT
+            BEGIN:VEVENT
+            UID:{eventUid}
+            TRANSP:OPAQUE
+            DTSTART:20250523T073000Z
+            DTEND:20250523T080000Z
+            CLASS:PUBLIC
+            SUMMARY:{keptOccurrenceSummary}
+            ORGANIZER;CN=John1 Doe1:mailto:{organizer}
+            DTSTAMP:20250516T060320Z
+            RECURRENCE-ID:20250523T043000Z
+            SEQUENCE:2
+            END:VEVENT
+            END:VCALENDAR
+            """.replace("{eventUid}", eventUid)
+            .replace("{masterSummary}", masterSummary)
+            .replace("{keptOccurrenceSummary}", keptOccurrenceSummary)
+            .replace("{organizer}", organizer);
+
+        davTestHelper.updateCalendar(openPaasUser, updatedCalendar, eventUid);
+
+        // Then the removed occurrence must not remain searchable from the index.
+        awaitAtMost.untilAsserted(() -> assertThat(
+            calendarSearchService.search(simpleQuery(removedOccurrenceSummary, CalendarURL.from(openPaasUser.id())))
+                .collectList()
+                .block()).isEmpty());
     }
 
     @Test
@@ -644,11 +719,12 @@ public class EventIndexerConsumerTest {
 
         davTestHelper.upsertCalendar(openPaasUser, calendarData, eventUid);
 
-        Supplier<Set<EventFields>> searchSupplier = () -> Flux.from(calendarSearchService.search(AccountId.fromUsername(openPaasUser.username()), simpleQuery(summary)))
+        Supplier<Set<EventFields>> searchSupplier = () -> Flux.from(calendarSearchService.search(simpleQuery(summary, CalendarURL.from(openPaasUser.id()))))
             .collect(Collectors.toSet())
             .block();
 
-        awaitAtMost.untilAsserted(() -> assertThat(searchSupplier.get()).hasSize(3));
+        // Occurrences collapse on the uid, keeping the master as the single representative.
+        awaitAtMost.untilAsserted(() -> assertThat(searchSupplier.get()).hasSize(1));
     }
 
     @Test
@@ -695,12 +771,94 @@ public class EventIndexerConsumerTest {
 
         assertEventExistsInSearch(openPaasUser.username(), summary, eventUid);
 
-        EventFields eventFields = calendarSearchService.search(AccountId.fromUsername(openPaasUser.username()), simpleQuery(summary))
+        EventFields eventFields = calendarSearchService.search(simpleQuery(summary, CalendarURL.from(openPaasUser.id())))
             .next()
             .block();
 
         assertThat(eventFields.videoconferenceUrl())
             .isEqualTo(videoconferenceUrl);
+    }
+
+    @Test
+    void shouldHandleResourceEvent(DockerSabreDavSetup dockerSabreDavSetup) {
+        OpenPaaSUser bob = openPaasUser;
+
+        // Given: resource A exists.
+        OpenPaaSDomain domain = dockerSabreDavSetup.getOpenPaaSProvisioningService().getDomain().block();
+        ResourceId resourceId = new MongoDBResourceDAO(dockerSabreDavSetup.getMongoDB(), Clock.systemUTC())
+            .insert(new ResourceInsertRequest(bob.id(),
+                "Resource A description", domain.id(), "projector", "Resource A"))
+            .block();
+        String eventUid = UUID.randomUUID().toString();
+        CalendarURL resourceCalendar = CalendarURL.from(resourceId.asOpenPaaSId());
+        String resourceEmail = Username.fromLocalPartWithDomain(resourceId.value(), domain.domain()).asString();
+        String originalSummary = "Resource Event Original";
+        String calendarData = """
+            BEGIN:VCALENDAR
+            VERSION:2.0
+            CALSCALE:GREGORIAN
+            PRODID:-//SabreDAV//SabreDAV 3.2.2//EN
+            BEGIN:VTIMEZONE
+            TZID:Asia/Ho_Chi_Minh
+            BEGIN:STANDARD
+            TZOFFSETFROM:+0700
+            TZOFFSETTO:+0700
+            TZNAME:ICT
+            DTSTART:19700101T000000
+            END:STANDARD
+            END:VTIMEZONE
+            BEGIN:VEVENT
+            UID:{eventUid}
+            SEQUENCE:1
+            DTSTART;TZID=Asia/Ho_Chi_Minh:20250515T113000
+            DTEND;TZID=Asia/Ho_Chi_Minh:20250515T120000
+            SUMMARY:{summary}
+            ORGANIZER;CN=Bob:mailto:{organizer}
+            ATTENDEE;PARTSTAT=TENTATIVE;RSVP=TRUE;ROLE=REQ-PARTICIPANT;CUTYPE=RESOURCE;CN=Resource A:mailto:{resource}
+            END:VEVENT
+            END:VCALENDAR
+            """.replace("{summary}", originalSummary)
+            .replace("{eventUid}", eventUid)
+            .replace("{organizer}", bob.username().asString())
+            .replace("{resource}", resourceEmail);
+
+        // When: Bob creates an event inviting resource A.
+        davTestHelper.upsertCalendar(bob, calendarData, eventUid);
+
+        // Then: the resource calendar event is indexed.
+        awaitAtMost.untilAsserted(() -> assertThat(
+            Flux.from(calendarSearchService.search(simpleQuery(originalSummary, resourceCalendar)))
+                .map(e -> e.uid().value())
+                .collect(Collectors.toSet())
+                .block()).containsExactly(eventUid));
+
+        // When: Bob updates the event.
+        String updatedSummary = "Resource Event Updated";
+        davTestHelper.updateCalendar(bob, calendarData
+            .replace(originalSummary, updatedSummary)
+            .replace("SEQUENCE:1", "SEQUENCE:2"), eventUid);
+
+        // Then: the resource calendar index reflects the updated event.
+        awaitAtMost.untilAsserted(() -> assertThat(
+            Flux.from(calendarSearchService.search(simpleQuery(originalSummary, resourceCalendar)))
+                .map(e -> e.uid().value())
+                .collectList()
+                .block()).doesNotContain(eventUid));
+        awaitAtMost.untilAsserted(() -> assertThat(
+            Flux.from(calendarSearchService.search(simpleQuery(updatedSummary, resourceCalendar)))
+                .map(e -> e.uid().value())
+                .collect(Collectors.toSet())
+                .block()).containsExactly(eventUid));
+
+        // When: Bob cancels the event.
+        davTestHelper.deleteCalendar(bob, eventUid);
+
+        // Then: the resource calendar event is removed from the index.
+        awaitAtMost.untilAsserted(() -> assertThat(
+            Flux.from(calendarSearchService.search(simpleQuery(updatedSummary, resourceCalendar)))
+                .map(e -> e.uid().value())
+                .collectList()
+                .block()).doesNotContain(eventUid));
     }
 
     @Test
@@ -807,7 +965,7 @@ public class EventIndexerConsumerTest {
 
         awaitAtMost.untilAsserted(() -> {
             List<EventFields> results = calendarSearchService
-                .search(AccountId.fromUsername(openPaasUser.username()), simpleQuery("Test1"))
+                .search(simpleQuery("Test1", CalendarURL.from(openPaasUser.id())))
                 .collectList()
                 .block();
 
@@ -856,16 +1014,16 @@ public class EventIndexerConsumerTest {
 
         awaitAtMost.untilAsserted(() -> {
             List<EventFields> results = calendarSearchService
-                .search(AccountId.fromUsername(openPaasUser.username()), simpleQuery(summary))
+                .search(simpleQuery(summary, CalendarURL.from(openPaasUser.id())))
                 .collectList()
                 .block();
 
-            // Expect only 2 events (master + updated instance)
-            assertThat(results).hasSize(2);
+            // Occurrences collapse on the uid, keeping the master as the single representative: no duplicate.
+            assertThat(results).hasSize(1);
 
-            // The updated instance should be present
+            // The master occurrence is returned as the representative.
             assertThat(results)
-                .anySatisfy(e -> assertThat(e.start()).isEqualTo(Instant.parse("2025-05-18T08:00:00Z")));
+                .allSatisfy(e -> assertThat(e.start()).isEqualTo(Instant.parse("2025-05-10T08:00:00Z")));
         });
     }
 
@@ -908,15 +1066,15 @@ public class EventIndexerConsumerTest {
         }
 
         @Test
-        void shouldRecoverWhenIndexerFailsTemporarilyDuringIndexing() throws InterruptedException {
+        void shouldRecoverWhenIndexerFailsTemporarilyDuringIndexing() {
             Mockito.doReturn(Mono.defer(() -> Mono.error(new RuntimeException("mock exception"))))
-                .when(calendarSearchService).index(any(), any());
+                .when(calendarSearchService).index(any());
 
             String eventUid = UUID.randomUUID().toString();
             String calendarData = getSampleCalendar(eventUid);
             davTestHelper.upsertCalendar(openPaasUser, calendarData, eventUid);
 
-            Thread.sleep(500);
+            awaitAtMost.untilAsserted(() -> Mockito.verify(calendarSearchService, Mockito.atLeastOnce()).index(any()));
             Mockito.reset(calendarSearchService);
 
             davTestHelper.upsertCalendar(openPaasUser, calendarData, eventUid);
@@ -925,7 +1083,7 @@ public class EventIndexerConsumerTest {
         }
 
         @Test
-        void shouldDeleteSuccessfullyAfterTemporaryIndexerFailure() throws InterruptedException {
+        void shouldDeleteSuccessfullyAfterTemporaryIndexerFailure() {
             String eventUid = UUID.randomUUID().toString();
             String calendarData = getSampleCalendar(eventUid);
             davTestHelper.upsertCalendar(openPaasUser, calendarData, eventUid);
@@ -941,7 +1099,7 @@ public class EventIndexerConsumerTest {
                 .when(calendarSearchService).delete(any(), any());
 
             davTestHelper.deleteCalendar(openPaasUser, eventUid);
-            Thread.sleep(500);
+            awaitAtMost.untilAsserted(() -> Mockito.verify(calendarSearchService, Mockito.atLeastOnce()).delete(any(), any()));
 
             Mockito.reset(calendarSearchService);
             davTestHelper.deleteCalendar(openPaasUser, eventUid2);
@@ -961,7 +1119,6 @@ public class EventIndexerConsumerTest {
                     amqpMessage.getBytes(UTF_8))))
                 .block();
 
-            Thread.sleep(200);
             String eventUid = UUID.randomUUID().toString();
             String calendarData = getSampleCalendar(eventUid);
             davTestHelper.upsertCalendar(openPaasUser, calendarData, eventUid);
@@ -972,7 +1129,7 @@ public class EventIndexerConsumerTest {
 
     private void assertEventExistsInSearch(Username username, String query, String expectedUid) {
         awaitAtMost.untilAsserted(() -> assertThat(
-            Flux.from(calendarSearchService.search(AccountId.fromUsername(username), simpleQuery(query)))
+            Flux.from(calendarSearchService.search(simpleQuery(query, calendarURL(username))))
                 .map(e -> e.uid().value())
                 .collect(Collectors.toSet())
                 .block()).containsExactly(expectedUid));
@@ -981,15 +1138,28 @@ public class EventIndexerConsumerTest {
 
     private void assertEventNotInSearch(Username username, String query, String unexpectedUid) {
         awaitAtMost.untilAsserted(() -> assertThat(
-            Flux.from(calendarSearchService.search(AccountId.fromUsername(username), simpleQuery(query)))
+            Flux.from(calendarSearchService.search(simpleQuery(query, calendarURL(username))))
                 .map(e -> e.uid().value())
                 .collectList()
                 .block()).doesNotContain(unexpectedUid));
     }
 
-    private EventSearchQuery simpleQuery(String query) {
-        return new EventSearchQuery(query, Optional.empty(),
-            Optional.empty(), Optional.empty(),
+    private CalendarURL calendarURL(Username username) {
+        if (openPaasUser.username().equals(username)) {
+            return CalendarURL.from(openPaasUser.id());
+        }
+        if (attendee1.username().equals(username)) {
+            return CalendarURL.from(attendee1.id());
+        }
+        if (attendee2.username().equals(username)) {
+            return CalendarURL.from(attendee2.id());
+        }
+        throw new IllegalArgumentException("Unknown test user " + username.asString());
+    }
+
+    private EventSearchQuery simpleQuery(String query, CalendarURL calendarURL) {
+        return new EventSearchQuery(query, Optional.of(List.of(calendarURL)),
+            Optional.empty(), Optional.empty(), Optional.empty(),
             EventSearchQuery.MAX_LIMIT, 0);
     }
 

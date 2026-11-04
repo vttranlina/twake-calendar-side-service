@@ -46,7 +46,6 @@ import com.linagora.calendar.storage.configuration.EntryIdentifier;
 import com.linagora.calendar.storage.configuration.ModuleName;
 import com.linagora.calendar.storage.configuration.UserConfigurationDAO;
 import com.linagora.calendar.storage.configuration.resolver.SettingsBasedResolver.LanguageSettingReader;
-import com.linagora.calendar.storage.exception.UserNotFoundException;
 import com.linagora.tmail.saas.rabbitmq.settings.TWPCommonSettingsMessage;
 import com.linagora.tmail.saas.rabbitmq.settings.TWPCommonSettingsMessage.IncomingLanguageSetting;
 import com.linagora.tmail.saas.rabbitmq.settings.TWPSettingsUpdater;
@@ -63,24 +62,31 @@ public class CalendarSettingUpdater implements TWPSettingsUpdater {
 
     private final UserConfigurationDAO userConfigurationDAO;
     private final OpenPaaSUserDAO openPaaSUserDAO;
+    private final SaaSUserProvisioner userProvisioner;
     private final SimpleSessionProvider sessionProvider;
 
     public CalendarSettingUpdater(UserConfigurationDAO userConfigurationDAO,
                                   OpenPaaSUserDAO openPaaSUserDAO,
+                                  SaaSUserProvisioner userProvisioner,
                                   SimpleSessionProvider sessionProvider) {
         this.userConfigurationDAO = userConfigurationDAO;
         this.openPaaSUserDAO = openPaaSUserDAO;
+        this.userProvisioner = userProvisioner;
         this.sessionProvider = sessionProvider;
     }
 
     @Override
     public Mono<Void> updateSettings(TWPCommonSettingsMessage message) {
-        return message.languageSettings()
-            .map(incomingLanguageSetting -> resolveUsername(message)
-                .flatMap(session -> updateSetting(session, incomingLanguageSetting))
-                .then())
-            .orElse(Mono.empty())
+        Username username = Username.of(message.payload().email());
+        return resolveUser(username)
+            .flatMap(user -> updateLanguageSettingIfPresent(user, message))
             .doOnError(error -> LOGGER.error("Error occurred while updating calendar settings for user={} ", message.payload().email(), error));
+    }
+
+    private Mono<Void> updateLanguageSettingIfPresent(OpenPaaSUser user, TWPCommonSettingsMessage message) {
+        return message.languageSettings()
+            .map(incomingLanguageSetting -> updateSetting(sessionProvider.createSession(user.username()), incomingLanguageSetting))
+            .orElse(Mono.empty());
     }
 
     private Mono<Void> updateSetting(MailboxSession session, IncomingLanguageSetting incomingLanguageSetting) {
@@ -114,12 +120,10 @@ public class CalendarSettingUpdater implements TWPSettingsUpdater {
         return userConfigurationDAO.persistConfiguration(mergedConfiguration, session);
     }
 
-    private Mono<MailboxSession> resolveUsername(TWPCommonSettingsMessage message) {
-        Username username = Username.of(message.payload().email());
+    private Mono<OpenPaaSUser> resolveUser(Username username) {
         return openPaaSUserDAO.retrieve(username)
-            .map(OpenPaaSUser::username)
-            .map(sessionProvider::createSession)
-            .switchIfEmpty(Mono.defer(() -> Mono.error(new UserNotFoundException(username))));
+            .flatMap(userProvisioner::reimportDisplayName)
+            .switchIfEmpty(Mono.defer(() -> userProvisioner.provisionUser(username)));
     }
 
     record StoredLanguageSetting(Locale locale, Optional<Long> version) {

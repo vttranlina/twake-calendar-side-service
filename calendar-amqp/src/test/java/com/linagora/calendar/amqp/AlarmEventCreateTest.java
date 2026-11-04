@@ -67,6 +67,8 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.RegisterExtension;
 import org.mockito.Mockito;
+import org.awaitility.Awaitility;
+import org.awaitility.core.ConditionFactory;
 
 import com.linagora.calendar.api.CalendarUtil;
 import com.linagora.calendar.smtp.EventEmailFilter;
@@ -74,7 +76,6 @@ import com.linagora.calendar.dav.CalDavClient;
 import com.linagora.calendar.dav.CalDavEventRepository;
 import com.linagora.calendar.dav.DavTestHelper;
 import com.linagora.calendar.dav.DockerSabreDavSetup;
-import com.linagora.calendar.dav.SabreDavExtension;
 import com.linagora.calendar.storage.AlarmEvent;
 import com.linagora.calendar.storage.AlarmEventDAO;
 import com.linagora.calendar.storage.AlarmEventFactory;
@@ -101,9 +102,15 @@ import reactor.rabbitmq.Sender;
 public class AlarmEventCreateTest {
 
     @RegisterExtension
-    static SabreDavExtension sabreDavExtension = new SabreDavExtension(DockerSabreDavSetup.SINGLETON);
+    static SabreDavWithAsyncSchedulingExtension sabreDavExtension = new SabreDavWithAsyncSchedulingExtension();
+
     private static final SettingsBasedResolver settingsResolver = mock(SettingsBasedResolver.class);
     private static final EventEmailFilter eventEmailFilter = spy(EventEmailFilter.acceptAll());
+    private static final ConditionFactory negativeAwait = Awaitility.with()
+        .pollInterval(Duration.ofMillis(200))
+        .pollDelay(Duration.ZERO)
+        .await()
+        .during(Duration.ofSeconds(1));
 
     private static OpenPaaSUserDAO openPaaSUserDAO;
     private static ReactorRabbitMQChannelPool channelPool;
@@ -246,10 +253,10 @@ public class AlarmEventCreateTest {
             BEGIN:VALARM
             TRIGGER:-PT10M
             ACTION:EMAIL
-            ATTENDEE:mailto:%s
+            %s
             SUMMARY:Meeting Reminder
             DESCRIPTION:You have a meeting
-            END:VALARM""".formatted(organizer.username().asString());
+            END:VALARM""".formatted(alarmAttendeeLines(List.of(attendee.username().asString())));
 
         // Organizer creates a calendar event; attendee has not accepted yet
         String initialCalendar = generateEventWithValarm(
@@ -301,10 +308,10 @@ public class AlarmEventCreateTest {
             BEGIN:VALARM
             TRIGGER:-PT10M
             ACTION:EMAIL
-            ATTENDEE:mailto:%s
+            %s
             SUMMARY:Meeting Reminder
             DESCRIPTION:This is an automatic alarm sent by OpenPaas
-            END:VALARM""".formatted(organizer.username().asString());
+            END:VALARM""".formatted(alarmAttendeeLines(List.of(attendee1Email, attendee2Email)));
 
         String calendarData = generateEventWithValarm(
             eventUid,
@@ -354,10 +361,10 @@ public class AlarmEventCreateTest {
             BEGIN:VALARM
             TRIGGER:-PT10M
             ACTION:EMAIL
-            ATTENDEE:mailto:%s
+            %s
             SUMMARY:Meeting Reminder
             DESCRIPTION:This is an automatic alarm sent by OpenPaas
-            END:VALARM""".formatted(organizer.username().asString());
+            END:VALARM""".formatted(alarmAttendeeLines(List.of(attendee1Email, attendee2Email)));
 
         String calendarData = generateEventWithValarm(
             eventUid,
@@ -402,10 +409,10 @@ public class AlarmEventCreateTest {
             BEGIN:VALARM
             TRIGGER:-PT5M
             ACTION:EMAIL
-            ATTENDEE:mailto:%s
+            %s
             SUMMARY:Recurring Meeting Reminder
             DESCRIPTION:This is an automatic recurring alarm
-            END:VALARM""".formatted(organizerEmail);
+            END:VALARM""".formatted(alarmAttendeeLines(List.of(organizerEmail, attendeeEmail)));
 
         String calendarData = generateRecurringEventWithValarm(
             eventUid,
@@ -494,11 +501,11 @@ public class AlarmEventCreateTest {
         // When: Organizer creates an event with VALARM
         davTestHelper.upsertCalendar(organizer, calendarData, eventUid);
 
-        Thread.sleep(1000);
         // Then: No AlarmEvent should be created for the organizer
-        assertThat(alarmEventDAO.find(new EventUid(eventUid),
-            organizer.username().asMailAddress()).blockOptional())
-            .isEmpty();
+        negativeAwait
+            .untilAsserted(() -> assertThat(alarmEventDAO.find(new EventUid(eventUid),
+                organizer.username().asMailAddress()).blockOptional())
+                .isEmpty());
     }
 
 
@@ -527,11 +534,11 @@ public class AlarmEventCreateTest {
         // When: Organizer creates an event with VALARM
         davTestHelper.upsertCalendar(organizer, calendarData, eventUid);
 
-        Thread.sleep(1000);
         // Then: No AlarmEvent should be created for the organizer
-        assertThat(alarmEventDAO.find(new EventUid(eventUid),
-            organizer.username().asMailAddress()).blockOptional())
-            .isEmpty();
+        negativeAwait
+            .untilAsserted(() -> assertThat(alarmEventDAO.find(new EventUid(eventUid),
+                organizer.username().asMailAddress()).blockOptional())
+                .isEmpty());
     }
 
     @Test
@@ -561,12 +568,11 @@ public class AlarmEventCreateTest {
         // When: Organizer creates the event in CalDAV
         davTestHelper.upsertCalendar(organizer, calendarData, eventUid);
 
-        Thread.sleep(1000);
-
         // Then: No AlarmEvent should be created for the external attendee
-        assertThat(alarmEventDAO.find(new EventUid(eventUid), new MailAddress(externalAttendeeEmail))
-            .blockOptional())
-            .isEmpty();
+        negativeAwait
+            .untilAsserted(() -> assertThat(alarmEventDAO.find(new EventUid(eventUid), new MailAddress(externalAttendeeEmail))
+                .blockOptional())
+                .isEmpty());
     }
 
     @Test
@@ -767,7 +773,7 @@ public class AlarmEventCreateTest {
 
             String calendarData = generateDailyRecurringEventWithValarm(
                 eventUid, organizerEmail, List.of(attendeeEmail), PartStat.NEEDS_ACTION,
-                valarmFor(organizerEmail));
+                valarmFor(attendeeEmail));
 
             Instant firstOccurrenceStart = extractStartTime(calendarData);
             Instant secondOccurrenceStart = firstOccurrenceStart.plus(1, ChronoUnit.DAYS);
@@ -810,7 +816,7 @@ public class AlarmEventCreateTest {
 
             String organizerIcs = generateDailyRecurringEventWithValarm(
                 eventUid, organizerEmail, List.of(attendeeEmail), PartStat.NEEDS_ACTION,
-                valarmFor(organizerEmail));
+                valarmFor(attendeeEmail));
 
             Instant firstOccurrenceStart = extractStartTime(organizerIcs);
             Instant secondOccurrenceStart = firstOccurrenceStart.plus(1, ChronoUnit.DAYS);
@@ -855,6 +861,12 @@ public class AlarmEventCreateTest {
             SUMMARY:Daily Standup Reminder
             DESCRIPTION:This is an automatic alarm sent by OpenPaas
             END:VALARM""".formatted(email);
+    }
+
+    private String alarmAttendeeLines(List<String> emails) {
+        return emails.stream()
+            .map("ATTENDEE:mailto:%s"::formatted)
+            .collect(Collectors.joining("\n"));
     }
 
     private String generateDailyRecurringEventWithValarm(String eventUid, String organizerEmail,

@@ -23,14 +23,29 @@ import java.util.Optional;
 
 import com.fasterxml.jackson.annotation.JsonInclude;
 import com.fasterxml.jackson.annotation.JsonProperty;
+import com.fasterxml.jackson.databind.JsonNode;
 import com.linagora.calendar.storage.booking.BookingLink;
+import com.linagora.calendar.storage.booking.BookingLinkExtraAttendeeUtil;
+import com.linagora.calendar.storage.booking.BookingLinkResourceUtil;
+import com.linagora.calendar.storage.booking.EventTransparency;
+import com.linagora.calendar.storage.booking.EventVisibility;
 
 @JsonInclude(JsonInclude.Include.NON_ABSENT)
 public record BookingLinkDTO(@JsonProperty("publicId") String publicId,
                              @JsonProperty("calendarUrl") String calendarUrl,
                              @JsonProperty("durationMinutes") long durationMinutes,
                              @JsonProperty("active") boolean active,
-                             @JsonProperty("availabilityRules") Optional<List<AvailabilityRuleDTO>> availabilityRules) {
+                             @JsonProperty("autoAccept") boolean autoAccept,
+                             @JsonProperty("availabilityRules") Optional<List<AvailabilityRuleDTO>> availabilityRules,
+                             @JsonProperty("extraAttendees") Optional<JsonNode> extraAttendees,
+                             @JsonProperty("name") Optional<String> name,
+                             @JsonProperty("description") Optional<String> description,
+                             @JsonProperty("color") String color,
+                             @JsonProperty("location") Optional<String> location,
+                             @JsonProperty("visibility") Optional<String> visibility,
+                             @JsonProperty("transparency") Optional<String> transparency,
+                             @JsonProperty("resources") Optional<List<String>> resources,
+                             @JsonProperty("alarm") Optional<List<BookingLinkAlarmDTO>> alarm) {
 
     public static BookingLinkDTO from(BookingLink bookingLink) {
         Optional<List<AvailabilityRuleDTO>> ruleDTOs = bookingLink.availabilityRules()
@@ -38,11 +53,29 @@ public record BookingLinkDTO(@JsonProperty("publicId") String publicId,
                 .map(AvailabilityRuleDTO::from)
                 .toList());
 
+        Optional<JsonNode> extraAttendees = Optional.of(bookingLink.extraAttendees())
+            .filter(attendees -> !attendees.isEmpty())
+            .map(BookingLinkExtraAttendeeUtil::serialize);
+
+        Optional<List<String>> resources = Optional.of(bookingLink.resources())
+            .filter(list -> !list.isEmpty())
+            .map(BookingLinkResourceUtil::serialize);
+
         return new BookingLinkDTO(
             bookingLink.publicId().value().toString(),
             bookingLink.calendarUrl().asUri().toString(),
             bookingLink.duration().toMinutes(),
             bookingLink.active(),
-            ruleDTOs);
+            bookingLink.autoAccept(),
+            ruleDTOs,
+            extraAttendees,
+            bookingLink.name(),
+            bookingLink.description(),
+            bookingLink.colorOrDefault(),
+            bookingLink.location(),
+            bookingLink.visibility().map(EventVisibility::value),
+            bookingLink.transparency().map(EventTransparency::value),
+            resources,
+            BookingLinkAlarmDTO.from(bookingLink.alarm()));
     }
 }

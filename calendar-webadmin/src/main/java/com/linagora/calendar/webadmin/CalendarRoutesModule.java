@@ -37,9 +37,9 @@ import com.google.inject.name.Named;
 import com.google.inject.name.Names;
 import com.linagora.calendar.webadmin.task.AddMissingFieldsTaskAdditionalInformationDTO;
 import com.linagora.calendar.webadmin.task.AlarmScheduleTaskAdditionalInformationDTO;
+import com.linagora.calendar.webadmin.task.BookingLinkEventDeletionTaskAdditionalInformationDTO;
 import com.linagora.calendar.webadmin.task.CalendarArchivalTaskAdditionalInformationDTO;
 import com.linagora.calendar.webadmin.task.CalendarEventsReindexTaskAdditionalInformationDTO;
-import com.linagora.calendar.webadmin.task.RepositionResourceRightsTaskAdditionalInformationDTO;
 
 public class CalendarRoutesModule extends AbstractModule {
     public static final String USER_CALENDAR_TASKS_KEY = "USER_CALENDAR";
@@ -52,8 +52,14 @@ public class CalendarRoutesModule extends AbstractModule {
         routesMultibinder.addBinding().to(CalendarChannelLogoutRoutes.class);
         routesMultibinder.addBinding().to(CalendarRoutes.class);
         routesMultibinder.addBinding().to(ResourceRoutes.class);
+        routesMultibinder.addBinding().to(TeamCalendarRoutes.class);
+        routesMultibinder.addBinding().to(TeamCalendarMemberRoutes.class);
         routesMultibinder.addBinding().to(DomainAdminRoutes.class);
         routesMultibinder.addBinding().to(DomainRegisteredUsersRoutes.class);
+        routesMultibinder.addBinding().to(DomainSettingsRoutes.class);
+        routesMultibinder.addBinding().to(UserCalendarRoutes.class);
+        routesMultibinder.addBinding().to(UserAddressBookRoutes.class);
+        routesMultibinder.addBinding().to(BookingLinkUserRoutes.class);
 
         bind(MemoryTaskManager.class).in(Scopes.SINGLETON);
         bind(TaskManager.class).to(MemoryTaskManager.class);
@@ -88,12 +94,6 @@ public class CalendarRoutesModule extends AbstractModule {
 
     @Named(DTOModuleInjections.WEBADMIN_DTO)
     @ProvidesIntoSet
-    public AdditionalInformationDTOModule<? extends TaskExecutionDetails.AdditionalInformation, ? extends AdditionalInformationDTO> repositionResourceRightsTaskAdditionalInformation() {
-        return RepositionResourceRightsTaskAdditionalInformationDTO.module();
-    }
-
-    @Named(DTOModuleInjections.WEBADMIN_DTO)
-    @ProvidesIntoSet
     public AdditionalInformationDTOModule<? extends TaskExecutionDetails.AdditionalInformation, ? extends AdditionalInformationDTO> addMissingFieldsTaskAdditionalInformation() {
         return AddMissingFieldsTaskAdditionalInformationDTO.module();
     }
@@ -102,5 +102,11 @@ public class CalendarRoutesModule extends AbstractModule {
     @ProvidesIntoSet
     public AdditionalInformationDTOModule<? extends TaskExecutionDetails.AdditionalInformation, ? extends AdditionalInformationDTO> calendarArchivalTaskAdditionalInformation() {
         return CalendarArchivalTaskAdditionalInformationDTO.module();
+    }
+
+    @Named(DTOModuleInjections.WEBADMIN_DTO)
+    @ProvidesIntoSet
+    public AdditionalInformationDTOModule<? extends TaskExecutionDetails.AdditionalInformation, ? extends AdditionalInformationDTO> bookingLinkEventDeletionTaskAdditionalInformation() {
+        return BookingLinkEventDeletionTaskAdditionalInformationDTO.module();
     }
 }

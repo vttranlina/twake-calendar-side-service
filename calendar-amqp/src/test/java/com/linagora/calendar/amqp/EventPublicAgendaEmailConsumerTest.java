@@ -24,6 +24,7 @@ import static com.linagora.calendar.storage.configuration.EntryIdentifier.LANGUA
 import static com.linagora.calendar.storage.configuration.resolver.SettingsBasedResolver.TimeZoneSettingReader.TIMEZONE_IDENTIFIER;
 import static io.restassured.RestAssured.given;
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.SoftAssertions.assertSoftly;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.spy;
@@ -38,6 +39,7 @@ import java.time.Duration;
 import java.time.ZoneId;
 import java.util.Base64;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Optional;
@@ -46,6 +48,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.function.Supplier;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
+import java.util.stream.IntStream;
 
 import org.apache.james.backends.rabbitmq.QueueArguments;
 import org.apache.james.backends.rabbitmq.RabbitMQConfiguration;
@@ -67,17 +70,14 @@ import org.junit.jupiter.api.Order;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.RegisterExtension;
 import org.mockito.Mockito;
-import org.testcontainers.shaded.org.awaitility.Awaitility;
-import org.testcontainers.shaded.org.awaitility.core.ConditionFactory;
+import org.awaitility.Awaitility;
+import org.awaitility.core.ConditionFactory;
 
-import com.fasterxml.jackson.databind.ObjectMapper;
-import com.fasterxml.jackson.datatype.jdk8.Jdk8Module;
 import com.linagora.calendar.api.EventParticipationActionLinkFactory;
 import com.linagora.calendar.api.Participation;
 import com.linagora.calendar.api.ParticipationTokenSigner;
 import com.linagora.calendar.dav.DavTestHelper;
 import com.linagora.calendar.dav.DockerSabreDavSetup;
-import com.linagora.calendar.dav.SabreDavExtension;
 import com.linagora.calendar.smtp.EventEmailFilter;
 import com.linagora.calendar.smtp.MailSender;
 import com.linagora.calendar.smtp.MailSenderConfiguration;
@@ -99,15 +99,13 @@ import io.restassured.path.json.JsonPath;
 import io.restassured.specification.RequestSpecification;
 import net.fortuna.ical4j.model.parameter.PartStat;
 import reactor.core.publisher.Mono;
-import reactor.rabbitmq.OutboundMessage;
-import reactor.rabbitmq.Sender;
 
 public class EventPublicAgendaEmailConsumerTest {
     private static final String X_PUBLICLY_CREATED_HEADER = "X-PUBLICLY-CREATED:true";
     private static final String X_PUBLICLY_CREATOR_HEADER = "X-PUBLICLY-CREATOR:%s";
+    private static final String X_PUBLICLY_CANCELLED_BY_HEADER = "X-PUBLICLY-CANCELLED-BY:%s";
     private static final int INITIAL_SEQUENCE = 1;
     private static final int UPDATED_SEQUENCE = INITIAL_SEQUENCE + 1;
-    private static final ObjectMapper OBJECT_MAPPER = new ObjectMapper().registerModule(new Jdk8Module());
 
     private final ConditionFactory calmlyAwait = Awaitility.with()
         .pollInterval(Duration.ofMillis(500))
@@ -120,7 +118,7 @@ public class EventPublicAgendaEmailConsumerTest {
 
     @RegisterExtension
     @Order(1)
-    static SabreDavExtension sabreDavExtension = new SabreDavExtension(DockerSabreDavSetup.SINGLETON);
+    static SabreDavWithAsyncSchedulingExtension sabreDavExtension = new SabreDavWithAsyncSchedulingExtension();
 
     @RegisterExtension
     @Order(2)
@@ -161,7 +159,6 @@ public class EventPublicAgendaEmailConsumerTest {
 
     private OpenPaaSUser organizer;
     private OpenPaaSUser attendee;
-    private Sender sender;
     private UsersRepository usersRepository;
     private EventEmailConsumer consumer;
 
@@ -239,8 +236,6 @@ public class EventPublicAgendaEmailConsumerTest {
         consumer = new EventEmailConsumer(channelPool, QueueArguments.Builder::new, mailHandler,
             eventEmailFilter, new RecordingMetricFactory());
         consumer.init();
-
-        sender = channelPool.getSender();
     }
 
     static RequestSpecification mockSMTPRequestSpecification() {
@@ -264,6 +259,7 @@ public class EventPublicAgendaEmailConsumerTest {
 
     @Test
     void shouldSendEmailWhenOrganizerPartStatUpdatedFromNeedsActionToAcceptedOnPublicAgenda() {
+        // Given: a public agenda event waiting for organizer confirmation.
         String eventUid = UUID.randomUUID().toString();
         String initialCalendarData = generatePublicAgendaCalendar(eventUid, organizer.username().asString(),
             attendee.username().asString(), PartStat.NEEDS_ACTION, INITIAL_SEQUENCE);
@@ -271,11 +267,13 @@ public class EventPublicAgendaEmailConsumerTest {
         calmlyAwaitDuringNoEmail
             .untilAsserted(() -> assertThat(smtpMailsResponseSupplier.get().getList("")).isEmpty());
 
+        // When: organizer accepts the event.
         mockSmtpExtension.clear();
         String updatedCalendarData = generatePublicAgendaCalendar(eventUid, organizer.username().asString(),
             attendee.username().asString(), PartStat.ACCEPTED, UPDATED_SEQUENCE);
         davTestHelper.upsertCalendar(organizer, updatedCalendarData, eventUid);
 
+        // Then: the booker receives a booking-confirmed email.
         awaitAtMostForEmailDelivery
             .untilAsserted(() -> assertThat(smtpMailsResponseSupplier.get().getList("")).hasSize(1));
 
@@ -295,8 +293,159 @@ public class EventPublicAgendaEmailConsumerTest {
             .contains("Content-Type: application/ics")
             .contains("filename=\"meeting.ics\"")
             .doesNotContain("Public agenda event notification.");
+        assertThat(extractDecodedPart(message, "text/calendar; charset=UTF-8; method=REQUEST"))
+            .contains("METHOD:REQUEST");
         assertThat(smtpMailsResponse.getString("[0].from")).isEqualTo(organizer.username().asString());
         assertThat(smtpMailsResponse.getString("[0].recipients[0].address")).isEqualTo(attendee.username().asString());
+    }
+
+    @Test
+    void shouldSendEmailWhenOrganizerPartStatUpdatedFromNeedsActionToDeclinedOnPublicAgenda() {
+        // Given: a public agenda event waiting for organizer confirmation.
+        String eventUid = UUID.randomUUID().toString();
+        String initialCalendarData = generatePublicAgendaCalendar(eventUid, organizer.username().asString(),
+            attendee.username().asString(), PartStat.NEEDS_ACTION, INITIAL_SEQUENCE);
+        davTestHelper.upsertCalendar(organizer, initialCalendarData, eventUid);
+        calmlyAwaitDuringNoEmail
+            .untilAsserted(() -> assertThat(smtpMailsResponseSupplier.get().getList("")).isEmpty());
+
+        // When: organizer declines the event.
+        mockSmtpExtension.clear();
+        String updatedCalendarData = generatePublicAgendaCalendar(eventUid, organizer.username().asString(),
+            attendee.username().asString(), PartStat.DECLINED, UPDATED_SEQUENCE);
+        davTestHelper.upsertCalendar(organizer, updatedCalendarData, eventUid);
+
+        // Then: the booker learns the proposal was turned down.
+        awaitAtMostForEmailDelivery
+            .untilAsserted(() -> assertThat(smtpMailsResponseSupplier.get().getList("")).hasSize(1));
+
+        JsonPath smtpMailsResponse = smtpMailsResponseSupplier.get();
+        String message = smtpMailsResponse.getString("[0].message");
+
+        assertSoftly(softly -> {
+            softly.assertThat(message)
+                .containsIgnoringNewLines("Subject: Van Tung TRAN has declined your event proposal: Publicly created meeting")
+                .contains("Content-Type: text/html; charset=UTF-8")
+                .doesNotContain("text/calendar")
+                .doesNotContain("application/ics");
+            softly.assertThat(smtpMailsResponse.getString("[0].from")).isEqualTo(organizer.username().asString());
+            softly.assertThat(smtpMailsResponse.getString("[0].recipients[0].address")).isEqualTo(attendee.username().asString());
+
+            softly.assertThat(extractDecodedPart(message, "text/html; charset=UTF-8"))
+                .contains("Van Tung TRAN")
+                .contains("has declined your event proposal")
+                .contains("(Proposer)")
+                .doesNotContain("has accepted");
+        });
+    }
+
+    @Test
+    void shouldSendLocalizedBookingDeclinedEmailAccordingToRecipientLanguage() {
+        when(settingsResolver.resolveOrDefault(any(Username.class), any(Username.class)))
+            .thenReturn(Mono.just(new SettingsBasedResolver.ResolvedSettings(
+                Map.of(
+                    LANGUAGE_IDENTIFIER, Locale.FRENCH,
+                    TIMEZONE_IDENTIFIER, ZoneId.of("Europe/Paris")))));
+
+        String eventUid = UUID.randomUUID().toString();
+        davTestHelper.upsertCalendar(organizer, generatePublicAgendaCalendar(eventUid, organizer.username().asString(),
+            attendee.username().asString(), PartStat.NEEDS_ACTION, INITIAL_SEQUENCE), eventUid);
+        calmlyAwaitDuringNoEmail
+            .untilAsserted(() -> assertThat(smtpMailsResponseSupplier.get().getList("")).isEmpty());
+
+        mockSmtpExtension.clear();
+        davTestHelper.upsertCalendar(organizer, generatePublicAgendaCalendar(eventUid, organizer.username().asString(),
+            attendee.username().asString(), PartStat.DECLINED, UPDATED_SEQUENCE), eventUid);
+
+        awaitAtMostForEmailDelivery
+            .untilAsserted(() -> assertThat(smtpMailsResponseSupplier.get().getList("")).hasSize(1));
+
+        JsonPath smtpMailsResponse = smtpMailsResponseSupplier.get();
+        String message = smtpMailsResponse.getString("[0].message");
+
+        assertSoftly(softly -> {
+            softly.assertThat(message)
+                .contains("Content-Type: text/html; charset=UTF-8")
+                .contains("Content-Language: fr")
+                .doesNotContain("text/calendar")
+                .doesNotContain("application/ics");
+            softly.assertThat(smtpMailsResponse.getString("[0].from")).isEqualTo(organizer.username().asString());
+            softly.assertThat(smtpMailsResponse.getString("[0].recipients[0].address")).isEqualTo(attendee.username().asString());
+
+            assertThat(extractDecodedPart(message, "text/html; charset=UTF-8"))
+                .contains("a refus&eacute; la proposition d'&eacute;v&eacute;nement de vous")
+                .contains("Heure")
+                .contains("(Organisateur)")
+                .contains("(Proposant)");
+        });
+    }
+
+    @Test
+    void shouldSendCancelEmailToBookerWhenOrganizerDeletesAcceptedPublicAgendaEvent() {
+        // Given: an accepted public agenda event already confirmed to the booker.
+        String eventUid = UUID.randomUUID().toString();
+        String calendarData = generatePublicAgendaCalendar(eventUid, organizer.username().asString(),
+            attendee.username().asString(), PartStat.ACCEPTED, UPDATED_SEQUENCE);
+        davTestHelper.upsertCalendar(organizer, calendarData, eventUid);
+        awaitAtMostForEmailDelivery
+            .untilAsserted(() -> assertThat(smtpMailsResponseSupplier.get().getList("")).hasSize(1));
+        mockSmtpExtension.clear();
+
+        // When: organizer deletes the event.
+        davTestHelper.deleteCalendar(organizer, eventUid);
+
+        // Then: the booker receives a cancel email
+        awaitAtMostForEmailDelivery
+            .untilAsserted(() -> assertThat(smtpMailsResponseSupplier.get().getList("")).hasSize(1));
+
+        JsonPath smtpMailsResponse = smtpMailsResponseSupplier.get();
+        String message = smtpMailsResponse.getString("[0].message");
+
+        assertSoftly(softly -> {
+            softly.assertThat(smtpMailsResponse.getString("[0].from")).isEqualTo(organizer.username().asString());
+            softly.assertThat(smtpMailsResponse.getString("[0].recipients[0].address")).isEqualTo(attendee.username().asString());
+            softly.assertThat(message)
+                .contains("Subject: Event Publicly created meeting from")
+                .contains("canceled")
+                .contains("Content-Type: text/html; charset=UTF-8");
+            softly.assertThat(getHtml(message))
+                .contains("has canceled an event")
+                .contains("Van Tung TRAN")
+                .contains("Bob");
+        });
+    }
+
+    @Test
+    void shouldSendCancelEmailToBookerWhenOrganizerDeletesUnacceptedPublicAgendaEvent() {
+        // Given: a booking proposal the organizer has not answered yet.
+        String eventUid = UUID.randomUUID().toString();
+        davTestHelper.upsertCalendar(organizer, generatePublicAgendaCalendar(eventUid, organizer.username().asString(),
+            attendee.username().asString(), PartStat.NEEDS_ACTION, INITIAL_SEQUENCE), eventUid);
+        calmlyAwaitDuringNoEmail
+            .untilAsserted(() -> assertThat(smtpMailsResponseSupplier.get().getList("")).isEmpty());
+
+        // When: organizer deletes the event instead of answering the proposal.
+        davTestHelper.deleteCalendar(organizer, eventUid);
+
+        // Then: the booker is told the event has been cancelled.
+        awaitAtMostForEmailDelivery
+            .untilAsserted(() -> assertThat(smtpMailsResponseSupplier.get().getList("")).hasSize(1));
+
+        JsonPath smtpMailsResponse = smtpMailsResponseSupplier.get();
+        String message = smtpMailsResponse.getString("[0].message");
+
+        assertSoftly(softly -> {
+            softly.assertThat(smtpMailsResponse.getString("[0].from")).isEqualTo(organizer.username().asString());
+            softly.assertThat(smtpMailsResponse.getString("[0].recipients[0].address")).isEqualTo(attendee.username().asString());
+            softly.assertThat(message)
+                .contains("Subject: Event Publicly created meeting from")
+                .contains("canceled")
+                .contains("Content-Type: text/html; charset=UTF-8");
+            softly.assertThat(getHtml(message))
+                .contains("has canceled an event")
+                .contains("Van Tung TRAN")
+                .contains("Bob");
+        });
     }
 
     @Test
@@ -427,13 +576,105 @@ public class EventPublicAgendaEmailConsumerTest {
     }
 
     @Test
-    void shouldRecoverWhenProposerIsNotPresentInAttendees() throws Exception {
-        publishNotificationEmail(attendee.username().asString(), generatePublicAgendaCalendarWithCustomCreator(UUID.randomUUID().toString(),
-            organizer.username().asString(), attendee.username().asString(), PartStat.ACCEPTED, UPDATED_SEQUENCE,
-            "unknown-proposer@" + UUID.randomUUID() + ".com", null));
+    void shouldIgnoreBookerCancellationItipToCreatorButNotifyAdditionalAttendeeOnce() {
+        String additionalAttendeeEmail = "additional-attendee-" + UUID.randomUUID() + "@external-domain.com";
+        String eventUid = UUID.randomUUID().toString();
+        String calendarData = generatePublicAgendaCalendar(eventUid, organizer.username().asString(),
+            attendee.username().asString(), PartStat.ACCEPTED, UPDATED_SEQUENCE, additionalAttendeeEmail);
+        davTestHelper.upsertCalendar(organizer, calendarData, eventUid);
+        awaitAtMostForEmailDelivery
+            .untilAsserted(() -> assertThat(smtpMailsResponseSupplier.get().getList("")).hasSize(2));
+        mockSmtpExtension.clear();
 
-        publishNotificationEmail(attendee.username().asString(), generatePublicAgendaCalendar(UUID.randomUUID().toString(),
-            organizer.username().asString(), attendee.username().asString(), PartStat.ACCEPTED, UPDATED_SEQUENCE));
+        davTestHelper.upsertCalendar(organizer, withPubliclyCancelledBy(calendarData, attendee.username().asString()), eventUid);
+        calmlyAwaitDuringNoEmail
+            .untilAsserted(() -> assertThat(smtpMailsResponseSupplier.get().getList("")).isEmpty());
+
+        davTestHelper.deleteCalendar(organizer, eventUid);
+
+        awaitAtMostForEmailDelivery
+            .untilAsserted(() -> assertThat(smtpMailsResponseSupplier.get().getList("")).hasSize(1));
+        calmlyAwait.during(1, TimeUnit.SECONDS)
+            .untilAsserted(() -> assertThat(smtpMailsResponseSupplier.get().getList("")).hasSize(1));
+
+        assertThat(smtpMailsResponseSupplier.get().getString("[0].recipients[0].address"))
+            .isEqualTo(additionalAttendeeEmail);
+    }
+
+    @Test
+    void shouldNotifyCreatorAndAdditionalAttendeeWhenOrganizerCancelsPublicAgendaEvent() {
+        String additionalAttendeeEmail = "additional-attendee-" + UUID.randomUUID() + "@external-domain.com";
+        String eventUid = UUID.randomUUID().toString();
+        String calendarData = generatePublicAgendaCalendar(eventUid, organizer.username().asString(),
+            attendee.username().asString(), PartStat.ACCEPTED, UPDATED_SEQUENCE, additionalAttendeeEmail);
+        davTestHelper.upsertCalendar(organizer, calendarData, eventUid);
+        awaitAtMostForEmailDelivery
+            .untilAsserted(() -> assertThat(smtpMailsResponseSupplier.get().getList("")).hasSize(2));
+        mockSmtpExtension.clear();
+
+        davTestHelper.deleteCalendar(organizer, eventUid);
+
+        awaitAtMostForEmailDelivery
+            .untilAsserted(() -> assertThat(smtpMailsResponseSupplier.get().getList("")).hasSize(2));
+
+        JsonPath smtpMailsResponse = smtpMailsResponseSupplier.get();
+        assertThat(recipients(smtpMailsResponse))
+            .containsExactlyInAnyOrder(attendee.username().asString(), additionalAttendeeEmail);
+
+        String creatorMessage = IntStream.range(0, smtpMailsResponse.getList("").size())
+            .filter(index -> attendee.username().asString().equals(smtpMailsResponse.getString("[%d].recipients[0].address".formatted(index))))
+            .mapToObj(index -> smtpMailsResponse.getString("[%d].message".formatted(index)))
+            .findFirst()
+            .orElseThrow();
+        String additionalAttendeeMessage = IntStream.range(0, smtpMailsResponse.getList("").size())
+            .filter(index -> additionalAttendeeEmail.equals(smtpMailsResponse.getString("[%d].recipients[0].address".formatted(index))))
+            .mapToObj(index -> smtpMailsResponse.getString("[%d].message".formatted(index)))
+            .findFirst()
+            .orElseThrow();
+        String creatorHtml = getHtml(creatorMessage);
+        String additionalAttendeeHtml = getHtml(additionalAttendeeMessage);
+
+        assertSoftly(softly -> {
+            softly.assertThat(creatorMessage)
+                .contains("Subject: Event Publicly created meeting from")
+                .contains("canceled")
+                .doesNotContain("text/calendar")
+                .doesNotContain("application/ics");
+
+            softly.assertThat(additionalAttendeeMessage)
+                .contains("Subject: Event Publicly created meeting from")
+                .contains("canceled")
+                .doesNotContain("text/calendar")
+                .doesNotContain("application/ics");
+
+            softly.assertThat(creatorHtml)
+                .contains("has canceled an event")
+                .doesNotContain("Forwarding this invitation");
+
+            softly.assertThat(additionalAttendeeHtml)
+                .contains("has canceled an event")
+                .doesNotContain("Forwarding this invitation");
+        });
+    }
+
+    @Test
+    void shouldRecoverWhenProposerIsNotPresentInAttendees() {
+        String invalidEventUid = UUID.randomUUID().toString();
+        String unknownProposer = "unknown-proposer-" + UUID.randomUUID() + "@example.com";
+        davTestHelper.upsertCalendar(organizer, generatePublicAgendaCalendarWithCustomCreator(invalidEventUid,
+            organizer.username().asString(), attendee.username().asString(), PartStat.NEEDS_ACTION, INITIAL_SEQUENCE,
+            unknownProposer, null), invalidEventUid);
+        calmlyAwaitDuringNoEmail
+            .untilAsserted(() -> assertThat(smtpMailsResponseSupplier.get().getList("")).isEmpty());
+        davTestHelper.upsertCalendar(organizer, generatePublicAgendaCalendarWithCustomCreator(invalidEventUid,
+            organizer.username().asString(), attendee.username().asString(), PartStat.ACCEPTED, UPDATED_SEQUENCE,
+            unknownProposer, null), invalidEventUid);
+
+        String validEventUid = UUID.randomUUID().toString();
+        davTestHelper.upsertCalendar(organizer, generatePublicAgendaCalendar(validEventUid,
+            organizer.username().asString(), attendee.username().asString(), PartStat.NEEDS_ACTION, INITIAL_SEQUENCE), validEventUid);
+        davTestHelper.upsertCalendar(organizer, generatePublicAgendaCalendar(validEventUid,
+            organizer.username().asString(), attendee.username().asString(), PartStat.ACCEPTED, UPDATED_SEQUENCE), validEventUid);
 
         awaitAtMostForEmailDelivery
             .untilAsserted(() -> assertThat(smtpMailsResponseSupplier.get().getList("")).hasSize(1));
@@ -443,13 +684,22 @@ public class EventPublicAgendaEmailConsumerTest {
     }
 
     @Test
-    void shouldRecoverAfterInvalidPubliclyCreatorEmail() throws Exception {
-        publishNotificationEmail(attendee.username().asString(), generatePublicAgendaCalendarWithCustomCreator(UUID.randomUUID().toString(),
+    void shouldRecoverAfterInvalidPubliclyCreatorEmail() {
+        String invalidEventUid = UUID.randomUUID().toString();
+        davTestHelper.upsertCalendar(organizer, generatePublicAgendaCalendarWithCustomCreator(invalidEventUid,
+            organizer.username().asString(), attendee.username().asString(), PartStat.NEEDS_ACTION, INITIAL_SEQUENCE,
+            "not-an-email", null), invalidEventUid);
+        calmlyAwaitDuringNoEmail
+            .untilAsserted(() -> assertThat(smtpMailsResponseSupplier.get().getList("")).isEmpty());
+        davTestHelper.upsertCalendar(organizer, generatePublicAgendaCalendarWithCustomCreator(invalidEventUid,
             organizer.username().asString(), attendee.username().asString(), PartStat.ACCEPTED, UPDATED_SEQUENCE,
-            "not-an-email", null));
+            "not-an-email", null), invalidEventUid);
 
-        publishNotificationEmail(attendee.username().asString(), generatePublicAgendaCalendar(UUID.randomUUID().toString(),
-            organizer.username().asString(), attendee.username().asString(), PartStat.ACCEPTED, UPDATED_SEQUENCE));
+        String validEventUid = UUID.randomUUID().toString();
+        davTestHelper.upsertCalendar(organizer, generatePublicAgendaCalendar(validEventUid,
+            organizer.username().asString(), attendee.username().asString(), PartStat.NEEDS_ACTION, INITIAL_SEQUENCE), validEventUid);
+        davTestHelper.upsertCalendar(organizer, generatePublicAgendaCalendar(validEventUid,
+            organizer.username().asString(), attendee.username().asString(), PartStat.ACCEPTED, UPDATED_SEQUENCE), validEventUid);
 
         awaitAtMostForEmailDelivery
             .untilAsserted(() -> assertThat(smtpMailsResponseSupplier.get().getList("")).hasSize(1));
@@ -458,34 +708,14 @@ public class EventPublicAgendaEmailConsumerTest {
             .contains("Subject: Van Tung TRAN has accepted your event proposal");
     }
 
-    private void publishNotificationEmail(String recipientEmail, String calendarData) throws Exception {
-        String payload = """
-            {
-              "senderEmail": "%s",
-              "recipientEmail": "%s",
-              "method": "REQUEST",
-              "event": %s,
-              "notify": true,
-              "calendarURI": "calendar-uri",
-              "eventPath": "/calendars/%s/events/%s.ics",
-              "changes": {
-                "summary": {
-                  "previous": "Previous summary",
-                  "current": "Publicly created meeting"
-                }
-              },
-              "isNewEvent": false
-            }
-            """.formatted(
-            organizer.username().asString(),
-            recipientEmail,
-            OBJECT_MAPPER.writeValueAsString(calendarData),
-            recipientEmail,
-            UUID.randomUUID());
-
-        sender.send(Mono.just(new OutboundMessage(EventEmailConsumer.EXCHANGE_NAME, "",
-            payload.getBytes(StandardCharsets.UTF_8))))
-            .block();
+    private String getHtml(String rawMessage) {
+        Pattern htmlPattern = Pattern.compile(
+            "Content-Transfer-Encoding: base64\r?\nContent-Type: text/html; charset=UTF-8\r?\nContent-Language: [^\r\n]+\r?\n\r?\n([A-Za-z0-9+/=\r\n]+)\r?\n---=Part",
+            java.util.regex.Pattern.DOTALL);
+        Matcher matcher = htmlPattern.matcher(rawMessage);
+        matcher.find();
+        String base64Html = matcher.group(1).replaceAll("\\s+", "");
+        return new String(Base64.getDecoder().decode(base64Html), StandardCharsets.UTF_8);
     }
 
     private String extractDecodedPart(String mimeMessage, String contentType) {
@@ -494,6 +724,17 @@ public class EventPublicAgendaEmailConsumerTest {
         assertThat(matcher.find()).isTrue();
         String encoded = matcher.group(1).replaceAll("\\R", "");
         return new String(Base64.getDecoder().decode(encoded), StandardCharsets.UTF_8);
+    }
+
+    private List<String> recipients(JsonPath smtpMailsResponse) {
+        return IntStream.range(0, smtpMailsResponse.getList("").size())
+            .mapToObj(index -> smtpMailsResponse.getString("[%d].recipients[0].address".formatted(index)))
+            .toList();
+    }
+
+    private String withPubliclyCancelledBy(String calendarData, String cancelledBy) {
+        return calendarData.replace(X_PUBLICLY_CREATOR_HEADER.formatted(cancelledBy),
+            X_PUBLICLY_CREATOR_HEADER.formatted(cancelledBy) + "\n" + X_PUBLICLY_CANCELLED_BY_HEADER.formatted(cancelledBy));
     }
 
     private static final Supplier<JsonPath> smtpMailsResponseSupplier = () -> given(mockSMTPRequestSpecification())
@@ -541,7 +782,7 @@ public class EventPublicAgendaEmailConsumerTest {
             SUMMARY:Publicly created meeting
             DESCRIPTION:This is a publicly created meeting. Visio: https://meet.example.com/abc-xyzx-dkm
             ORGANIZER;CN=Van Tung TRAN:mailto:{organizerEmail}
-            ATTENDEE;PARTSTAT={organizerPartStat};RSVP=FALSE;ROLE=CHAIR;CUTYPE=INDIVIDUAL:mailto:{organizerEmail}
+            ATTENDEE;PARTSTAT={organizerPartStat};RSVP=FALSE;ROLE=CHAIR;CUTYPE=INDIVIDUAL;CN=Van Tung TRAN:mailto:{organizerEmail}
             ATTENDEE;PARTSTAT=ACCEPTED;RSVP=FALSE;CN=Bob:mailto:{requesterEmail}
             {xPubliclyCreated}
             {xPubliclyCreator}{additionalAttendee}

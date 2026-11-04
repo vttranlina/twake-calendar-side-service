@@ -63,12 +63,11 @@ import org.junit.jupiter.params.provider.MethodSource;
 import org.mockito.Mockito;
 
 import com.github.fge.lambdas.Throwing;
-import com.linagora.calendar.smtp.EventEmailFilter;
 import com.linagora.calendar.dav.CalDavClient;
 import com.linagora.calendar.dav.CalDavEventRepository;
 import com.linagora.calendar.dav.DavTestHelper;
 import com.linagora.calendar.dav.DockerSabreDavSetup;
-import com.linagora.calendar.dav.SabreDavExtension;
+import com.linagora.calendar.smtp.EventEmailFilter;
 import com.linagora.calendar.storage.AlarmEventDAO;
 import com.linagora.calendar.storage.AlarmEventFactory;
 import com.linagora.calendar.storage.MemoryAlarmEventDAO;
@@ -89,7 +88,7 @@ import reactor.rabbitmq.Sender;
 public class AlarmEventCancellationTest {
 
     @RegisterExtension
-    static SabreDavExtension sabreDavExtension = new SabreDavExtension(DockerSabreDavSetup.SINGLETON);
+    static SabreDavWithAsyncSchedulingExtension sabreDavExtension = new SabreDavWithAsyncSchedulingExtension();
 
     private static final SettingsBasedResolver settingsResolver = mock(SettingsBasedResolver.class);
 
@@ -216,6 +215,53 @@ public class AlarmEventCancellationTest {
     }
 
     @Test
+    void shouldRemoveDelegatedValarmRecipientAlarmWhenOrganizerCancelsEvent() {
+        // Given: organizer creates an event inviting one attendee, while the email VALARM also targets
+        // another recipient from the same calendar object.
+        String eventUidAsString = UUID.randomUUID().toString();
+        EventUid eventUid = new EventUid(eventUidAsString);
+        String attendeeEmail = attendee.username().asString();
+        String delegatedAlarmRecipientEmail = attendee2.username().asString();
+        String vAlarm = """
+            BEGIN:VALARM
+            TRIGGER:-PT30M
+            ACTION:EMAIL
+            ${alarmAttendees}
+            SUMMARY:Meeting Reminder
+            DESCRIPTION:This is an automatic alarm
+            END:VALARM"""
+            .replace("${alarmAttendees}", alarmAttendeeLines(List.of(
+                attendeeEmail,
+                attendeeEmail,
+                delegatedAlarmRecipientEmail)));
+        String calendarData = generateEventWithValarm(
+            eventUidAsString,
+            organizer.username().asString(),
+            List.of(attendeeEmail),
+            PartStat.NEEDS_ACTION,
+            vAlarm);
+
+        davTestHelper.upsertCalendar(organizer, calendarData, eventUidAsString);
+
+        // And: the attendee accepts, so the side service stores both the attendee alarm and
+        // the delegated VALARM recipient alarm.
+        attendeeAcceptsEvent(attendee, eventUid);
+        awaitAlarmEventCreated(eventUid, attendee.username());
+        awaitAlarmEventCreated(eventUid, attendee2.username());
+
+        // When: organizer cancels the event through Sabre/DAV.
+        davTestHelper.deleteCalendar(organizer, eventUid);
+
+        // Then: all alarm rows originating from that cancelled calendar object are removed.
+        awaitAtMost.untilAsserted(() -> assertSoftly(Throwing.consumer(softly -> {
+            softly.assertThat(alarmEventDAO.find(eventUid, attendee.username().asMailAddress()).blockOptional())
+                .isEmpty();
+            softly.assertThat(alarmEventDAO.find(eventUid, attendee2.username().asMailAddress()).blockOptional())
+                .isEmpty();
+        })));
+    }
+
+    @Test
     void shouldRemoveAllAttendeeAlarmsWhenOrganizerDeletesEvent() {
         // Given
         EventUid eventUid = createEventWithVALARM(attendee, attendee2);
@@ -319,10 +365,10 @@ public class AlarmEventCancellationTest {
                 BEGIN:VALARM
                 TRIGGER:-PT10M
                 ACTION:EMAIL
-                ATTENDEE:mailto:%s
+                %s
                 SUMMARY:Meeting Reminder
                 DESCRIPTION:This is an automatic alarm
-                END:VALARM""".formatted(organizer.username().asString()))
+                END:VALARM""".formatted(alarmAttendeeLines(List.of(organizer.username().asString(), attendee.username().asString()))))
             .replaceAll("(?m)^SEQUENCE:.*$", "")
             .replaceFirst("(?m)^(DTSTAMP:.*$)", "$1\nSEQUENCE:2");
 
@@ -381,6 +427,25 @@ public class AlarmEventCancellationTest {
                 .isEmpty());
     }
 
+    @Test
+    void shouldKeepOrganizerAlarmWhenAttendeeDeletesOwnEvent() {
+        // Given
+        EventUid eventUid = createEventWithVALARM(attendee);
+        attendeeAcceptsEvent(attendee, eventUid);
+        awaitAlarmEventCreated(eventUid, organizer.username());
+        awaitAlarmEventCreated(eventUid, attendee.username());
+
+        String attendeeEventResourceId = davTestHelper.findFirstEventId(attendee).get();
+        // When: the attendee deletes the event from their own calendar
+        davTestHelper.deleteCalendar(attendee, attendeeEventResourceId);
+
+        // Then: only the attendee's alarm is removed, the organizer's one is left untouched
+        awaitAtMost.untilAsserted(() -> assertSoftly(Throwing.consumer(softly -> {
+            softly.assertThat(alarmEventDAO.find(eventUid, attendee.username().asMailAddress()).blockOptional()).isEmpty();
+            softly.assertThat(alarmEventDAO.find(eventUid, organizer.username().asMailAddress()).blockOptional()).isPresent();
+        })));
+    }
+
     private EventUid createEventWithVALARM(OpenPaaSUser... attendees) {
         String eventUid = UUID.randomUUID().toString();
         String organizerEmail = organizer.username().asString();
@@ -393,10 +458,11 @@ public class AlarmEventCancellationTest {
             BEGIN:VALARM
             TRIGGER:-PT10M
             ACTION:EMAIL
-            ATTENDEE:mailto:%s
+            %s
             SUMMARY:Meeting Reminder
             DESCRIPTION:This is an automatic alarm
-            END:VALARM""".formatted(organizerEmail);
+            END:VALARM""".formatted(alarmAttendeeLines(Stream.concat(Stream.of(organizerEmail), attendeeEmails.stream())
+            .toList()));
 
         String ics = generateEventWithValarm(
             eventUid,
@@ -470,6 +536,12 @@ public class AlarmEventCancellationTest {
             organizerEmail, organizerEmail,
             attendeeLines,
             vAlarm);
+    }
+
+    private String alarmAttendeeLines(List<String> emails) {
+        return emails.stream()
+            .map("ATTENDEE:mailto:%s"::formatted)
+            .collect(Collectors.joining("\n"));
     }
 
     private String waitForFirstEventCreation(OpenPaaSUser user) {

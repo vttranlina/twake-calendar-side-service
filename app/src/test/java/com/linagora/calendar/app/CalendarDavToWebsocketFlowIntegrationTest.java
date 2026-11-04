@@ -22,9 +22,12 @@ import static com.linagora.calendar.app.TestFixture.awaitMessage;
 import static com.linagora.calendar.app.TestFixture.connectWebSocket;
 import static com.linagora.calendar.storage.TestFixture.TECHNICAL_TOKEN_SERVICE_TESTING;
 import static io.restassured.RestAssured.given;
+import static io.restassured.config.EncoderConfig.encoderConfig;
+import static io.restassured.config.RestAssuredConfig.newConfig;
 import static net.javacrumbs.jsonunit.assertj.JsonAssertions.assertThatJson;
 import static org.assertj.core.api.Assertions.assertThat;
 
+import java.nio.charset.StandardCharsets;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.Map;
@@ -37,6 +40,7 @@ import org.apache.commons.lang3.tuple.Pair;
 import org.apache.http.HttpStatus;
 import org.apache.james.backends.redis.RedisConfiguration;
 import org.apache.james.backends.redis.StandaloneRedisConfiguration;
+import org.apache.james.utils.WebAdminGuiceProbe;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
@@ -49,18 +53,22 @@ import com.google.inject.Provides;
 import com.google.inject.Singleton;
 import com.linagora.calendar.app.modules.CalendarDataProbe;
 import com.linagora.calendar.dav.CalDavClient;
+import com.linagora.calendar.dav.CalDavClient.ItipRequest;
 import com.linagora.calendar.dav.DavModuleTestHelper;
 import com.linagora.calendar.dav.DavTestHelper;
-import com.linagora.calendar.dav.DockerSabreDavSetup;
 import com.linagora.calendar.dav.SabreDavExtension;
 import com.linagora.calendar.restapi.RestApiServerProbe;
 import com.linagora.calendar.storage.CalendarURL;
 import com.linagora.calendar.storage.OpenPaaSUser;
+import com.linagora.calendar.storage.model.TeamCalendarId;
 import com.linagora.calendar.storage.redis.DockerRedisExtension;
 
 import io.restassured.RestAssured;
 import io.restassured.authentication.PreemptiveBasicAuthScheme;
+import io.restassured.builder.RequestSpecBuilder;
+import io.restassured.http.ContentType;
 import io.restassured.path.json.JsonPath;
+import io.restassured.specification.RequestSpecification;
 import okhttp3.WebSocket;
 
 class CalendarDavToWebsocketFlowIntegrationTest {
@@ -69,7 +77,7 @@ class CalendarDavToWebsocketFlowIntegrationTest {
 
     @RegisterExtension
     @Order(1)
-    static SabreDavExtension sabreDavExtension = new SabreDavExtension(DockerSabreDavSetup.SINGLETON);
+    static SabreDavExtension sabreDavExtension = SabreDavExtension.perClass();
 
     @Order(2)
     @RegisterExtension
@@ -134,7 +142,7 @@ class CalendarDavToWebsocketFlowIntegrationTest {
     }
 
     @Test
-    void bobShouldReceiveWebsocketPushWhenAliceInvitesHim() {
+    void bobShouldReceiveWebsocketPushWhenHaveANewEvent() {
         // GIVEN: Bob opens WebSocket
         String bobTicket = generateTicket(bob);
         BlockingQueue<String> messages = new LinkedBlockingQueue<>();
@@ -154,11 +162,11 @@ class CalendarDavToWebsocketFlowIntegrationTest {
             .isArray()
             .contains(bobCalendarUrl);
 
-        // WHEN: Alice creates ICS event and invites Bob
+        // WHEN: Bob's calendar changes
         String eventUid = "event-" + System.currentTimeMillis();
         String ics = buildEventICS(eventUid, alice.username().asString(), bob.username().asString());
 
-        davTestHelper.upsertCalendar(alice, ics, eventUid);
+        sendItipRequestToBob(eventUid, ics);
 
         String pushMessage = awaitMessage(messages, msg -> msg.contains("syncToken") && msg.contains(bobCalendarUrl));
 
@@ -185,11 +193,12 @@ class CalendarDavToWebsocketFlowIntegrationTest {
                 "register": ["%s"]
             }
             """.formatted(bobCalendarUrl));
+        awaitMessage(messages, msg -> msg.contains("\"registered\""));
 
-        // WHEN: Alice creates an event
+        // WHEN: Bob's calendar changes
         String eventUid = "event-" + System.currentTimeMillis();
         String ics = buildEventICS(eventUid, alice.username().asString(), bob.username().asString());
-        davTestHelper.upsertCalendar(alice, ics, eventUid);
+        sendItipRequestToBob(eventUid, ics);
 
         // Bob receives websocket notification (skip unrelated messages)
         String pushMessage = awaitMessage(messages, msg -> msg.contains("syncToken"));
@@ -211,6 +220,27 @@ class CalendarDavToWebsocketFlowIntegrationTest {
             .isEqualTo(bobCalendarUrl + ".json");
     }
 
+    @Test
+    void bobShouldReceiveWebsocketPushWhenAddedAsTeamCalendarMember(TwakeCalendarGuiceServer server) {
+        // GIVEN: Bob opens WebSocket
+        String bobTicket = generateTicket(bob);
+        BlockingQueue<String> messages = new LinkedBlockingQueue<>();
+        webSocket = connectWebSocket(restApiPort, bobTicket, messages);
+        TeamCalendarId teamCalendarId = createTeamCalendar(server, "websocket-team", "WebSocket Team");
+
+        // WHEN: Bob is added as a Team Calendar member
+        grantMember(server, teamCalendarId, bob, "dav:read-write");
+
+        // THEN: Bob receives a calendar-list websocket notification for the delegated Team Calendar
+        String pushMessage = awaitMessage(messages, msg -> msg.contains("\"calendarList\"") && msg.contains("\"delegated\""));
+        assertThatJson(pushMessage)
+            .node("calendarList.delegated")
+            .isArray()
+            .hasSize(1);
+        assertThat(JsonPath.from(pushMessage).getList("calendarList.delegated", String.class))
+            .allSatisfy(calendarUrl -> assertThat(calendarUrl).startsWith("/calendars/" + bob.id().value() + "/"));
+    }
+
     private String generateTicket(OpenPaaSUser user) {
         String ticketResponse = given()
             .auth().preemptive().basic(user.username().asString(), PASSWORD)
@@ -223,6 +253,60 @@ class CalendarDavToWebsocketFlowIntegrationTest {
         return JsonPath.from(ticketResponse).getString("value");
     }
 
+    private TeamCalendarId createTeamCalendar(TwakeCalendarGuiceServer server, String name, String displayName) {
+        String payload = """
+            {
+              "name": "{name}",
+              "displayName": "{displayName}"
+            }
+            """.replace("{name}", name)
+            .replace("{displayName}", displayName);
+
+        return new TeamCalendarId(given(webAdminSpecification(server))
+            .body(payload)
+        .when()
+            .post("/domains/{domain}/team-calendars", bob.username().getDomainPart().get().asString())
+        .then()
+            .statusCode(HttpStatus.SC_CREATED)
+            .extract()
+            .path("id"));
+    }
+
+    private void grantMember(TwakeCalendarGuiceServer server, TeamCalendarId teamCalendarId, OpenPaaSUser member, String davRight) {
+        String payload = """
+            {
+              "share": {
+                "set": [
+                  {
+                    "dav:href": "mailto:{member}",
+                    "{davRight}": true
+                  }
+                ],
+                "remove": []
+              }
+            }
+            """.replace("{member}", member.username().asString())
+            .replace("{davRight}", davRight);
+
+        given(webAdminSpecification(server))
+            .body(payload)
+        .when()
+            .post("/domains/{domain}/team-calendars/{teamCalendarId}/members/invitee",
+                member.username().getDomainPart().get().asString(),
+                teamCalendarId.value())
+        .then()
+            .statusCode(HttpStatus.SC_NO_CONTENT);
+    }
+
+    private RequestSpecification webAdminSpecification(TwakeCalendarGuiceServer server) {
+        return new RequestSpecBuilder()
+            .setContentType(ContentType.JSON)
+            .setAccept(ContentType.JSON)
+            .setConfig(newConfig().encoderConfig(encoderConfig().defaultContentCharset(StandardCharsets.UTF_8)))
+            .setPort(server.getProbe(WebAdminGuiceProbe.class).getWebAdminPort().getValue())
+            .build();
+    }
+
     private Pair<CalendarURL, String> extractCalendarUrlAndSyncToken(String pushMessage) {
         Map<String, Object> root = JsonPath.from(pushMessage).get();
         Map.Entry<String, Object> entry = root.entrySet().iterator().next();
@@ -230,6 +314,19 @@ class CalendarDavToWebsocketFlowIntegrationTest {
         Map<String, Object> inner = (Map<String, Object>) entry.getValue();
         String syncToken = (String) inner.get("syncToken");
         return Pair.of(CalendarURL.deserialize(Strings.CS.removeStart(calendarUrlString, "/calendars/")), syncToken);
+    }
+
+    private void sendItipRequestToBob(String eventUid, String ics) {
+        Boolean deliveredLocally = calDavClient.sendItip(bob.username(), new ItipRequest(
+                eventUid,
+                alice.username().asString(),
+                bob.username().asString(),
+                ics,
+                "REQUEST",
+                Optional.of(0)))
+            .block();
+
+        assertThat(deliveredLocally).isTrue();
     }
 
     private String buildEventICS(String eventUid, String organizer, String attendee) {
@@ -242,6 +339,7 @@ class CalendarDavToWebsocketFlowIntegrationTest {
             VERSION:2.0
             PRODID:-//Sabre//Sabre VObject 4.2.2//EN
             CALSCALE:GREGORIAN
+            METHOD:REQUEST
             BEGIN:VEVENT
             UID:{UID}
             DTSTAMP:{DTSTAMP}Z
@@ -249,7 +347,7 @@ class CalendarDavToWebsocketFlowIntegrationTest {
             DTEND;TZID=Asia/Ho_Chi_Minh:{END}
             SUMMARY:WebSocket Flow Test
             ORGANIZER:mailto:{ORGANIZER}
-            ATTENDEE;PARTSTAT=ACCEPTED:mailto:{ATTENDEE}
+            ATTENDEE;PARTSTAT=NEEDS-ACTION:mailto:{ATTENDEE}
             END:VEVENT
             END:VCALENDAR
             """;

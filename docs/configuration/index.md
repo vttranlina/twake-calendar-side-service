@@ -22,7 +22,16 @@ Optional.
 Optional. If present, it is used to set up LDAP connection following the exact James semantic.
  - [rabbitmq.properties](https://james.staged.apache.org/james-project/3.9.0/servers/distributed/configure/rabbitmq.html) matches the semantic in James. 
 The following properties are supported: `uri`, `management.uri`, `management.user`, `mangement.password`, `scheduled.consumer.reconnection.enabled`, 
-`scheduled.consumer.reconnection.interval`. Compulsory.
+`scheduled.consumer.reconnection.interval`. Compulsory. When `twp.settings.enabled`, `common.contacts.enabled` or `saas.subscription.enabled` is set, additional
+Twake Workplace integration properties are read from this file, see [Twake Workplace RabbitMQ properties](configuration.md#twake-workplace-rabbitmq-properties).
  - [opensearch.properties](opensearch.md) enable setting up the OpenSearch service.
  - [webadmn.properties](https://james.staged.apache.org/james-project/3.9.0/servers/distributed/configure/webadmin.html)
 inherited of Apache James.
+
+## JVM system properties
+
+Add these properties to `jvm.properties` or pass them with the JVM `-D` option. Restart the service after changing them.
+
+| Property | Description | Default |
+| --- | --- | --- |
+| `twake.calendar.smtp.max-retries` | Maximum number of retries for a complete SMTP create-and-send attempt. Set to `0` to disable retries. | `3` |

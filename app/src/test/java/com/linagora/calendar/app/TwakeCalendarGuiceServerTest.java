@@ -76,6 +76,7 @@ class TwakeCalendarGuiceServerTest  {
     public static final Domain DOMAIN = Domain.of("linagora.com");
     public static final String PASSWORD = "secret";
     public static final Username USERNAME = Username.of("btellier@linagora.com");
+    public static final Username ADMIN = Username.of("admin@linagora.com");
     private static final String USERINFO_TOKEN_URI_PATH = "/token/userinfo";
     private static final String INTROSPECT_TOKEN_URI_PATH = "/oauth2/introspect";
 
@@ -210,6 +211,16 @@ class TwakeCalendarGuiceServerTest  {
     }
 
     @Test
+    void shouldExposeWebAdminUserCalendarRoutes() {
+        given()
+        .when()
+            .get("/users/notfound@linagora.com/calendars")
+        .then()
+            .statusCode(404)
+            .body("message", is("User does not exist"));
+    }
+
+    @Test
     void shouldExposeWebAdminCalendarEventReindexTask() {
         String taskId = given()
             .when()
@@ -235,8 +246,7 @@ class TwakeCalendarGuiceServerTest  {
 
     @Test
     void shouldExposeWebAdminCalendarDeleteUserDataRoutes(TwakeCalendarGuiceServer server) throws AddressException {
-        String userId = "6053022c9da5ef001f430b43";
-        String calendarId = "6053022c9da5ef001f430b43";
+        CalendarURL calendarURL = CalendarURL.from(userId);
         String organizerEmail = "organizer@linagora.com";
         String attendeeEmail = "attendee@linagora.com";
         EventFields event = EventFields.builder()
@@ -252,10 +262,10 @@ class TwakeCalendarGuiceServerTest  {
             .organizer(EventFields.Person.of("organizer", organizerEmail))
             .addAttendee(EventFields.Person.of("attendee", attendeeEmail))
             .addResource(new EventFields.Person("resource 1", new MailAddress("resource1@linagora.com")))
-            .calendarURL(new CalendarURL(new OpenPaaSId(userId), new OpenPaaSId(calendarId)))
+            .calendarURL(calendarURL)
             .dtStamp(Instant.parse("2025-04-18T07:47:48Z"))
             .build();
-        server.getProbe(CalendarDataProbe.class).indexCalendar(USERNAME, CalendarEvents.of(event));
+        server.getProbe(CalendarDataProbe.class).indexCalendar(CalendarEvents.of(event));
 
         String taskId = with()
             .queryParam("action", "deleteData")
@@ -278,7 +288,7 @@ class TwakeCalendarGuiceServerTest  {
             .body("additionalInformation.status.CalendarSearchDeletionTaskStep", is("DONE"))
             .body("additionalInformation.status.OpenPaaSUserDeletionTaskStep", is("DONE"));
 
-        assertThat(server.getProbe(CalendarDataProbe.class).searchEvents(USERNAME, "")).isEmpty();
+        assertThat(server.getProbe(CalendarDataProbe.class).searchEvents(calendarURL, "")).isEmpty();
         assertThat(server.getProbe(CalendarDataProbe.class).getUser(USERNAME)).isNull();
     }
 
@@ -302,30 +312,6 @@ class TwakeCalendarGuiceServerTest  {
             .body("additionalInformation.failedEventCount", is(0))
             .body("additionalInformation.timestamp", is(notNullValue()))
             .body("additionalInformation.type", is("schedule-alarms"))
-            .body("startedDate", is(notNullValue()))
-            .body("submitDate", is(notNullValue()));
-    }
-
-    @Test
-    void shouldExposeWebAdminRepositionResourceRightsTask() {
-        String taskId = given()
-            .when()
-            .post("/domains/linagora.com/resources?task=repositionWriteRights")
-            .jsonPath()
-            .get("taskId");
-
-        given()
-            .basePath(TasksRoutes.BASE)
-        .when()
-            .get(taskId + "/await")
-        .then()
-            .body("status", is(notNullValue()))
-            .body("taskId", is(taskId))
-            .body("type", is("reposition-resource-rights"))
-            .body("additionalInformation.processedResourceCount", is(notNullValue()))
-            .body("additionalInformation.failedResourceCount", is(notNullValue()))
-            .body("additionalInformation.timestamp", is(notNullValue()))
-            .body("additionalInformation.type", is("reposition-resource-rights"))
             .body("startedDate", is(notNullValue()))
             .body("submitDate", is(notNullValue()));
     }
@@ -405,6 +391,20 @@ class TwakeCalendarGuiceServerTest  {
             .asString();
 
         assertThatJson(body).isEqualTo("{\"logos\":{},\"colors\":{}}");
+    }
+
+    @Test
+    void shouldExposeWebAdminDomainSettings() {
+        String body = given()
+        .when()
+            .get("/domains/linagora.com/settings")
+        .then()
+            .statusCode(200)
+            .extract()
+            .body()
+            .asString();
+
+        assertThat(body).contains("\"userSearchMode\":null");
     }
 
     @Test
@@ -793,6 +793,57 @@ class TwakeCalendarGuiceServerTest  {
     }
 
     @Test
+    void profileAvatarShouldNotExposeUserFromAnotherDomain(TwakeCalendarGuiceServer server) {
+        // GIVEN: two domains with one user each
+        targetRestAPI(server);
+        CalendarDataProbe calendarDataProbe = server.getProbe(CalendarDataProbe.class);
+
+        Domain domainA = Domain.of("domain-a.com");
+        Domain domainB = Domain.of("domain-b.com");
+        Username userDomainA = Username.fromLocalPartWithDomain("alice", domainA.asString());
+        Username userDomainB = Username.fromLocalPartWithDomain("bob", domainB.asString());
+
+        calendarDataProbe.addDomain(domainA).addUser(userDomainA, PASSWORD);
+        calendarDataProbe.addDomain(domainB).addUser(userDomainB, PASSWORD);
+
+        String userDomainBId = calendarDataProbe.userId(userDomainB).value();
+
+        // WHEN: authenticated as domain A user, querying the avatar of user B
+        // THEN: cross-domain access is blocked
+        given()
+            .redirects().follow(false)
+            .auth().preemptive().basic(userDomainA.asString(), PASSWORD)
+        .when()
+            .get("/api/users/" + userDomainBId + "/profile/avatar")
+        .then()
+            .statusCode(404);
+    }
+
+    @Test
+    void adminShouldAccessProfileAvatarOfAnotherDomain(TwakeCalendarGuiceServer server) {
+        // GIVEN: a user in a domain the admin does not belong to
+        targetRestAPI(server);
+        CalendarDataProbe calendarDataProbe = server.getProbe(CalendarDataProbe.class);
+
+        Domain domainB = Domain.of("domain-b.com");
+        Username userDomainB = Username.fromLocalPartWithDomain("bob", domainB.asString());
+        calendarDataProbe.addDomain(domainB).addUser(userDomainB, PASSWORD);
+
+        String userDomainBId = calendarDataProbe.userId(userDomainB).value();
+
+        // WHEN: authenticated as admin, querying the avatar of user B
+        // THEN: cross-domain access is granted
+        given()
+            .redirects().follow(false)
+            .auth().preemptive().basic(ADMIN.asString(), PASSWORD)
+        .when()
+            .get("/api/users/" + userDomainBId + "/profile/avatar")
+        .then()
+            .statusCode(302)
+            .header("Location", "https://twcalendar.linagora.com/api/avatars?email=" + userDomainB.asString());
+    }
+
+    @Test
     void shouldSupportDomainEndpoint(TwakeCalendarGuiceServer server) {
         targetRestAPI(server);
 
@@ -862,6 +913,28 @@ class TwakeCalendarGuiceServerTest  {
     }
 
     @Test
+    void adminShouldAccessDomainOfAnotherDomain(TwakeCalendarGuiceServer server) {
+        // GIVEN: a domain the admin does not belong to
+        targetRestAPI(server);
+        CalendarDataProbe calendarDataProbe = server.getProbe(CalendarDataProbe.class);
+
+        Domain domainB = Domain.of("domain-b.com");
+        calendarDataProbe.addDomain(domainB);
+
+        String domainBId = calendarDataProbe.domainId(domainB).value();
+
+        // WHEN: authenticated as admin, querying domain B
+        // THEN: cross-domain access is granted
+        given()
+            .auth().preemptive().basic(ADMIN.asString(), PASSWORD)
+        .when()
+            .get("/api/domains/" + domainBId)
+        .then()
+            .statusCode(200)
+            .body("name", is(domainB.asString()));
+    }
+
+    @Test
     void shouldSupportUserEndpoint(TwakeCalendarGuiceServer server) {
         targetRestAPI(server);
 
@@ -927,6 +1000,29 @@ class TwakeCalendarGuiceServerTest  {
         .get("/api/users/" + userDomainBId)
             .then()
             .statusCode(404);
+    }
+
+    @Test
+    void adminShouldQueryUserOfAnotherDomainById(TwakeCalendarGuiceServer server) {
+        // GIVEN: a user in a domain the admin does not belong to
+        targetRestAPI(server);
+        CalendarDataProbe calendarDataProbe = server.getProbe(CalendarDataProbe.class);
+
+        Domain domainB = Domain.of("domain-b.com");
+        Username userDomainB = Username.fromLocalPartWithDomain("bob", domainB.asString());
+        calendarDataProbe.addDomain(domainB).addUser(userDomainB, PASSWORD);
+
+        String userDomainBId = calendarDataProbe.userId(userDomainB).value();
+
+        // WHEN: authenticated as admin, querying user B by id
+        // THEN: cross-domain access is granted
+        given()
+            .auth().preemptive().basic(ADMIN.asString(), PASSWORD)
+        .when()
+            .get("/api/users/" + userDomainBId)
+        .then()
+            .statusCode(200)
+            .body("preferredEmail", is(userDomainB.asString()));
     }
 
     @Test
@@ -1004,6 +1100,36 @@ class TwakeCalendarGuiceServerTest  {
     }
 
     @Test
+    void adminShouldQueryUserOfAnotherDomainByEmail(TwakeCalendarGuiceServer server) {
+        // GIVEN: a user in a domain the admin does not belong to
+        targetRestAPI(server);
+        CalendarDataProbe calendarDataProbe = server.getProbe(CalendarDataProbe.class);
+
+        Domain domainB = Domain.of("domain-b.com");
+        Username userDomainB = Username.fromLocalPartWithDomain("bob", domainB.asString());
+        calendarDataProbe.addDomain(domainB).addUser(userDomainB, PASSWORD);
+
+        // WHEN: authenticated as admin, querying user B by email
+        String body = given()
+            .auth().preemptive().basic(ADMIN.asString(), PASSWORD)
+            .queryParam("email", userDomainB.asString())
+        .when()
+            .get("/api/users")
+        .then()
+            .statusCode(200)
+            .extract()
+            .body()
+            .asString();
+
+        // THEN: cross-domain access is granted
+        assertThatJson(body)
+            .isArray()
+            .anySatisfy(json -> assertThatJson(json)
+                .node("preferredEmail")
+                .isEqualTo(userDomainB.asString()));
+    }
+
+    @Test
     void shouldSupportAdminCreds(TwakeCalendarGuiceServer server) {
         targetRestAPI(server);
 
@@ -1064,6 +1190,20 @@ class TwakeCalendarGuiceServerTest  {
 
         assertThatJson(body)
             .isEqualTo("[]");
+    }
+
+    @Test
+    void userByEmailEndpointShouldRejectEmailWithoutDomainPart(TwakeCalendarGuiceServer server) {
+        targetRestAPI(server);
+
+        given()
+            .auth().preemptive().basic(USERNAME.asString(), PASSWORD)
+            .queryParam("email", "user1")
+        .when()
+            .get("/api/users")
+        .then()
+            .statusCode(400)
+            .body("error.details", is("'email' query parameter must contain a domain part"));
     }
 
     @Test

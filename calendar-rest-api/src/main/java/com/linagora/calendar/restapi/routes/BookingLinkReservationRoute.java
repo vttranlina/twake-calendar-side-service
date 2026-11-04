@@ -18,21 +18,20 @@
 
 package com.linagora.calendar.restapi.routes;
 
+import static com.linagora.calendar.restapi.RestApiConstants.JSON_HEADER;
+
 import java.time.Instant;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Optional;
 import java.util.Set;
-import java.util.stream.Stream;
 
 import jakarta.inject.Inject;
 
 import org.apache.commons.lang3.StringUtils;
 import org.apache.commons.lang3.Strings;
 import org.apache.james.jmap.Endpoint;
-import org.apache.james.jmap.JMAPRoute;
-import org.apache.james.jmap.JMAPRoutes;
 import org.apache.james.metrics.api.MetricFactory;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -42,9 +41,13 @@ import com.fasterxml.jackson.annotation.JsonProperty;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
 import com.google.common.base.Preconditions;
+import com.linagora.calendar.api.BookedEventTokenSigner;
+import com.linagora.calendar.restapi.ErrorType;
+import com.linagora.calendar.restapi.ForbiddenException;
 import com.linagora.calendar.restapi.routes.BookingLinkReservationException.SlotNotAvailableException;
 import com.linagora.calendar.restapi.routes.BookingLinkReservationService.BookingRequest;
 import com.linagora.calendar.restapi.routes.BookingLinkReservationService.BookingRequest.BookingAttendee;
+import com.linagora.calendar.storage.booking.BookingLinkNotActiveException;
 import com.linagora.calendar.storage.booking.BookingLinkNotFoundException;
 import com.linagora.calendar.storage.booking.BookingLinkPublicId;
 
@@ -54,38 +57,36 @@ import reactor.core.publisher.Mono;
 import reactor.netty.http.server.HttpServerRequest;
 import reactor.netty.http.server.HttpServerResponse;
 
-public class BookingLinkReservationRoute implements JMAPRoutes {
+public class BookingLinkReservationRoute extends PublicRoute {
 
     private static final Logger LOGGER = LoggerFactory.getLogger(BookingLinkReservationRoute.class);
     private static final String BOOKING_LINK_PUBLIC_ID_PARAM = "bookingLinkPublicId";
 
-    private final MetricFactory metricFactory;
     private final BookingLinkReservationService bookingLinkReservationService;
+    private final BookedEventTokenSigner bookedEventTokenSigner;
 
     @Inject
     public BookingLinkReservationRoute(MetricFactory metricFactory,
-                                       BookingLinkReservationService bookingLinkReservationService) {
-        this.metricFactory = metricFactory;
+                                       BookingLinkReservationService bookingLinkReservationService,
+                                       BookedEventTokenSigner bookedEventTokenSigner) {
+        super(metricFactory);
         this.bookingLinkReservationService = bookingLinkReservationService;
+        this.bookedEventTokenSigner = bookedEventTokenSigner;
     }
 
-    Endpoint endpoint() {
+    protected Endpoint endpoint() {
         return new Endpoint(HttpMethod.POST, "/api/booking-links/{%s}/book".formatted(BOOKING_LINK_PUBLIC_ID_PARAM));
     }
 
-    @Override
-    public Stream<JMAPRoute> routes() {
-        return Stream.of(JMAPRoute.builder()
-            .endpoint(endpoint())
-            .action((req, res) -> Mono.from(metricFactory.decoratePublisherWithTimerMetric(this.getClass().getSimpleName(), handleRequest(req, res))))
-            .corsHeaders());
-    }
-
-    Mono<Void> handleRequest(HttpServerRequest request, HttpServerResponse response) {
+    protected Mono<Void> handleRequest(HttpServerRequest request, HttpServerResponse response) {
         return request.receive().aggregate().asByteArray()
             .flatMap(bytes -> Mono.fromCallable(() -> ReservationRequestDTO.parse(bytes).toBookingRequest()))
             .flatMap(bookingRequest -> bookingLinkReservationService.book(BookingLinkPublicId.from(request.param(BOOKING_LINK_PUBLIC_ID_PARAM)), bookingRequest))
-            .then(response.status(HttpResponseStatus.CREATED).send())
+            .flatMap(bookedEventTokenSigner::signAsJwt)
+            .flatMap(jwt -> response.status(HttpResponseStatus.CREATED)
+                .headers(JSON_HEADER)
+                .sendString(Mono.just("{\"bookingConfirmationToken\":\"%s\"}".formatted(jwt)))
+                .then())
             .onErrorResume(Exception.class, exception -> handleError(request, response, exception));
     }
 
@@ -95,9 +96,17 @@ public class BookingLinkReservationRoute implements JMAPRoutes {
                 LOGGER.warn("Booking link not found for [{}]: {}", request.uri(), notFound.getMessage());
                 yield ErrorResponseHandler.handle(response, HttpResponseStatus.NOT_FOUND, notFound);
             }
+            case BookingLinkNotActiveException notActive -> {
+                LOGGER.warn("Booking link {} is not active for [{}]", notActive.publicId().value(), request.uri());
+                yield ErrorResponseHandler.handle(response, HttpResponseStatus.BAD_REQUEST, ErrorType.INACTIVE_BOOKING_LINK, notActive);
+            }
             case SlotNotAvailableException slotNotAvailableException -> {
                 LOGGER.warn("Requested slot is unavailable (likely busy) for [{}]: {}", request.uri(), slotNotAvailableException.getMessage());
-                yield ErrorResponseHandler.handle(response, HttpResponseStatus.UNPROCESSABLE_ENTITY, slotNotAvailableException);
+                yield ErrorResponseHandler.handle(response, HttpResponseStatus.UNPROCESSABLE_ENTITY, ErrorType.UNAVAILABLE_BOOKING_SLOT, slotNotAvailableException);
+            }
+            case ForbiddenException forbiddenException -> {
+                LOGGER.warn("Booking rejected, owner lacks write access for [{}]: {}", request.uri(), forbiddenException.getMessage());
+                yield ErrorResponseHandler.handle(response, HttpResponseStatus.FORBIDDEN, forbiddenException);
             }
             case BookingLinkReservationException bookingLinkReservationException -> {
                 LOGGER.error("Booking operation failed for [{}]", request.uri(), bookingLinkReservationException);

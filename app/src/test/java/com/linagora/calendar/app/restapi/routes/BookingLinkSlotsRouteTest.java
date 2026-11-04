@@ -24,14 +24,14 @@ import static io.restassured.config.EncoderConfig.encoderConfig;
 import static io.restassured.config.RestAssuredConfig.newConfig;
 import static io.restassured.http.ContentType.JSON;
 import static net.javacrumbs.jsonunit.assertj.JsonAssertions.assertThatJson;
+import static org.assertj.core.api.Assertions.assertThat;
 
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.time.ZonedDateTime;
+import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
-
-import jakarta.inject.Inject;
 
 import org.apache.http.HttpStatus;
 import org.apache.james.core.Username;
@@ -42,26 +42,32 @@ import org.junit.jupiter.api.Order;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.RegisterExtension;
 
-import com.google.inject.Scopes;
 import com.google.inject.multibindings.Multibinder;
 import com.linagora.calendar.api.booking.AvailabilityRule.FixedAvailabilityRule;
 import com.linagora.calendar.api.booking.AvailabilityRules;
 import com.linagora.calendar.app.AppTestHelper;
+import com.linagora.calendar.app.BookingLinkProbe;
 import com.linagora.calendar.app.TwakeCalendarConfiguration;
 import com.linagora.calendar.app.TwakeCalendarExtension;
 import com.linagora.calendar.app.TwakeCalendarGuiceServer;
 import com.linagora.calendar.app.modules.CalendarDataProbe;
 import com.linagora.calendar.dav.DavModuleTestHelper;
 import com.linagora.calendar.dav.DavTestHelper;
-import com.linagora.calendar.dav.DockerSabreDavSetup;
 import com.linagora.calendar.dav.SabreDavExtension;
 import com.linagora.calendar.restapi.RestApiServerProbe;
+import com.linagora.calendar.app.ResourceProbe;
 import com.linagora.calendar.storage.CalendarURL;
+import com.linagora.calendar.storage.OpenPaaSId;
 import com.linagora.calendar.storage.OpenPaaSUser;
 import com.linagora.calendar.storage.booking.BookingLink;
-import com.linagora.calendar.storage.booking.BookingLinkDAO;
+import com.linagora.calendar.storage.booking.BookingLinkAlarm;
+import com.linagora.calendar.storage.booking.BookingLinkAlarmAction;
 import com.linagora.calendar.storage.booking.BookingLinkInsertRequest;
-import com.linagora.calendar.storage.booking.MemoryBookingLinkDAO;
+import com.linagora.calendar.storage.booking.EventTransparency;
+import com.linagora.calendar.storage.booking.EventVisibility;
+import com.linagora.calendar.storage.booking.ExtraAttendees;
+import com.linagora.calendar.storage.model.Resource;
+import com.linagora.calendar.storage.model.ResourceId;
 
 import io.restassured.RestAssured;
 import io.restassured.builder.RequestSpecBuilder;
@@ -77,22 +83,9 @@ class BookingLinkSlotsRouteTest {
         ZonedDateTime.parse("2036-01-26T09:00:00Z"),
         ZonedDateTime.parse("2036-01-26T12:00:00Z")));
 
-    static class BookingLinkSlotsProbe implements GuiceProbe {
-        private final BookingLinkDAO bookingLinkDAO;
-
-        @Inject
-        BookingLinkSlotsProbe(BookingLinkDAO bookingLinkDAO) {
-            this.bookingLinkDAO = bookingLinkDAO;
-        }
-
-        BookingLink insert(Username username, BookingLinkInsertRequest request) {
-            return bookingLinkDAO.insert(username, request).block();
-        }
-    }
-
     @RegisterExtension
     @Order(1)
-    static SabreDavExtension sabreDavExtension = new SabreDavExtension(DockerSabreDavSetup.SINGLETON);
+    static SabreDavExtension sabreDavExtension = SabreDavExtension.shared();
 
     @RegisterExtension
     @Order(2)
@@ -106,10 +99,10 @@ class BookingLinkSlotsRouteTest {
         binder -> {
             Multibinder.newSetBinder(binder, GuiceProbe.class)
                 .addBinding()
-                .to(BookingLinkSlotsProbe.class);
-
-            binder.bind(MemoryBookingLinkDAO.class).in(Scopes.SINGLETON);
-            binder.bind(BookingLinkDAO.class).to(MemoryBookingLinkDAO.class);
+                .to(BookingLinkProbe.class);
+            Multibinder.newSetBinder(binder, GuiceProbe.class)
+                .addBinding()
+                .to(ResourceProbe.class);
         });
 
     @AfterAll
@@ -141,8 +134,8 @@ class BookingLinkSlotsRouteTest {
 
     @Test
     void shouldReturnSlotsWhenRequestIsValid(TwakeCalendarGuiceServer server) {
-        BookingLinkInsertRequest insertRequest = new BookingLinkInsertRequest(CalendarURL.from(openPaaSUser.id()), DURATION_30_MINUTES, AVAILABILITY_RULE);
-        BookingLink inserted = server.getProbe(BookingLinkSlotsProbe.class).insert(openPaaSUser.username(), insertRequest);
+        BookingLinkInsertRequest insertRequest = BookingLinkInsertRequest.builder().calendarUrl(CalendarURL.from(openPaaSUser.id())).eventDuration(DURATION_30_MINUTES).availabilityRules(AVAILABILITY_RULE).build();
+        BookingLink inserted = server.getProbe(BookingLinkProbe.class).insert(openPaaSUser.username(), insertRequest);
 
         String response = given()
             .pathParam("bookingLinkPublicId", inserted.publicId().value())
@@ -162,6 +155,12 @@ class BookingLinkSlotsRouteTest {
             .isEqualTo("""
                 {
                   "durationMinutes": 30,
+                  "autoAccept": false,
+                  "color": "#6B4ECC",
+                  "owner": {
+                    "displayName": "%s",
+                    "email": "%s"
+                  },
                   "range": {
                     "from": "2036-01-26T00:00:00Z",
                     "to": "2036-01-27T00:00:00Z"
@@ -175,13 +174,327 @@ class BookingLinkSlotsRouteTest {
                     { "start": "2036-01-26T11:30:00Z" }
                   ]
                 }
+                """.formatted(openPaaSUser.fullName(), openPaaSUser.username().asString()));
+
+        assertThat(response)
+            .describedAs("should omit optional booking link name and description when unset")
+            .doesNotContain("\"name\"")
+            .doesNotContain("\"description\"");
+    }
+
+    @Test
+    void shouldExposeLocationAndResources(TwakeCalendarGuiceServer server) {
+        Resource resource = server.getProbe(ResourceProbe.class).save(openPaaSUser, "Projector", "projector");
+        BookingLink inserted = server.getProbe(BookingLinkProbe.class).insert(openPaaSUser.username(),
+            insertRequestWith(Optional.of("Room 3, Building A"), List.of(resource.id()), Optional.empty(), Optional.empty(), List.of()));
+
+        String response = given()
+            .pathParam("bookingLinkPublicId", inserted.publicId().value())
+            .queryParam("from", FROM_20360126)
+            .queryParam("to", TO_20360127)
+        .when()
+            .get("/api/booking-links/{bookingLinkPublicId}/slots")
+        .then()
+            .statusCode(HttpStatus.SC_OK)
+            .contentType(JSON)
+            .extract().body().asString();
+
+        assertThatJson(response)
+            .inPath("$.location")
+            .isEqualTo("\"Room 3, Building A\"");
+        assertThatJson(response)
+            .inPath("$.resources")
+            .isEqualTo("""
+                [ { "name": "Projector", "photoUrl": "https://twcalendar.linagora.com/images/icon/projector.svg" } ]
                 """);
     }
 
     @Test
+    void shouldSkipDeletedResource(TwakeCalendarGuiceServer server) {
+        Resource resource = server.getProbe(ResourceProbe.class).save(openPaaSUser, "Projector", "projector");
+        server.getProbe(ResourceProbe.class).remove(resource.id());
+        BookingLink inserted = server.getProbe(BookingLinkProbe.class).insert(openPaaSUser.username(),
+            insertRequestWith(Optional.empty(), List.of(resource.id()), Optional.empty(), Optional.empty(), List.of()));
+
+        String response = given()
+            .pathParam("bookingLinkPublicId", inserted.publicId().value())
+            .queryParam("from", FROM_20360126)
+            .queryParam("to", TO_20360127)
+        .when()
+            .get("/api/booking-links/{bookingLinkPublicId}/slots")
+        .then()
+            .statusCode(HttpStatus.SC_OK)
+            .extract().body().asString();
+
+        assertThat(response).doesNotContain("\"resources\"");
+    }
+
+    @Test
+    void shouldExposeVisibilityTransparencyAndAlarm(TwakeCalendarGuiceServer server) {
+        BookingLink inserted = server.getProbe(BookingLinkProbe.class).insert(openPaaSUser.username(),
+            insertRequestWith(Optional.empty(), List.of(), Optional.of(EventVisibility.PRIVATE),
+                Optional.of(EventTransparency.TRANSPARENT), List.of(new BookingLinkAlarm("-PT10M", BookingLinkAlarmAction.EMAIL))));
+
+        String response = given()
+            .pathParam("bookingLinkPublicId", inserted.publicId().value())
+            .queryParam("from", FROM_20360126)
+            .queryParam("to", TO_20360127)
+        .when()
+            .get("/api/booking-links/{bookingLinkPublicId}/slots")
+        .then()
+            .statusCode(HttpStatus.SC_OK)
+            .extract().body().asString();
+
+        assertThatJson(response).inPath("$.visibility").isEqualTo("\"PRIVATE\"");
+        assertThatJson(response).inPath("$.transparency").isEqualTo("\"TRANSPARENT\"");
+        assertThatJson(response).inPath("$.alarm").isEqualTo("""
+            [ { "period": "-PT10M", "action": "EMAIL" } ]
+            """);
+    }
+
+    @Test
+    void shouldExposeOwnerDisplayNameAndMailAddress(TwakeCalendarGuiceServer server) {
+        BookingLinkInsertRequest insertRequest = BookingLinkInsertRequest.builder().calendarUrl(CalendarURL.from(openPaaSUser.id())).eventDuration(DURATION_30_MINUTES).availabilityRules(AVAILABILITY_RULE).build();
+        BookingLink inserted = server.getProbe(BookingLinkProbe.class).insert(openPaaSUser.username(), insertRequest);
+
+        String response = given()
+            .pathParam("bookingLinkPublicId", inserted.publicId().value())
+            .queryParam("from", FROM_20360126)
+            .queryParam("to", TO_20360127)
+        .when()
+            .get("/api/booking-links/{bookingLinkPublicId}/slots")
+        .then()
+            .statusCode(HttpStatus.SC_OK)
+            .contentType(JSON)
+            .extract()
+            .body()
+            .asString();
+
+        assertThatJson(response)
+            .describedAs("should expose the booking link owner display name and mail address")
+            .inPath("$.owner")
+            .isEqualTo("""
+                {
+                  "displayName": "%s",
+                  "email": "%s"
+                }
+                """.formatted(openPaaSUser.fullName(), openPaaSUser.username().asString()));
+    }
+
+    @Test
+    void shouldExposeNameDescriptionAndAutoAccept(TwakeCalendarGuiceServer server) {
+        BookingLinkInsertRequest insertRequest = BookingLinkInsertRequest.builder()
+            .calendarUrl(CalendarURL.from(openPaaSUser.id()))
+            .eventDuration(DURATION_30_MINUTES)
+            .autoAccept(true)
+            .availabilityRules(AVAILABILITY_RULE)
+            .name("Interview")
+            .description("A 30 minutes interview")
+            .build();
+        BookingLink inserted = server.getProbe(BookingLinkProbe.class).insert(openPaaSUser.username(), insertRequest);
+
+        String response = given()
+            .pathParam("bookingLinkPublicId", inserted.publicId().value())
+            .queryParam("from", FROM_20360126)
+            .queryParam("to", TO_20360127)
+        .when()
+            .get("/api/booking-links/{bookingLinkPublicId}/slots")
+        .then()
+            .statusCode(HttpStatus.SC_OK)
+            .contentType(JSON)
+            .extract()
+            .body()
+            .asString();
+
+        assertThatJson(response)
+            .describedAs("should expose the booking link name, description and autoAccept")
+            .isEqualTo("""
+                {
+                  "durationMinutes": 30,
+                  "autoAccept": true,
+                  "name": "Interview",
+                  "description": "A 30 minutes interview",
+                  "color": "#6B4ECC",
+                  "owner": {
+                    "displayName": "%s",
+                    "email": "%s"
+                  },
+                  "range": {
+                    "from": "2036-01-26T00:00:00Z",
+                    "to": "2036-01-27T00:00:00Z"
+                  },
+                  "slots": [
+                    { "start": "2036-01-26T09:00:00Z" },
+                    { "start": "2036-01-26T09:30:00Z" },
+                    { "start": "2036-01-26T10:00:00Z" },
+                    { "start": "2036-01-26T10:30:00Z" },
+                    { "start": "2036-01-26T11:00:00Z" },
+                    { "start": "2036-01-26T11:30:00Z" }
+                  ]
+                }
+                """.formatted(openPaaSUser.fullName(), openPaaSUser.username().asString()));
+    }
+
+    @Test
+    void shouldConvertSlotsToRequestedTimeZone(TwakeCalendarGuiceServer server) {
+        BookingLinkInsertRequest insertRequest = BookingLinkInsertRequest.builder().calendarUrl(CalendarURL.from(openPaaSUser.id())).eventDuration(DURATION_30_MINUTES).availabilityRules(AVAILABILITY_RULE).build();
+        BookingLink inserted = server.getProbe(BookingLinkProbe.class).insert(openPaaSUser.username(), insertRequest);
+
+        String response = given()
+            .pathParam("bookingLinkPublicId", inserted.publicId().value())
+            .queryParam("from", FROM_20360126)
+            .queryParam("to", TO_20360127)
+            .queryParam("timeZone", "Europe/Paris")
+        .when()
+            .get("/api/booking-links/{bookingLinkPublicId}/slots")
+        .then()
+            .statusCode(HttpStatus.SC_OK)
+            .contentType(JSON)
+            .extract()
+            .body()
+            .asString();
+
+        assertThatJson(response)
+            .describedAs("should express range and slots in the requested time zone")
+            .isEqualTo("""
+                {
+                  "durationMinutes": 30,
+                  "autoAccept": false,
+                  "color": "#6B4ECC",
+                  "owner": {
+                    "displayName": "%s",
+                    "email": "%s"
+                  },
+                  "range": {
+                    "from": "2036-01-26T01:00:00+01:00",
+                    "to": "2036-01-27T01:00:00+01:00"
+                  },
+                  "slots": [
+                    { "start": "2036-01-26T10:00:00+01:00" },
+                    { "start": "2036-01-26T10:30:00+01:00" },
+                    { "start": "2036-01-26T11:00:00+01:00" },
+                    { "start": "2036-01-26T11:30:00+01:00" },
+                    { "start": "2036-01-26T12:00:00+01:00" },
+                    { "start": "2036-01-26T12:30:00+01:00" }
+                  ]
+                }
+                """.formatted(openPaaSUser.fullName(), openPaaSUser.username().asString()));
+    }
+
+    @Test
+    void shouldApplyDaylightSavingRulesForLegacyTimeZoneIdentifier(TwakeCalendarGuiceServer server) {
+        AvailabilityRules summerAvailabilityRule = AvailabilityRules.of(new FixedAvailabilityRule(
+            ZonedDateTime.parse("2036-07-01T09:00:00Z"),
+            ZonedDateTime.parse("2036-07-01T10:00:00Z")));
+        BookingLinkInsertRequest insertRequest = BookingLinkInsertRequest.builder().calendarUrl(CalendarURL.from(openPaaSUser.id())).eventDuration(DURATION_30_MINUTES).availabilityRules(summerAvailabilityRule).build();
+        BookingLink inserted = server.getProbe(BookingLinkProbe.class).insert(openPaaSUser.username(), insertRequest);
+
+        String response = given()
+            .pathParam("bookingLinkPublicId", inserted.publicId().value())
+            .queryParam("from", "2036-07-01T00:00:00Z")
+            .queryParam("to", "2036-07-02T00:00:00Z")
+            .queryParam("timeZone", "Romance Standard Time")
+        .when()
+            .get("/api/booking-links/{bookingLinkPublicId}/slots")
+        .then()
+            .statusCode(HttpStatus.SC_OK)
+            .contentType(JSON)
+            .extract()
+            .body()
+            .asString();
+
+        assertThatJson(response)
+            .describedAs("should apply DST offsets when resolving legacy time zone identifiers")
+            .isEqualTo("""
+                {
+                  "durationMinutes": 30,
+                  "autoAccept": false,
+                  "color": "#6B4ECC",
+                  "owner": {
+                    "displayName": "%s",
+                    "email": "%s"
+                  },
+                  "range": {
+                    "from": "2036-07-01T02:00:00+02:00",
+                    "to": "2036-07-02T02:00:00+02:00"
+                  },
+                  "slots": [
+                    { "start": "2036-07-01T11:00:00+02:00" },
+                    { "start": "2036-07-01T11:30:00+02:00" }
+                  ]
+                }
+                """.formatted(openPaaSUser.fullName(), openPaaSUser.username().asString()));
+    }
+
+    @Test
+    void shouldDefaultToUtcWhenTimeZoneIsAbsent(TwakeCalendarGuiceServer server) {
+        BookingLinkInsertRequest insertRequest = BookingLinkInsertRequest.builder().calendarUrl(CalendarURL.from(openPaaSUser.id())).eventDuration(DURATION_30_MINUTES).availabilityRules(AVAILABILITY_RULE).build();
+        BookingLink inserted = server.getProbe(BookingLinkProbe.class).insert(openPaaSUser.username(), insertRequest);
+
+        String response = given()
+            .pathParam("bookingLinkPublicId", inserted.publicId().value())
+            .queryParam("from", FROM_20360126)
+            .queryParam("to", TO_20360127)
+        .when()
+            .get("/api/booking-links/{bookingLinkPublicId}/slots")
+        .then()
+            .statusCode(HttpStatus.SC_OK)
+            .contentType(JSON)
+            .extract()
+            .body()
+            .asString();
+
+        assertThatJson(response)
+            .describedAs("should default to UTC when no time zone is provided")
+            .inPath("$.slots")
+            .isEqualTo("""
+                [
+                  { "start": "2036-01-26T09:00:00Z" },
+                  { "start": "2036-01-26T09:30:00Z" },
+                  { "start": "2036-01-26T10:00:00Z" },
+                  { "start": "2036-01-26T10:30:00Z" },
+                  { "start": "2036-01-26T11:00:00Z" },
+                  { "start": "2036-01-26T11:30:00Z" }
+                ]
+                """);
+    }
+
+    @Test
+    void shouldReturnBadRequestWhenTimeZoneIsInvalid(TwakeCalendarGuiceServer server) {
+        BookingLinkInsertRequest insertRequest = BookingLinkInsertRequest.builder().calendarUrl(CalendarURL.from(openPaaSUser.id())).eventDuration(DURATION_30_MINUTES).availabilityRules(AVAILABILITY_RULE).build();
+        BookingLink inserted = server.getProbe(BookingLinkProbe.class).insert(openPaaSUser.username(), insertRequest);
+
+        String response = given()
+            .pathParam("bookingLinkPublicId", inserted.publicId().value())
+            .queryParam("from", FROM_20360126)
+            .queryParam("to", TO_20360127)
+            .queryParam("timeZone", "Invalid/Zone")
+        .when()
+            .get("/api/booking-links/{bookingLinkPublicId}/slots")
+        .then()
+            .statusCode(HttpStatus.SC_BAD_REQUEST)
+            .contentType(JSON)
+            .extract()
+            .body()
+            .asString();
+
+        assertThatJson(response)
+            .describedAs("should return bad request when 'timeZone' is not a valid time zone")
+            .isEqualTo("""
+                {
+                    "error": {
+                        "code": 400,
+                        "type": "BadRequest",
+                        "message": "Bad Request",
+                        "details": "Invalid query parameter 'timeZone': Invalid/Zone"
+                    }
+                }""");
+    }
+
+    @Test
     void shouldReturnSlotsWithoutAuthentication(TwakeCalendarGuiceServer server) {
-        BookingLinkInsertRequest insertRequest = new BookingLinkInsertRequest(CalendarURL.from(openPaaSUser.id()), DURATION_30_MINUTES, AVAILABILITY_RULE);
-        BookingLink inserted = server.getProbe(BookingLinkSlotsProbe.class).insert(openPaaSUser.username(), insertRequest);
+        BookingLinkInsertRequest insertRequest = BookingLinkInsertRequest.builder().calendarUrl(CalendarURL.from(openPaaSUser.id())).eventDuration(DURATION_30_MINUTES).availabilityRules(AVAILABILITY_RULE).build();
+        BookingLink inserted = server.getProbe(BookingLinkProbe.class).insert(openPaaSUser.username(), insertRequest);
 
         given()
             .auth().none()
@@ -199,8 +512,8 @@ class BookingLinkSlotsRouteTest {
     void shouldExcludeBusyIntervalsFromReturnedSlots(TwakeCalendarGuiceServer server) {
         // Given: an active booking link with a 09:00-12:00 availability window
         // and two opaque busy events that overlap expected 30-minute slots.
-        BookingLinkInsertRequest insertRequest = new BookingLinkInsertRequest(CalendarURL.from(openPaaSUser.id()), DURATION_30_MINUTES, AVAILABILITY_RULE);
-        BookingLink inserted = server.getProbe(BookingLinkSlotsProbe.class).insert(openPaaSUser.username(), insertRequest);
+        BookingLinkInsertRequest insertRequest = BookingLinkInsertRequest.builder().calendarUrl(CalendarURL.from(openPaaSUser.id())).eventDuration(DURATION_30_MINUTES).availabilityRules(AVAILABILITY_RULE).build();
+        BookingLink inserted = server.getProbe(BookingLinkProbe.class).insert(openPaaSUser.username(), insertRequest);
 
         // Given busy interval [09:30, 10:00): this should exclude slot starting at 09:30.
         String firstUid = UUID.randomUUID().toString();
@@ -264,12 +577,188 @@ class BookingLinkSlotsRouteTest {
     }
 
     @Test
+    void shouldExcludeExtraAttendeeBusyIntervalsFromReturnedSlots(TwakeCalendarGuiceServer server) {
+        // Given: a booking link carrying an extra attendee. Their free/busy is queried by impersonating the
+        // booking link owner, so the DAV server decides what the owner may see of that calendar.
+        OpenPaaSUser extraAttendee = createTestUser(server, "extra");
+
+        BookingLinkInsertRequest insertRequest = BookingLinkInsertRequest.builder()
+            .calendarUrl(CalendarURL.from(openPaaSUser.id()))
+            .eventDuration(DURATION_30_MINUTES)
+            .availabilityRules(AVAILABILITY_RULE)
+            .extraAttendees(ExtraAttendees.of(extraAttendee.id()))
+            .build();
+        BookingLink inserted = server.getProbe(BookingLinkProbe.class).insert(openPaaSUser.username(), insertRequest);
+
+        // Given owner busy interval [09:30, 10:00): this should exclude slot starting at 09:30.
+        String ownerBusyUid = UUID.randomUUID().toString();
+        davTestHelper.upsertCalendar(openPaaSUser, """
+            BEGIN:VCALENDAR
+            VERSION:2.0
+            PRODID:-//Twake//BookingSlotsTest//EN
+            BEGIN:VEVENT
+            UID:%s
+            DTSTAMP:20360101T000000Z
+            DTSTART:20360126T093000Z
+            DTEND:20360126T100000Z
+            SUMMARY:owner-busy
+            TRANSP:OPAQUE
+            END:VEVENT
+            END:VCALENDAR
+            """.formatted(ownerBusyUid), ownerBusyUid);
+
+        // Given extra attendee busy interval [11:00, 11:30): this should exclude slot starting at 11:00 too.
+        String extraAttendeeBusyUid = UUID.randomUUID().toString();
+        davTestHelper.upsertCalendar(extraAttendee, """
+            BEGIN:VCALENDAR
+            VERSION:2.0
+            PRODID:-//Twake//BookingSlotsTest//EN
+            BEGIN:VEVENT
+            UID:%s
+            DTSTAMP:20360101T000000Z
+            DTSTART:20360126T110000Z
+            DTEND:20360126T113000Z
+            SUMMARY:extra-attendee-busy
+            TRANSP:OPAQUE
+            END:VEVENT
+            END:VCALENDAR
+            """.formatted(extraAttendeeBusyUid), extraAttendeeBusyUid);
+
+        String response = given()
+            .pathParam("bookingLinkPublicId", inserted.publicId().value())
+            .queryParam("from", FROM_20360126)
+            .queryParam("to", TO_20360127)
+        .when()
+            .get("/api/booking-links/{bookingLinkPublicId}/slots")
+        .then()
+            .statusCode(HttpStatus.SC_OK)
+            .contentType(JSON)
+            .extract()
+            .body()
+            .asString();
+
+        assertThatJson(response)
+            .describedAs("offered slots should be the intersection of the owner and the extra attendee availability")
+            .inPath("$.slots")
+            .isEqualTo("""
+                [
+                  { "start": "2036-01-26T09:00:00Z" },
+                  { "start": "2036-01-26T10:00:00Z" },
+                  { "start": "2036-01-26T10:30:00Z" },
+                  { "start": "2036-01-26T11:30:00Z" }
+                ]
+                """);
+    }
+
+    @Test
+    void shouldStillReturnSlotsWhenExtraAttendeeCalendarCannotBeRead(TwakeCalendarGuiceServer server) {
+        // Given: an extra attendee whose calendar the owner cannot read at all. Such an attendee is treated
+        // as free rather than breaking the whole booking link.
+        BookingLinkInsertRequest insertRequest = BookingLinkInsertRequest.builder()
+            .calendarUrl(CalendarURL.from(openPaaSUser.id()))
+            .eventDuration(DURATION_30_MINUTES)
+            .availabilityRules(AVAILABILITY_RULE)
+            .extraAttendees(ExtraAttendees.of(new OpenPaaSId("659387b9d486dc0046aeffff")))
+            .build();
+        BookingLink inserted = server.getProbe(BookingLinkProbe.class).insert(openPaaSUser.username(), insertRequest);
+
+        String response = given()
+            .pathParam("bookingLinkPublicId", inserted.publicId().value())
+            .queryParam("from", FROM_20360126)
+            .queryParam("to", TO_20360127)
+        .when()
+            .get("/api/booking-links/{bookingLinkPublicId}/slots")
+        .then()
+            .statusCode(HttpStatus.SC_OK)
+            .contentType(JSON)
+            .extract()
+            .body()
+            .asString();
+
+        assertThatJson(response)
+            .inPath("$.slots")
+            .isEqualTo("""
+                [
+                  { "start": "2036-01-26T09:00:00Z" },
+                  { "start": "2036-01-26T09:30:00Z" },
+                  { "start": "2036-01-26T10:00:00Z" },
+                  { "start": "2036-01-26T10:30:00Z" },
+                  { "start": "2036-01-26T11:00:00Z" },
+                  { "start": "2036-01-26T11:30:00Z" }
+                ]
+                """);
+    }
+
+    @Test
+    void shouldExposeExtraAttendees(TwakeCalendarGuiceServer server) {
+        OpenPaaSUser john = createTestUser(server, "john");
+        OpenPaaSUser peter = createTestUser(server, "peter");
+
+        BookingLinkInsertRequest insertRequest = BookingLinkInsertRequest.builder()
+            .calendarUrl(CalendarURL.from(openPaaSUser.id()))
+            .eventDuration(DURATION_30_MINUTES)
+            .availabilityRules(AVAILABILITY_RULE)
+            .extraAttendees(ExtraAttendees.of(john.id(), peter.id()))
+            .build();
+        BookingLink inserted = server.getProbe(BookingLinkProbe.class).insert(openPaaSUser.username(), insertRequest);
+
+        String response = given()
+            .pathParam("bookingLinkPublicId", inserted.publicId().value())
+            .queryParam("from", FROM_20360126)
+            .queryParam("to", TO_20360127)
+        .when()
+            .get("/api/booking-links/{bookingLinkPublicId}/slots")
+        .then()
+            .statusCode(HttpStatus.SC_OK)
+            .contentType(JSON)
+            .extract()
+            .body()
+            .asString();
+
+        assertThatJson(response)
+            .describedAs("should expose the extra attendees by display name and email rather than by id")
+            .inPath("$.extraAttendees")
+            .isEqualTo("""
+                {
+                  "and": [
+                    { "displayName": "%s", "email": "%s" },
+                    { "displayName": "%s", "email": "%s" }
+                  ]
+                }
+                """.formatted(john.fullName(), john.username().asString(),
+                peter.fullName(), peter.username().asString()));
+    }
+
+    @Test
+    void shouldSkipDeletedExtraAttendee(TwakeCalendarGuiceServer server) {
+        BookingLinkInsertRequest insertRequest = BookingLinkInsertRequest.builder()
+            .calendarUrl(CalendarURL.from(openPaaSUser.id()))
+            .eventDuration(DURATION_30_MINUTES)
+            .availabilityRules(AVAILABILITY_RULE)
+            .extraAttendees(ExtraAttendees.of(new OpenPaaSId("659387b9d486dc0046aeffff")))
+            .build();
+        BookingLink inserted = server.getProbe(BookingLinkProbe.class).insert(openPaaSUser.username(), insertRequest);
+
+        String response = given()
+            .pathParam("bookingLinkPublicId", inserted.publicId().value())
+            .queryParam("from", FROM_20360126)
+            .queryParam("to", TO_20360127)
+        .when()
+            .get("/api/booking-links/{bookingLinkPublicId}/slots")
+        .then()
+            .statusCode(HttpStatus.SC_OK)
+            .extract().body().asString();
+
+        assertThat(response).doesNotContain("\"extraAttendees\"");
+    }
+
+    @Test
     void shouldExcludeOnlyCurrentUserBusyIntervalsFromReturnedSlots(TwakeCalendarGuiceServer server) {
         // Given: two users, where both have busy events at the same period,
         // but only user A owns the booking link being queried.
         OpenPaaSUser otherUser = createTestUser(server, "other");
-        BookingLinkInsertRequest insertRequest = new BookingLinkInsertRequest(CalendarURL.from(openPaaSUser.id()), DURATION_30_MINUTES, AVAILABILITY_RULE);
-        BookingLink inserted = server.getProbe(BookingLinkSlotsProbe.class).insert(openPaaSUser.username(), insertRequest);
+        BookingLinkInsertRequest insertRequest = BookingLinkInsertRequest.builder().calendarUrl(CalendarURL.from(openPaaSUser.id())).eventDuration(DURATION_30_MINUTES).availabilityRules(AVAILABILITY_RULE).build();
+        BookingLink inserted = server.getProbe(BookingLinkProbe.class).insert(openPaaSUser.username(), insertRequest);
 
         // Given owner busy interval [09:30, 10:00): this should exclude owner slot starting at 09:30.
         String ownerBusyUid = UUID.randomUUID().toString();
@@ -336,8 +825,8 @@ class BookingLinkSlotsRouteTest {
     @Test
     void shouldComputeSlotsWhenQueryRangeContainsHourMinute(TwakeCalendarGuiceServer server) {
         // Given a booking link with fixed availability 09:00-12:00 and 30-minute duration.
-        BookingLinkInsertRequest insertRequest = new BookingLinkInsertRequest(CalendarURL.from(openPaaSUser.id()), DURATION_30_MINUTES, AVAILABILITY_RULE);
-        BookingLink inserted = server.getProbe(BookingLinkSlotsProbe.class).insert(openPaaSUser.username(), insertRequest);
+        BookingLinkInsertRequest insertRequest = BookingLinkInsertRequest.builder().calendarUrl(CalendarURL.from(openPaaSUser.id())).eventDuration(DURATION_30_MINUTES).availabilityRules(AVAILABILITY_RULE).build();
+        BookingLink inserted = server.getProbe(BookingLinkProbe.class).insert(openPaaSUser.username(), insertRequest);
 
         // Given query range containing HH:mm precision instead of full-day boundaries.
         String from = "2036-01-26T09:00:00Z";
@@ -372,8 +861,8 @@ class BookingLinkSlotsRouteTest {
 
     @Test
     void shouldExcludeSlotsOverlappingNonRoundedBusyIntervals(TwakeCalendarGuiceServer server) {
-        BookingLinkInsertRequest insertRequest = new BookingLinkInsertRequest(CalendarURL.from(openPaaSUser.id()), DURATION_30_MINUTES, AVAILABILITY_RULE);
-        BookingLink inserted = server.getProbe(BookingLinkSlotsProbe.class).insert(openPaaSUser.username(), insertRequest);
+        BookingLinkInsertRequest insertRequest = BookingLinkInsertRequest.builder().calendarUrl(CalendarURL.from(openPaaSUser.id())).eventDuration(DURATION_30_MINUTES).availabilityRules(AVAILABILITY_RULE).build();
+        BookingLink inserted = server.getProbe(BookingLinkProbe.class).insert(openPaaSUser.username(), insertRequest);
 
         String firstUid = UUID.randomUUID().toString();
         davTestHelper.upsertCalendar(openPaaSUser, """
@@ -434,8 +923,8 @@ class BookingLinkSlotsRouteTest {
 
     @Test
     void shouldReturnBadRequestWhenRangeExceedsMaximumAllowedDays(TwakeCalendarGuiceServer server) {
-        BookingLinkInsertRequest insertRequest = new BookingLinkInsertRequest(CalendarURL.from(openPaaSUser.id()), DURATION_30_MINUTES, AVAILABILITY_RULE);
-        BookingLink inserted = server.getProbe(BookingLinkSlotsProbe.class).insert(openPaaSUser.username(), insertRequest);
+        BookingLinkInsertRequest insertRequest = BookingLinkInsertRequest.builder().calendarUrl(CalendarURL.from(openPaaSUser.id())).eventDuration(DURATION_30_MINUTES).availabilityRules(AVAILABILITY_RULE).build();
+        BookingLink inserted = server.getProbe(BookingLinkProbe.class).insert(openPaaSUser.username(), insertRequest);
 
         String response = given()
             .pathParam("bookingLinkPublicId", inserted.publicId().value())
@@ -456,6 +945,7 @@ class BookingLinkSlotsRouteTest {
                 {
                     "error": {
                         "code": 400,
+                        "type": "BadRequest",
                         "message": "Bad Request",
                         "details": "Requested range is too large, max is %s days"
                     }
@@ -467,8 +957,8 @@ class BookingLinkSlotsRouteTest {
         AvailabilityRules anotherDayRule = AvailabilityRules.of(new FixedAvailabilityRule(
             ZonedDateTime.parse("2036-01-25T09:00:00Z"),
             ZonedDateTime.parse("2036-01-25T12:00:00Z")));
-        BookingLinkInsertRequest insertRequest = new BookingLinkInsertRequest(CalendarURL.from(openPaaSUser.id()), DURATION_30_MINUTES, anotherDayRule);
-        BookingLink inserted = server.getProbe(BookingLinkSlotsProbe.class).insert(openPaaSUser.username(), insertRequest);
+        BookingLinkInsertRequest insertRequest = BookingLinkInsertRequest.builder().calendarUrl(CalendarURL.from(openPaaSUser.id())).eventDuration(DURATION_30_MINUTES).availabilityRules(anotherDayRule).build();
+        BookingLink inserted = server.getProbe(BookingLinkProbe.class).insert(openPaaSUser.username(), insertRequest);
 
         String response = given()
             .pathParam("bookingLinkPublicId", inserted.publicId().value())
@@ -491,8 +981,8 @@ class BookingLinkSlotsRouteTest {
 
     @Test
     void shouldUseFixedRuleFromQueryRangeWhenAvailabilityRulesIsAbsent(TwakeCalendarGuiceServer server) {
-        BookingLinkInsertRequest insertRequest = new BookingLinkInsertRequest(CalendarURL.from(openPaaSUser.id()), DURATION_30_MINUTES, BookingLinkInsertRequest.ACTIVE, Optional.empty());
-        BookingLink inserted = server.getProbe(BookingLinkSlotsProbe.class).insert(openPaaSUser.username(), insertRequest);
+        BookingLinkInsertRequest insertRequest = BookingLinkInsertRequest.builder().calendarUrl(CalendarURL.from(openPaaSUser.id())).eventDuration(DURATION_30_MINUTES).build();
+        BookingLink inserted = server.getProbe(BookingLinkProbe.class).insert(openPaaSUser.username(), insertRequest);
 
         String response = given()
             .pathParam("bookingLinkPublicId", inserted.publicId().value())
@@ -522,8 +1012,8 @@ class BookingLinkSlotsRouteTest {
 
     @Test
     void shouldReturnBadRequestWhenFromQueryParamIsMissing(TwakeCalendarGuiceServer server) {
-        BookingLinkInsertRequest insertRequest = new BookingLinkInsertRequest(CalendarURL.from(openPaaSUser.id()), DURATION_30_MINUTES, AVAILABILITY_RULE);
-        BookingLink inserted = server.getProbe(BookingLinkSlotsProbe.class).insert(openPaaSUser.username(), insertRequest);
+        BookingLinkInsertRequest insertRequest = BookingLinkInsertRequest.builder().calendarUrl(CalendarURL.from(openPaaSUser.id())).eventDuration(DURATION_30_MINUTES).availabilityRules(AVAILABILITY_RULE).build();
+        BookingLink inserted = server.getProbe(BookingLinkProbe.class).insert(openPaaSUser.username(), insertRequest);
 
         String response = given()
             .pathParam("bookingLinkPublicId", inserted.publicId().value())
@@ -543,6 +1033,7 @@ class BookingLinkSlotsRouteTest {
                 {
                     "error": {
                         "code": 400,
+                        "type": "BadRequest",
                         "message": "Bad Request",
                         "details": "Missing or invalid query parameter 'from'. Expected ISO-8601 instant format, e.g. 2007-12-03T10:15:30.00Z"
                     }
@@ -551,8 +1042,8 @@ class BookingLinkSlotsRouteTest {
 
     @Test
     void shouldReturnBadRequestWhenToQueryParamIsMissing(TwakeCalendarGuiceServer server) {
-        BookingLinkInsertRequest insertRequest = new BookingLinkInsertRequest(CalendarURL.from(openPaaSUser.id()), DURATION_30_MINUTES, AVAILABILITY_RULE);
-        BookingLink inserted = server.getProbe(BookingLinkSlotsProbe.class).insert(openPaaSUser.username(), insertRequest);
+        BookingLinkInsertRequest insertRequest = BookingLinkInsertRequest.builder().calendarUrl(CalendarURL.from(openPaaSUser.id())).eventDuration(DURATION_30_MINUTES).availabilityRules(AVAILABILITY_RULE).build();
+        BookingLink inserted = server.getProbe(BookingLinkProbe.class).insert(openPaaSUser.username(), insertRequest);
 
         String response = given()
             .pathParam("bookingLinkPublicId", inserted.publicId().value())
@@ -572,6 +1063,7 @@ class BookingLinkSlotsRouteTest {
                 {
                     "error": {
                         "code": 400,
+                        "type": "BadRequest",
                         "message": "Bad Request",
                         "details": "Missing or invalid query parameter 'to'. Expected ISO-8601 instant format, e.g. 2007-12-03T10:15:30.00Z"
                     }
@@ -580,8 +1072,8 @@ class BookingLinkSlotsRouteTest {
 
     @Test
     void shouldReturnBadRequestWhenFromIsInvalidInstant(TwakeCalendarGuiceServer server) {
-        BookingLinkInsertRequest insertRequest = new BookingLinkInsertRequest(CalendarURL.from(openPaaSUser.id()), DURATION_30_MINUTES, AVAILABILITY_RULE);
-        BookingLink inserted = server.getProbe(BookingLinkSlotsProbe.class).insert(openPaaSUser.username(), insertRequest);
+        BookingLinkInsertRequest insertRequest = BookingLinkInsertRequest.builder().calendarUrl(CalendarURL.from(openPaaSUser.id())).eventDuration(DURATION_30_MINUTES).availabilityRules(AVAILABILITY_RULE).build();
+        BookingLink inserted = server.getProbe(BookingLinkProbe.class).insert(openPaaSUser.username(), insertRequest);
 
         String response = given()
             .pathParam("bookingLinkPublicId", inserted.publicId().value())
@@ -602,6 +1094,7 @@ class BookingLinkSlotsRouteTest {
                 {
                     "error": {
                         "code": 400,
+                        "type": "BadRequest",
                         "message": "Bad Request",
                         "details": "Missing or invalid query parameter 'from'. Expected ISO-8601 instant format, e.g. 2007-12-03T10:15:30.00Z"
                     }
@@ -610,8 +1103,8 @@ class BookingLinkSlotsRouteTest {
 
     @Test
     void shouldReturnBadRequestWhenToIsInvalidInstant(TwakeCalendarGuiceServer server) {
-        BookingLinkInsertRequest insertRequest = new BookingLinkInsertRequest(CalendarURL.from(openPaaSUser.id()), DURATION_30_MINUTES, AVAILABILITY_RULE);
-        BookingLink inserted = server.getProbe(BookingLinkSlotsProbe.class).insert(openPaaSUser.username(), insertRequest);
+        BookingLinkInsertRequest insertRequest = BookingLinkInsertRequest.builder().calendarUrl(CalendarURL.from(openPaaSUser.id())).eventDuration(DURATION_30_MINUTES).availabilityRules(AVAILABILITY_RULE).build();
+        BookingLink inserted = server.getProbe(BookingLinkProbe.class).insert(openPaaSUser.username(), insertRequest);
 
         String response = given()
             .pathParam("bookingLinkPublicId", inserted.publicId().value())
@@ -632,6 +1125,7 @@ class BookingLinkSlotsRouteTest {
                 {
                     "error": {
                         "code": 400,
+                        "type": "BadRequest",
                         "message": "Bad Request",
                         "details": "Missing or invalid query parameter 'to'. Expected ISO-8601 instant format, e.g. 2007-12-03T10:15:30.00Z"
                     }
@@ -640,8 +1134,8 @@ class BookingLinkSlotsRouteTest {
 
     @Test
     void shouldReturnBadRequestWhenToIsNotAfterFrom(TwakeCalendarGuiceServer server) {
-        BookingLinkInsertRequest insertRequest = new BookingLinkInsertRequest(CalendarURL.from(openPaaSUser.id()), DURATION_30_MINUTES, AVAILABILITY_RULE);
-        BookingLink inserted = server.getProbe(BookingLinkSlotsProbe.class).insert(openPaaSUser.username(), insertRequest);
+        BookingLinkInsertRequest insertRequest = BookingLinkInsertRequest.builder().calendarUrl(CalendarURL.from(openPaaSUser.id())).eventDuration(DURATION_30_MINUTES).availabilityRules(AVAILABILITY_RULE).build();
+        BookingLink inserted = server.getProbe(BookingLinkProbe.class).insert(openPaaSUser.username(), insertRequest);
 
         String response = given()
             .pathParam("bookingLinkPublicId", inserted.publicId().value())
@@ -662,6 +1156,7 @@ class BookingLinkSlotsRouteTest {
                 {
                     "error": {
                         "code": 400,
+                        "type": "BadRequest",
                         "message": "Bad Request",
                         "details": "'to' must be after 'from'"
                     }
@@ -690,6 +1185,7 @@ class BookingLinkSlotsRouteTest {
                 {
                     "error": {
                         "code": 404,
+                        "type": "NotFound",
                         "message": "Not Found",
                         "details": "Cannot find booking link with publicId %s"
                     }
@@ -697,10 +1193,10 @@ class BookingLinkSlotsRouteTest {
     }
 
     @Test
-    void shouldReturnNotFoundWhenBookingLinkIsInactive(TwakeCalendarGuiceServer server) {
-        boolean inactive = false;
-        BookingLinkInsertRequest insertRequest = new BookingLinkInsertRequest(CalendarURL.from(openPaaSUser.id()), DURATION_30_MINUTES, inactive, Optional.of(AVAILABILITY_RULE));
-        BookingLink inserted = server.getProbe(BookingLinkSlotsProbe.class).insert(openPaaSUser.username(), insertRequest);
+    void shouldReturnNotFoundWhenBookingLinkOwnerDoesNotExist(TwakeCalendarGuiceServer server) {
+        Username missingOwner = Username.of("missing-owner@domain.tld");
+        BookingLinkInsertRequest insertRequest = BookingLinkInsertRequest.builder().calendarUrl(CalendarURL.from(openPaaSUser.id())).eventDuration(DURATION_30_MINUTES).availabilityRules(AVAILABILITY_RULE).build();
+        BookingLink inserted = server.getProbe(BookingLinkProbe.class).insert(missingOwner, insertRequest);
 
         String response = given()
             .pathParam("bookingLinkPublicId", inserted.publicId().value())
@@ -716,15 +1212,59 @@ class BookingLinkSlotsRouteTest {
             .asString();
 
         assertThatJson(response)
-            .describedAs("should return not found when booking link is inactive")
+            .describedAs("should return not found when the booking link owner no longer exists")
             .isEqualTo("""
                 {
                     "error": {
                         "code": 404,
+                        "type": "NotFound",
                         "message": "Not Found",
                         "details": "Cannot find booking link with publicId %s"
                     }
                 }""".formatted(inserted.publicId().value()));
+    }
+
+    @Test
+    void shouldReturnBadRequestWhenBookingLinkIsInactive(TwakeCalendarGuiceServer server) {
+        boolean inactive = false;
+        BookingLinkInsertRequest insertRequest = BookingLinkInsertRequest.builder().calendarUrl(CalendarURL.from(openPaaSUser.id())).eventDuration(DURATION_30_MINUTES).active(inactive).availabilityRules(AVAILABILITY_RULE).build();
+        BookingLink inserted = server.getProbe(BookingLinkProbe.class).insert(openPaaSUser.username(), insertRequest);
+
+        String response = given()
+            .pathParam("bookingLinkPublicId", inserted.publicId().value())
+            .queryParam("from", FROM_20360126)
+            .queryParam("to", TO_20360127)
+        .when()
+            .get("/api/booking-links/{bookingLinkPublicId}/slots")
+        .then()
+            .statusCode(HttpStatus.SC_BAD_REQUEST)
+            .contentType(JSON)
+            .extract()
+            .body()
+            .asString();
+
+        assertThatJson(response)
+            .describedAs("should return bad request when booking link is inactive")
+            .isEqualTo("""
+                {
+                    "error": {
+                        "code": 400,
+                        "type": "InactiveBookingLink",
+                        "message": "Bad Request",
+                        "details": "The booking link with public id %s is not available"
+                    }
+                }""".formatted(inserted.publicId().value()));
+    }
+
+    private BookingLinkInsertRequest insertRequestWith(Optional<String> location,
+                                                       List<ResourceId> resources,
+                                                       Optional<EventVisibility> visibility,
+                                                       Optional<EventTransparency> transparency,
+                                                       List<BookingLinkAlarm> alarm) {
+        return new BookingLinkInsertRequest(CalendarURL.from(openPaaSUser.id()), DURATION_30_MINUTES, BookingLinkInsertRequest.ACTIVE,
+            BookingLinkInsertRequest.AUTO_ACCEPT, Optional.of(AVAILABILITY_RULE), ExtraAttendees.NONE,
+            Optional.empty(), Optional.empty(), Optional.empty(),
+            location, visibility, transparency, resources, alarm);
     }
 
     private OpenPaaSUser createTestUser(TwakeCalendarGuiceServer server, String prefix) {

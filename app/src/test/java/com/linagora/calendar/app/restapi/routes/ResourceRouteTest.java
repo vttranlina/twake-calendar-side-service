@@ -50,9 +50,10 @@ import com.linagora.calendar.app.TwakeCalendarConfiguration;
 import com.linagora.calendar.app.TwakeCalendarExtension;
 import com.linagora.calendar.app.TwakeCalendarGuiceServer;
 import com.linagora.calendar.app.modules.CalendarDataProbe;
-import com.linagora.calendar.app.restapi.routes.PeopleSearchRouteTest.ResourceProbe;
+import com.linagora.calendar.app.ResourceProbe;
+import com.linagora.calendar.dav.DavRight;
 import com.linagora.calendar.dav.DavModuleTestHelper;
-import com.linagora.calendar.dav.DockerSabreDavSetup;
+import com.linagora.calendar.dav.ResourceService.ResourceAdministrator;
 import com.linagora.calendar.dav.SabreDavExtension;
 import com.linagora.calendar.restapi.RestApiServerProbe;
 import com.linagora.calendar.smtp.MailSenderConfiguration;
@@ -69,6 +70,9 @@ import net.javacrumbs.jsonunit.core.Option;
 
 public class ResourceRouteTest {
     private static final String DEFAULT_USER_PASSWORD = "secret";
+    private static final String ADMIN = "admin@linagora.com";
+    private static final String ADMIN_PASSWORD = "secret";
+    private static final String LEGACY_RESOURCE_PATH = "/linagora.esn.resource/api/resources/%s";
 
     @RegisterExtension
     @Order(1)
@@ -76,7 +80,7 @@ public class ResourceRouteTest {
 
     @RegisterExtension
     @Order(2)
-    static SabreDavExtension SABRE_DAV_EXTENSION = new SabreDavExtension(DockerSabreDavSetup.SINGLETON);
+    static SabreDavExtension SABRE_DAV_EXTENSION = SabreDavExtension.shared();
 
     @RegisterExtension
     @Order(3)
@@ -119,6 +123,10 @@ public class ResourceRouteTest {
 
         resource = server.getProbe(ResourceProbe.class)
             .save(openPaaSUser, "meeting-room", "room", List.of(openPaaSUser.id(), openPaaSUser2.id()));
+        server.getProbe(ResourceProbe.class)
+            .updateAdmins(resource, List.of(
+                new ResourceAdministrator(openPaaSUser.username(), DavRight.READ_WRITE),
+                new ResourceAdministrator(openPaaSUser2.username(), DavRight.ADMINISTRATION)));
         resource2 = server.getProbe(ResourceProbe.class)
             .save(openPaaSUser2, "Laptop HP", "laptop");
 
@@ -163,12 +171,16 @@ public class ResourceRouteTest {
                         {
                             "id": "{adminId1}",
                             "objectType": "user",
-                            "_id": "{adminId1}"
+                            "_id": "{adminId1}",
+                            "davRight": "dav:read-write",
+                            "access": 3
                         },
                         {
                             "id": "{adminId2}",
                             "objectType": "user",
-                            "_id": "{adminId2}"
+                            "_id": "{adminId2}",
+                            "davRight": "dav:administration",
+                            "access": 5
                         }
                     ],
                     "creator": "{creatorId}",
@@ -251,6 +263,45 @@ public class ResourceRouteTest {
             .get(String.format("/api/resources/%s", resource.id().value()))
         .then()
             .statusCode(404);
+    }
+
+    @Test
+    void shouldReturn404WhenAccessingResourceFromAnotherDomainOnLegacyEndpoint(TwakeCalendarGuiceServer server) {
+        Domain otherDomain = Domain.of("domain999.tld");
+        Username otherDomainUser = Username.fromLocalPartWithDomain(UUID.randomUUID().toString(), otherDomain);
+        server.getProbe(CalendarDataProbe.class)
+            .addDomain(otherDomain)
+            .addUserToRepository(otherDomainUser, DEFAULT_USER_PASSWORD);
+
+        given(buildRequestSpec(otherDomainUser.asString(), DEFAULT_USER_PASSWORD, restApiPort))
+            .when()
+            .get(String.format(LEGACY_RESOURCE_PATH, resource.id().value()))
+        .then()
+            .statusCode(404);
+    }
+
+    @Test
+    void adminShouldAccessResourceFromAnotherDomain() {
+        given(buildRequestSpec(ADMIN, ADMIN_PASSWORD, restApiPort))
+            .when()
+            .get(String.format("/api/resources/%s", resource.id().value()))
+        .then()
+            .statusCode(200)
+            .contentType(JSON)
+            .body("_id", equalTo(resource.id().value()))
+            .body("name", equalTo(resource.name()));
+    }
+
+    @Test
+    void adminShouldAccessResourceFromAnotherDomainOnLegacyEndpoint() {
+        given(buildRequestSpec(ADMIN, ADMIN_PASSWORD, restApiPort))
+            .when()
+            .get(String.format(LEGACY_RESOURCE_PATH, resource.id().value()))
+        .then()
+            .statusCode(200)
+            .contentType(JSON)
+            .body("_id", equalTo(resource.id().value()))
+            .body("name", equalTo(resource.name()));
     }
 
     @Test

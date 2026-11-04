@@ -27,12 +27,14 @@ import java.util.Optional;
 import jakarta.mail.internet.AddressException;
 
 import org.apache.commons.lang3.StringUtils;
+import org.apache.commons.lang3.Strings;
 import org.apache.james.core.MailAddress;
 
 import com.fasterxml.jackson.annotation.JsonProperty;
 import com.fasterxml.jackson.core.JsonParser;
 import com.fasterxml.jackson.core.JsonToken;
 import com.fasterxml.jackson.databind.DeserializationContext;
+import com.fasterxml.jackson.databind.DeserializationFeature;
 import com.fasterxml.jackson.databind.JsonDeserializer;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.annotation.JsonDeserialize;
@@ -56,7 +58,8 @@ public record ItipLocalDeliveryDTO(
     @JsonDeserialize(using = RecipientListDeserializer.class)
     @JsonProperty("recipients") List<String> recipients) {
 
-    private static final ObjectMapper OBJECT_MAPPER = new ObjectMapper().registerModule(new Jdk8Module());
+    private static final ObjectMapper OBJECT_MAPPER = new ObjectMapper().registerModule(new Jdk8Module())
+        .configure(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES, false);
 
     public static byte[] serialize(ItipLocalDeliveryDTO dto) {
         try {
@@ -121,7 +124,11 @@ public record ItipLocalDeliveryDTO(
         return stripMailto(recipients.getFirst());
     }
 
-    private static String stripMailto(String address) {
-        return address.startsWith("mailto:") ? address.substring(7) : address;
+    static String stripMailto(String address) {
+        String sanitized = StringUtils.strip(StringUtils.trimToEmpty(address), "<>");
+        if (Strings.CI.startsWith(sanitized, "mailto:")) {
+            sanitized = sanitized.substring("mailto:".length());
+        }
+        return StringUtils.strip(sanitized, "<>");
     }
 }

@@ -18,15 +18,23 @@
 
 package com.linagora.calendar.amqp;
 
+import static com.linagora.calendar.amqp.EventEmailConsumer.X_PUBLICLY_CANCELLED_BY_HEADER;
+import static com.linagora.calendar.amqp.EventEmailConsumer.X_PUBLICLY_CREATED_HEADER;
 import static com.linagora.calendar.amqp.EventFieldConverter.extractCalendarURL;
+import static com.linagora.calendar.amqp.model.CalendarEventBookingNotificationEmail.X_PUBLICLY_CREATOR_HEADER;
+import static com.linagora.calendar.amqp.model.CalendarEventCancelNotificationEmail.DISPLAY_FORWARD_WARNING;
 import static com.linagora.calendar.smtp.template.MimeAttachment.ATTACHMENT_DISPOSITION_TYPE;
 
+import java.nio.charset.StandardCharsets;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 
 import jakarta.inject.Inject;
 import jakarta.inject.Named;
 
+import org.apache.commons.lang3.BooleanUtils;
+import org.apache.commons.lang3.StringUtils;
 import org.apache.james.core.Domain;
 import org.apache.james.core.MailAddress;
 import org.apache.james.core.MaybeSender;
@@ -43,12 +51,14 @@ import com.github.fge.lambdas.Throwing;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
 import com.linagora.calendar.amqp.model.CalendarEventBookingConfirmedNotificationEmail;
+import com.linagora.calendar.amqp.model.CalendarEventBookingDeclinedNotificationEmail;
 import com.linagora.calendar.amqp.model.CalendarEventCancelNotificationEmail;
 import com.linagora.calendar.amqp.model.CalendarEventCounterNotificationEmail;
 import com.linagora.calendar.amqp.model.CalendarEventInviteNotificationEmail;
 import com.linagora.calendar.amqp.model.CalendarEventNotificationEmail;
 import com.linagora.calendar.amqp.model.CalendarEventReplyNotificationEmail;
 import com.linagora.calendar.amqp.model.CalendarEventUpdateNotificationEmail;
+import com.linagora.calendar.api.CalendarUtil;
 import com.linagora.calendar.api.EventParticipationActionLinkFactory;
 import com.linagora.calendar.api.EventParticipationActionLinkFactory.ActionLinks;
 import com.linagora.calendar.smtp.Mail;
@@ -58,15 +68,18 @@ import com.linagora.calendar.smtp.template.MessageGenerator;
 import com.linagora.calendar.smtp.template.MimeAttachment;
 import com.linagora.calendar.smtp.template.TemplateType;
 import com.linagora.calendar.smtp.template.content.model.EventInCalendarLinkFactory;
+import com.linagora.calendar.smtp.template.content.model.PersonModel;
 import com.linagora.calendar.smtp.template.content.model.ReplyContentModelBuilder;
 import com.linagora.calendar.storage.OpenPaaSDomainDAO;
 import com.linagora.calendar.storage.OpenPaaSId;
 import com.linagora.calendar.storage.ResourceDAO;
 import com.linagora.calendar.storage.configuration.resolver.SettingsBasedResolver;
 import com.linagora.calendar.storage.configuration.resolver.SettingsBasedResolver.ResolvedSettings;
+import com.linagora.calendar.storage.event.EventFields;
 import com.linagora.calendar.storage.event.EventParseUtils;
 import com.linagora.calendar.storage.model.ResourceId;
 
+import net.fortuna.ical4j.model.Calendar;
 import net.fortuna.ical4j.model.property.Method;
 import net.fortuna.ical4j.model.property.Uid;
 import net.fortuna.ical4j.model.property.immutable.ImmutableMethod;
@@ -81,7 +94,8 @@ public class EventMailHandler {
         REPLY("event-reply"),
         CANCEL("event-cancel"),
         COUNTER("event-counter"),
-        BOOKING_CONFIRMED("event-booking-confirmed");
+        BOOKING_CONFIRMED("event-booking-confirmed"),
+        BOOKING_DECLINED("event-booking-declined");
 
         private final TemplateType templateType;
 
@@ -125,7 +139,8 @@ public class EventMailHandler {
     interface EventMessageGenerator {
         Mono<Message> generate(ResolvedSettings resolvedSettings);
 
-        static List<MimeAttachment> createAttachments(byte[] calendarAsBytes, Method method) {
+        static List<MimeAttachment> createAttachments(Calendar calendar, Method method) {
+            byte[] calendarAsBytes = CalendarUtil.withMethod(calendar, method).toString().getBytes(StandardCharsets.UTF_8);
             return List.of(
                 MimeAttachment.builder()
                     .contentType(ContentType.of("text/calendar; charset=UTF-8; method=" + method.getValue()))
@@ -140,15 +155,18 @@ public class EventMailHandler {
             );
         }
 
-        static Mono<ActionLinks> generateActionLinks(EventParticipationActionLinkFactory participationActionLinkFactory, CalendarEventNotificationEmail event) {
+        static Mono<Optional<ActionLinks>> generateActionLinks(EventParticipationActionLinkFactory participationActionLinkFactory, CalendarEventNotificationEmail event) {
             return Mono.just(event.getFirstVEvent())
-                .flatMap(vEvent -> {
-                    MailAddress organizerMail = EventParseUtils.getOrganizer(vEvent).email();
-                    MailAddress attendeeMail = event.recipientEmail();
-                    String eventUid = vEvent.getUid().map(Uid::getValue).orElseThrow();
-                    OpenPaaSId attendeeCalendarBaseId = extractCalendarURL(event.eventPath()).base();
-                    return participationActionLinkFactory.generateLinks(organizerMail, attendeeMail, eventUid, attendeeCalendarBaseId.value());
-                });
+                .flatMap(vEvent -> EventParseUtils.getOrganizer(vEvent)
+                    .map(EventFields.Person::email)
+                    .map(organizerMail -> {
+                        MailAddress attendeeMail = event.recipientEmail();
+                        String eventUid = vEvent.getUid().map(Uid::getValue).orElseThrow();
+                        OpenPaaSId attendeeCalendarBaseId = extractCalendarURL(event.eventPath()).base();
+                        return participationActionLinkFactory.generateLinks(organizerMail, attendeeMail, eventUid, attendeeCalendarBaseId.value())
+                            .map(Optional::of);
+                    })
+                    .orElseGet(() -> Mono.just(Optional.empty())));
         }
     }
 
@@ -172,8 +190,7 @@ public class EventMailHandler {
         }
 
         private Mono<Message> generateInvitationMessage(ResolvedSettings resolvedSettings, MessageGenerator messageGenerator) {
-            byte[] calendarAsBytes = event.base().eventAsBytes();
-            List<MimeAttachment> attachments = EventMessageGenerator.createAttachments(calendarAsBytes, ImmutableMethod.REQUEST);
+            List<MimeAttachment> attachments = EventMessageGenerator.createAttachments(event.base().event(), ImmutableMethod.REQUEST);
             MailAddress fromAddress = event.base().senderEmail();
 
             return EventMessageGenerator.generateActionLinks(participationActionLinkFactory, event.base())
@@ -202,8 +219,7 @@ public class EventMailHandler {
         }
 
         private Mono<Message> generateUpdateMessage(ResolvedSettings resolvedSettings, MessageGenerator messageGenerator) {
-            byte[] calendarAsBytes = event.base().eventAsBytes();
-            List<MimeAttachment> attachments = EventMessageGenerator.createAttachments(calendarAsBytes, ImmutableMethod.REQUEST);
+            List<MimeAttachment> attachments = EventMessageGenerator.createAttachments(event.base().event(), ImmutableMethod.REQUEST);
 
             MailAddress fromAddress = event.base().senderEmail();
 
@@ -233,16 +249,55 @@ public class EventMailHandler {
         }
 
         private Mono<Message> generateCancelMessage(ResolvedSettings resolvedSettings, MessageGenerator messageGenerator) {
-            byte[] calendarAsBytes = event.base().eventAsBytes();
-            List<MimeAttachment> attachments = EventMessageGenerator.createAttachments(calendarAsBytes, ImmutableMethod.CANCEL);
+            List<MimeAttachment> attachments = cancelAttachments();
 
             MailAddress fromAddress = event.base().senderEmail();
-            return messageGenerator.generate(recipientUser, fromAddress,
-                    event.toPugModel(resolvedSettings.locale(), resolvedSettings.zoneId(), eventInCalendarLinkFactory, isInternalUser), attachments)
+            return messageGenerator.generate(recipientUser, fromAddress, toPugModel(resolvedSettings), attachments)
                 .map(message -> {
                     message.getHeader().addField(new RawField("Auto-Submitted", "auto-generated"));
                     return message;
                 });
+        }
+
+        private Map<String, Object> toPugModel(ResolvedSettings resolvedSettings) {
+            if (publiclyCreated()) {
+                return event.toPugModel(resolvedSettings.locale(), resolvedSettings.zoneId(), eventInCalendarLinkFactory, isInternalUser,
+                    booker(), canceler(), !DISPLAY_FORWARD_WARNING);
+            }
+            return event.toPugModel(resolvedSettings.locale(), resolvedSettings.zoneId(), eventInCalendarLinkFactory, isInternalUser);
+        }
+
+        private PersonModel booker() {
+            String bookerEmail = EventParseUtils.getPropertyValueIgnoreCase(event.base().getFirstVEvent(), X_PUBLICLY_CREATOR_HEADER)
+                .orElseThrow(() -> new EventMailHandlerException("Missing " + X_PUBLICLY_CREATOR_HEADER + " for publicly created cancel event"));
+            return personOfEmail(bookerEmail);
+        }
+
+        private PersonModel canceler() {
+            return EventParseUtils.getPropertyValueIgnoreCase(event.base().getFirstVEvent(), X_PUBLICLY_CANCELLED_BY_HEADER)
+                .map(this::personOfEmail)
+                .orElseGet(() -> PersonModel.from(EventParseUtils.getOrganizer(event.base().getFirstVEvent())));
+        }
+
+        private PersonModel personOfEmail(String email) {
+            return EventParseUtils.getAttendees(event.base().getFirstVEvent()).stream()
+                .filter(person -> person.email().asString().equalsIgnoreCase(email))
+                .findFirst()
+                .map(PersonModel::from)
+                .orElseGet(() -> new PersonModel(StringUtils.EMPTY, email));
+        }
+
+        private List<MimeAttachment> cancelAttachments() {
+            if (publiclyCreated()) {
+                return List.of();
+            }
+            return EventMessageGenerator.createAttachments(event.base().event(), ImmutableMethod.CANCEL);
+        }
+
+        private boolean publiclyCreated() {
+            return EventParseUtils.getPropertyValueIgnoreCase(event.base().getFirstVEvent(), X_PUBLICLY_CREATED_HEADER)
+                .map(BooleanUtils::toBoolean)
+                .orElse(false);
         }
     }
 
@@ -272,7 +327,7 @@ public class EventMailHandler {
                 .translator(messageGenerator.getI18nTranslator())
                 .eventInCalendarLink(eventInCalendarLinkFactory);
 
-            List<MimeAttachment> attachments = EventMessageGenerator.createAttachments(event.base().eventAsBytes(), ImmutableMethod.REPLY);
+            List<MimeAttachment> attachments = EventMessageGenerator.createAttachments(event.base().event(), ImmutableMethod.REPLY);
 
             MailAddress fromAddress = event.base().senderEmail();
 
@@ -314,8 +369,7 @@ public class EventMailHandler {
                 .eventInCalendarLink(eventInCalendarLinkFactory)
                 .buildAsMap();
 
-            byte[] calendarAsBytes = event.base().eventAsBytes();
-            List<MimeAttachment> attachments = EventMessageGenerator.createAttachments(calendarAsBytes, ImmutableMethod.COUNTER);
+            List<MimeAttachment> attachments = EventMessageGenerator.createAttachments(event.base().event(), ImmutableMethod.COUNTER);
 
             MailAddress fromAddress = event.base().senderEmail();
             return messageGenerator.generate(recipientUser, fromAddress, model, attachments);
@@ -341,8 +395,7 @@ public class EventMailHandler {
         }
 
         private Mono<Message> generateBookingConfirmedMessage(ResolvedSettings resolvedSettings, MessageGenerator messageGenerator) {
-            byte[] calendarAsBytes = event.base().eventAsBytes();
-            List<MimeAttachment> attachments = EventMessageGenerator.createAttachments(calendarAsBytes, ImmutableMethod.REQUEST);
+            List<MimeAttachment> attachments = EventMessageGenerator.createAttachments(event.base().event(), ImmutableMethod.REQUEST);
             MailAddress fromAddress = event.base().senderEmail();
 
             return Mono.fromCallable(() -> toBookingConfirmedPugModel(resolvedSettings, messageGenerator))
@@ -350,6 +403,37 @@ public class EventMailHandler {
         }
 
         private Map<String, Object> toBookingConfirmedPugModel(ResolvedSettings resolvedSettings, MessageGenerator messageGenerator) throws Exception {
+            return event.toPugModel(resolvedSettings.locale(), resolvedSettings.zoneId(),
+                messageGenerator.getI18nTranslator(), recipientUser.asMailAddress());
+        }
+    }
+
+    class BookingDeclinedEventMessageGenerator implements EventMessageGenerator {
+        private final CalendarEventBookingDeclinedNotificationEmail event;
+        private final Username recipientUser;
+
+        public BookingDeclinedEventMessageGenerator(CalendarEventBookingDeclinedNotificationEmail event,
+                                                    Username recipientUser) {
+            this.event = event;
+            this.recipientUser = recipientUser;
+        }
+
+        @Override
+        public Mono<Message> generate(ResolvedSettings resolvedSettings) {
+            return Mono.fromCallable(() -> messageGeneratorFactory.forLocalizedFeature(new Language(resolvedSettings.locale()), EventType.BOOKING_DECLINED.asTemplateType()))
+                .subscribeOn(Schedulers.boundedElastic())
+                .flatMap(messageGenerator -> generateBookingDeclinedMessage(resolvedSettings, messageGenerator))
+                .onErrorResume(error -> Mono.error(new EventMailHandlerException("Error occurred when generate booking declined event message", error)));
+        }
+
+        private Mono<Message> generateBookingDeclinedMessage(ResolvedSettings resolvedSettings, MessageGenerator messageGenerator) {
+            MailAddress fromAddress = event.base().senderEmail();
+
+            return Mono.fromCallable(() -> toBookingDeclinedPugModel(resolvedSettings, messageGenerator))
+                .flatMap(scopedVariable -> messageGenerator.generate(recipientUser, fromAddress, scopedVariable, List.of()));
+        }
+
+        private Map<String, Object> toBookingDeclinedPugModel(ResolvedSettings resolvedSettings, MessageGenerator messageGenerator) throws Exception {
             return event.toPugModel(resolvedSettings.locale(), resolvedSettings.zoneId(),
                 messageGenerator.getI18nTranslator(), recipientUser.asMailAddress());
         }
@@ -411,12 +495,17 @@ public class EventMailHandler {
         return handleEvent(new PublicAgendaEventMessageGenerator(event, recipientUser), recipientUser, event.base().senderEmail(), event.base().eventPath(), event.base().getFirstVEvent().getUid().map(Uid::getValue).orElse(""));
     }
 
+    public Mono<Void> handleBookingDeclinedEvent(CalendarEventBookingDeclinedNotificationEmail event) {
+        MailAddress recipientEmail = event.base().recipientEmail();
+        Username recipientUser = Username.fromMailAddress(recipientEmail);
+        return handleEvent(new BookingDeclinedEventMessageGenerator(event, recipientUser), recipientUser, event.base().senderEmail(), event.base().eventPath(), event.base().getFirstVEvent().getUid().map(Uid::getValue).orElse(""));
+    }
+
     private Mono<Void> handleEvent(EventMessageGenerator eventMessageGenerator, Username recipientUser, MailAddress senderEmail, String eventPath, String eventUid) {
         return settingsResolver.resolveOrDefault(recipientUser, Username.fromMailAddress(senderEmail))
             .flatMap(eventMessageGenerator::generate)
-            .flatMap(mailMessage -> mailSenderFactory.create()
-                .flatMap(mailSender -> mailSender.send(new Mail(MaybeSender.of(senderEmail),
-                    ImmutableList.of(Throwing.supplier(recipientUser::asMailAddress).get()), mailMessage)))
+            .flatMap(mailMessage -> mailSenderFactory.send(new Mail(MaybeSender.of(senderEmail),
+                ImmutableList.of(Throwing.supplier(recipientUser::asMailAddress).get()), mailMessage))
                 .doOnSuccess(any -> AuditTrail.entry()
                     .action("IMIP")
                     .action(eventMessageGenerator.getClass().getName())

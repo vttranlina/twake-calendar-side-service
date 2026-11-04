@@ -47,7 +47,6 @@ import org.apache.james.task.TaskExecutionDetails;
 import org.apache.james.task.TaskManager;
 import org.apache.james.utils.UpdatableTickingClock;
 import org.apache.james.webadmin.WebAdminServer;
-import org.apache.james.webadmin.WebAdminUtils;
 import org.apache.james.webadmin.routes.TasksRoutes;
 import org.apache.james.webadmin.utils.JsonTransformer;
 import org.junit.jupiter.api.AfterEach;
@@ -57,7 +56,6 @@ import org.junit.jupiter.api.extension.RegisterExtension;
 
 import com.google.common.collect.ImmutableSet;
 import com.linagora.calendar.dav.CalDavClient;
-import com.linagora.calendar.dav.DockerSabreDavSetup;
 import com.linagora.calendar.dav.SabreDavExtension;
 import com.linagora.calendar.storage.AlarmEvent;
 import com.linagora.calendar.storage.AlarmEventDAO;
@@ -80,7 +78,7 @@ import reactor.core.publisher.Mono;
 public class AlarmScheduleTest {
 
     @RegisterExtension
-    static SabreDavExtension sabreDavExtension = new SabreDavExtension(DockerSabreDavSetup.SINGLETON);
+    static SabreDavExtension sabreDavExtension = SabreDavExtension.shared();
 
     private WebAdminServer webAdminServer;
     private OpenPaaSUserDAO userDAO;
@@ -132,6 +130,7 @@ public class AlarmScheduleTest {
     void shouldShowAllInformationInResponse() {
         String taskId = given()
             .queryParam("task", "scheduleAlarms")
+            .queryParam("eventsPerSecond", 12)
             .when()
             .post()
             .jsonPath()
@@ -147,6 +146,7 @@ public class AlarmScheduleTest {
             .body("type", is("schedule-alarms"))
             .body("additionalInformation.processedEventCount", is(0))
             .body("additionalInformation.failedEventCount", is(0))
+            .body("additionalInformation.runningOptions.eventsPerSecond", is(12))
             .body("additionalInformation.timestamp", is(notNullValue()))
             .body("additionalInformation.type", is("schedule-alarms"))
             .body("startedDate", is(notNullValue()))

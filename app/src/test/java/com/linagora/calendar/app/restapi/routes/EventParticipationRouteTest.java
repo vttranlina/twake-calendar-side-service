@@ -19,6 +19,7 @@
 package com.linagora.calendar.app.restapi.routes;
 
 import static com.linagora.calendar.app.restapi.routes.ImportRouteTest.mailSenderConfigurationFunction;
+import static com.linagora.calendar.storage.TestFixture.awaitAtMost;
 import static com.linagora.calendar.storage.TestFixture.TECHNICAL_TOKEN_SERVICE_TESTING;
 import static io.restassured.RestAssured.given;
 import static io.restassured.config.EncoderConfig.encoderConfig;
@@ -43,6 +44,7 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.atomic.AtomicReference;
@@ -57,7 +59,9 @@ import org.apache.commons.lang3.StringUtils;
 import org.apache.http.HttpStatus;
 import org.apache.http.NameValuePair;
 import org.apache.http.client.utils.URLEncodedUtils;
+import org.apache.james.core.Domain;
 import org.apache.james.utils.GuiceProbe;
+import org.apache.james.utils.WebAdminGuiceProbe;
 import org.awaitility.Awaitility;
 import org.awaitility.core.ConditionFactory;
 import org.junit.jupiter.api.AfterAll;
@@ -70,6 +74,7 @@ import org.junit.jupiter.params.provider.Arguments;
 import org.junit.jupiter.params.provider.MethodSource;
 
 import com.github.fge.lambdas.Throwing;
+import com.fasterxml.jackson.databind.JsonNode;
 import com.google.inject.multibindings.Multibinder;
 import com.linagora.calendar.api.CalendarUtil;
 import com.linagora.calendar.api.Participation;
@@ -81,16 +86,18 @@ import com.linagora.calendar.app.TwakeCalendarExtension;
 import com.linagora.calendar.app.TwakeCalendarGuiceServer;
 import com.linagora.calendar.app.modules.CalendarDataProbe;
 import com.linagora.calendar.dav.CalDavClient;
+import com.linagora.calendar.dav.DavCalendarObject;
 import com.linagora.calendar.dav.DavModuleTestHelper;
 import com.linagora.calendar.dav.DavTestHelper;
-import com.linagora.calendar.dav.DockerSabreDavSetup;
-import com.linagora.calendar.dav.Fixture;
 import com.linagora.calendar.dav.SabreDavExtension;
+import com.linagora.calendar.dav.SabreDavProvisioningService;
 import com.linagora.calendar.dav.dto.CalendarReportJsonResponse;
 import com.linagora.calendar.restapi.RestApiServerProbe;
 import com.linagora.calendar.smtp.MailSenderConfiguration;
 import com.linagora.calendar.smtp.MockSmtpServerExtension;
+import com.linagora.calendar.storage.CalendarURL;
 import com.linagora.calendar.storage.OpenPaaSUser;
+import com.linagora.calendar.storage.model.TeamCalendarId;
 
 import io.restassured.RestAssured;
 import io.restassured.authentication.PreemptiveBasicAuthScheme;
@@ -98,6 +105,10 @@ import io.restassured.builder.RequestSpecBuilder;
 import io.restassured.http.ContentType;
 import io.restassured.path.json.JsonPath;
 import io.restassured.specification.RequestSpecification;
+import net.fortuna.ical4j.model.Calendar;
+import net.fortuna.ical4j.model.Component;
+import net.fortuna.ical4j.model.Property;
+import net.fortuna.ical4j.model.component.VEvent;
 import net.fortuna.ical4j.model.parameter.PartStat;
 import net.javacrumbs.jsonunit.core.Option;
 
@@ -123,7 +134,7 @@ class EventParticipationRouteTest {
 
     @RegisterExtension
     @Order(1)
-    static SabreDavExtension sabreDavExtension = new SabreDavExtension(DockerSabreDavSetup.SINGLETON);
+    static SabreDavExtension sabreDavExtension = SabreDavExtension.shared();
 
     @RegisterExtension
     @Order(2)
@@ -162,12 +173,15 @@ class EventParticipationRouteTest {
         RestAssured.reset();
     }
 
+    private static final Domain DOMAIN = Domain.of(SabreDavProvisioningService.DOMAIN);
+
     private OpenPaaSUser attendee;
     private OpenPaaSUser organizer;
 
     private int restApiPort;
 
     private DavTestHelper davTestHelper;
+    private CalDavClient calDavClient;
 
     private RequestSpecification attendeeRequestSpecification;
 
@@ -180,6 +194,7 @@ class EventParticipationRouteTest {
         davTestHelper = new DavTestHelper(sabreDavExtension.dockerSabreDavSetup().davConfiguration(), TECHNICAL_TOKEN_SERVICE_TESTING);
         server.getProbe(CalendarDataProbe.class).addUserToRepository(attendee.username(), password);
         server.getProbe(CalendarDataProbe.class).addUserToRepository(organizer.username(), password);
+        calDavClient = new CalDavClient(sabreDavExtension.dockerSabreDavSetup().davConfiguration(), TECHNICAL_TOKEN_SERVICE_TESTING);
 
         restApiPort = server.getProbe(RestApiServerProbe.class).getPort().getValue();
 
@@ -260,7 +275,7 @@ class EventParticipationRouteTest {
                                     ["dtstart", {"tzid": "Asia/Ho_Chi_Minh"}, "date-time", "${json-unit.ignore}"],
                                     ["dtend", {"tzid": "Asia/Ho_Chi_Minh"}, "date-time", "${json-unit.ignore}"],
                                     ["summary", {}, "text", "Twake Calendar - Sprint planning #04"],
-                                    ["organizer", {"cn": "Van Tung TRAN", "schedule-status": "1.1"}, "cal-address", "${json-unit.ignore}"],
+                                    ["organizer", {"cn": "Van Tung TRAN", "schedule-status": "${json-unit.ignore}"}, "cal-address", "${json-unit.ignore}"],
                                     ["attendee", {"cn": "Benoît TELLIER", "partstat": "ACCEPTED"}, "cal-address", "${json-unit.ignore}"]
                                 ],
                                 []
@@ -283,21 +298,19 @@ class EventParticipationRouteTest {
             .get("/smtpMails")
             .jsonPath();
 
-        CALMLY_AWAIT
-            .atMost(Duration.ofSeconds(10))
-            .untilAsserted(() -> assertThat(smtpMailsResponseSupplier.get().getList("")).hasSize(1));
-
-        JsonPath smtpMailsResponse = smtpMailsResponseSupplier.get();
-
         AtomicReference<String> actionLink = new AtomicReference<>();
 
-        assertSoftly(Throwing.consumer(softly -> {
-            softly.assertThat(smtpMailsResponse.getString("[0].recipients[0].address")).isEqualTo(externalUser);
-            String message = smtpMailsResponse.getString("[0].message");
-            List<String> actionLinks = extractActionLinks(getHtml(message));
-            softly.assertThat(actionLinks).hasSize(3);
-            actionLink.set(actionLinks.getFirst());
-        }));
+        CALMLY_AWAIT
+            .atMost(Duration.ofSeconds(10))
+            .untilAsserted(() -> {
+                JsonPath smtpMailsResponse = smtpMailsResponseSupplier.get();
+                assertThat(smtpMailsResponse.getList("")).hasSize(1);
+                assertThat(smtpMailsResponse.getString("[0].recipients[0].address")).isEqualTo(externalUser);
+                String message = smtpMailsResponse.getString("[0].message");
+                List<String> actionLinks = extractActionLinks(getHtml(message));
+                assertThat(actionLinks).hasSize(3);
+                actionLink.set(actionLinks.getFirst());
+            });
 
         String participationLink = actionLink.get()
             .replace("https://excal.linagora.com/excal/?jwt=",
@@ -326,12 +339,204 @@ class EventParticipationRouteTest {
                 """.formatted(externalUser));
     }
 
+    @Test
+    void teamCalendarEventParticipationShouldSucceedForExternalAttendee(TwakeCalendarGuiceServer server) {
+        // Given an external attendee receives an action link for an event created in a Team Calendar
+        TeamCalendarId teamCalendarId = createTeamCalendar(server, "engineering", "Engineering Team");
+        grantTeamMember(server, teamCalendarId, organizer, "dav:read-write");
+        CalendarURL delegatedCalendar = awaitAtMost.until(() ->
+                calDavClient.findUserCalendarList(organizer)
+                    .map(list -> list.calendars().entrySet().stream()
+                        .filter(entry -> isTeamCalendar(entry, teamCalendarId))
+                        .map(Map.Entry::getKey)
+                        .findFirst())
+                    .block(),
+            Optional::isPresent).get();
+
+        String eventUid = UUID.randomUUID().toString();
+        URI delegatedEventHref = URI.create(delegatedCalendar.asUri().toASCIIString() + "/" + eventUid + ".ics");
+        String externalAttendee = "externaluser@gmail.com";
+        davTestHelper.upsertCalendar(organizer.username(), delegatedEventHref,
+            generateCalendarData(eventUid, organizer.username().asString(), externalAttendee)).block();
+
+        AtomicReference<String> actionLink = new AtomicReference<>();
+        CALMLY_AWAIT
+            .atMost(Duration.ofSeconds(10))
+            .untilAsserted(() -> {
+                JsonPath smtpMailsResponse = given(mockSMTPRequestSpecification())
+                    .get("/smtpMails")
+                    .jsonPath();
+                assertThat(smtpMailsResponse.getList("")).hasSize(1);
+                assertThat(smtpMailsResponse.getString("[0].recipients[0].address")).isEqualTo(externalAttendee);
+                List<String> actionLinks = extractActionLinks(getHtml(smtpMailsResponse.getString("[0].message")));
+                assertThat(actionLinks).hasSize(3);
+                actionLink.set(actionLinks.getFirst());
+            });
+
+        String participationLink = actionLink.get()
+            .replace("https://excal.linagora.com/excal/?jwt=",
+                "http://localhost:" + restApiPort + "/calendar/api/calendars/event/participation?jwt=");
+
+        // When the attendee follows the action link
+        String actualResponse = given()
+            .when()
+            .get(participationLink)
+            .then()
+            .statusCode(200)
+            .contentType(JSON)
+            .extract()
+            .body().asString();
+
+        // Then the participation endpoint returns the event and updates the Team Calendar event status
+        assertThatJson(actualResponse)
+            .isEqualTo("""
+                {
+                  "eventJSON": "${json-unit.ignore}",
+                  "attendeeEmail": "%s",
+                  "locale": "en",
+                  "links": {
+                    "yes": "${json-unit.ignore}",
+                    "no": "${json-unit.ignore}",
+                    "maybe": "${json-unit.ignore}"
+                  }
+                }
+                """.formatted(externalAttendee));
+
+        DavCalendarObject updated = calDavClient.fetchCalendarEvent(organizer.username(), delegatedEventHref).block();
+        assertThat(updated.calendarData().toString()).contains("PARTSTAT=ACCEPTED");
+    }
+
+    @Test
+    void teamCalendarEventParticipationShouldSucceedForInternalAttendee(TwakeCalendarGuiceServer server) throws Exception {
+        // Given an internal attendee receives an action link for an event created in a Team Calendar
+        TeamCalendarId teamCalendarId = createTeamCalendar(server, "engineering-internal", "Engineering Team");
+        grantTeamMember(server, teamCalendarId, organizer, "dav:read-write");
+        CalendarURL delegatedCalendar = awaitAtMost.until(() ->
+                calDavClient.findUserCalendarList(organizer)
+                    .map(list -> list.calendars().entrySet().stream()
+                        .filter(entry -> isTeamCalendar(entry, teamCalendarId))
+                        .map(Map.Entry::getKey)
+                        .findFirst())
+                    .block(),
+            Optional::isPresent).get();
+
+        String eventUid = UUID.randomUUID().toString();
+        URI delegatedEventHref = URI.create(delegatedCalendar.asUri().toASCIIString() + "/" + eventUid + ".ics");
+        davTestHelper.upsertCalendar(organizer.username(), delegatedEventHref,
+            generateCalendarData(eventUid, organizer.username().asString(), attendee.username().asString())).block();
+
+        AtomicReference<String> actionLink = new AtomicReference<>();
+        CALMLY_AWAIT
+            .atMost(Duration.ofSeconds(10))
+            .untilAsserted(() -> {
+                JsonPath smtpMailsResponse = given(mockSMTPRequestSpecification())
+                    .get("/smtpMails")
+                    .jsonPath();
+                assertThat(smtpMailsResponse.getList("")).hasSize(1);
+                assertThat(smtpMailsResponse.getString("[0].recipients[0].address")).isEqualTo(attendee.username().asString());
+                List<String> actionLinks = extractActionLinks(getHtml(smtpMailsResponse.getString("[0].message")));
+                assertThat(actionLinks).hasSize(3);
+                actionLink.set(actionLinks.getFirst());
+            });
+
+        String participationLink = actionLink.get()
+            .replace("https://excal.linagora.com/excal/?jwt=",
+                "http://localhost:" + restApiPort + "/calendar/api/calendars/event/participation?jwt=");
+
+        // When the attendee follows the action link
+        String actualResponse = given()
+            .when()
+            .get(participationLink)
+            .then()
+            .statusCode(200)
+            .contentType(JSON)
+            .extract()
+            .body().asString();
+
+        // Then the participation endpoint returns the event and updates the internal attendee's calendar copy
+        assertThatJson(actualResponse)
+            .isEqualTo("""
+                {
+                  "eventJSON": "${json-unit.ignore}",
+                  "attendeeEmail": "%s",
+                  "locale": "en",
+                  "links": {
+                    "yes": "${json-unit.ignore}",
+                    "no": "${json-unit.ignore}",
+                    "maybe": "${json-unit.ignore}"
+                  }
+                }
+                """.formatted(attendee.username().asString()));
+
+        assertThat(getCalendarEventReportResponse(eventUid)).contains("\"partstat\" : \"ACCEPTED\"");
+    }
+
+    private boolean isTeamCalendar(Map.Entry<CalendarURL, JsonNode> entry, TeamCalendarId teamCalendarId) {
+        String teamCalendarPrincipal = "principals/team-calendars/" + teamCalendarId.value();
+        return entry.getValue().findValuesAsText("principal").contains(teamCalendarPrincipal);
+    }
+
+    private TeamCalendarId createTeamCalendar(TwakeCalendarGuiceServer server, String name, String displayName) {
+        String payload = """
+            {
+              "name": "{name}",
+              "displayName": "{displayName}"
+            }
+            """.replace("{name}", name)
+            .replace("{displayName}", displayName);
+
+        return new TeamCalendarId(given(webAdminSpecification(server))
+            .body(payload)
+        .when()
+            .post("/domains/{domain}/team-calendars", DOMAIN.asString())
+        .then()
+            .statusCode(201)
+            .extract()
+            .path("id"));
+    }
+
+    private void grantTeamMember(TwakeCalendarGuiceServer server, TeamCalendarId teamCalendarId,
+                                 OpenPaaSUser member, String davRight) {
+        String payload = """
+            {
+              "share": {
+                "set": [
+                  {
+                    "dav:href": "mailto:{member}",
+                    "{davRight}": true
+                  }
+                ],
+                "remove": []
+              }
+            }
+            """.replace("{member}", member.username().asString())
+            .replace("{davRight}", davRight);
+
+        given(webAdminSpecification(server))
+            .body(payload)
+        .when()
+            .post("/domains/{domain}/team-calendars/{teamCalendarId}/members/invitee",
+                DOMAIN.asString(), teamCalendarId.value())
+        .then()
+            .statusCode(204);
+    }
+
+    private RequestSpecification webAdminSpecification(TwakeCalendarGuiceServer server) {
+        return new RequestSpecBuilder()
+            .setContentType(JSON)
+            .setAccept(JSON)
+            .setPort(server.getProbe(WebAdminGuiceProbe.class).getWebAdminPort().getValue())
+            .build();
+    }
+
     private String getHtml(String message) {
         Pattern htmlPattern = Pattern.compile(
             "Content-Transfer-Encoding: base64\r?\nContent-Type: text/html; charset=UTF-8\r?\nContent-Language: [^\r\n]+\r?\n\r?\n([A-Za-z0-9+/=\r\n]+)\r?\n---=Part",
             Pattern.DOTALL);
         Matcher matcher = htmlPattern.matcher(message);
-        matcher.find();
+        if (!matcher.find()) {
+            return "";
+        }
         String base64Html = matcher.group(1).replaceAll("\\s+", "");
         return new String(Base64.getDecoder().decode(base64Html), StandardCharsets.UTF_8);
     }
@@ -470,10 +675,10 @@ class EventParticipationRouteTest {
                 .jsonPath()
                 .getMap("links");
 
-            Thread.sleep(1000);
             jwtYesSet.add(extractJwtFromUrl(links.get("yes")));
             jwtNoSet.add(extractJwtFromUrl(links.get("no")));
             jwtMaybeSet.add(extractJwtFromUrl(links.get("maybe")));
+            Thread.sleep(1000);
         }
 
         assertSoftly(softly -> {
@@ -536,6 +741,7 @@ class EventParticipationRouteTest {
                 {
                     "error": {
                         "code": 401,
+                        "type": "Unauthorized",
                         "message": "Unauthorized",
                         "details": "JWT is missing or invalid"
                     }
@@ -565,6 +771,52 @@ class EventParticipationRouteTest {
             {
                 "error": {
                     "code": 404,
+                    "type": "NotFound",
+                    "message": "Not found",
+                    "details": "${json-unit.ignore}"
+                }
+            }
+            """);
+    }
+
+    @Test
+    void shouldReturn404WhenOrganizerDeletedMeeting(TwakeCalendarGuiceServer server) {
+        String eventUid = UUID.randomUUID().toString();
+
+        davTestHelper.upsertCalendar(organizer,
+            generateCalendarData(eventUid, organizer.username().asString(), attendee.username().asString()),
+            eventUid);
+
+        String attendeeEventId = awaitAtMost.until(() -> davTestHelper.findFirstEventId(attendee), Optional::isPresent).get();
+
+        davTestHelper.deleteCalendar(organizer, eventUid);
+
+        awaitAtMost.until(() ->
+            calDavClient.fetchCalendarEvent(attendee.username(),
+                URI.create(String.format("/calendars/%s/%s/%s.ics", attendee.id().value(), attendee.id().value(), attendeeEventId)))
+                .block()
+                .calendarData(),
+            this::isEventCancelled);
+
+        Participation participation = getParticipation(eventUid, ParticipantAction.ACCEPTED);
+        URL participationTokenUrl = getParticipationTokenUrl(participation, server);
+
+        String response = RestAssured
+            .given()
+            .when()
+            .get(participationTokenUrl)
+            .then()
+            .statusCode(404)
+            .contentType(ContentType.JSON)
+            .extract()
+            .body()
+            .asString();
+
+        assertThatJson(response).isEqualTo("""
+            {
+                "error": {
+                    "code": 404,
+                    "type": "NotFound",
                     "message": "Not found",
                     "details": "${json-unit.ignore}"
                 }
@@ -687,11 +939,11 @@ class EventParticipationRouteTest {
 
     private void upsertCalendarForTest(String eventUid) {
         davTestHelper.upsertCalendar(
-            organizer,
+            attendee,
             generateCalendarData(eventUid, organizer.username().asString(), attendee.username().asString()),
             eventUid);
 
-        Fixture.awaitAtMost.untilAsserted(() ->
+        awaitAtMost.untilAsserted(() ->
             assertThat(davTestHelper.findFirstEventId(attendee))
                 .withFailMessage("Event not created for user: " + attendee.username())
                 .isPresent());
@@ -704,6 +956,17 @@ class EventParticipationRouteTest {
             eventUid,
             attendee.id().value(),
             action)).get();
+    }
+
+    private boolean isEventCancelled(Calendar calendar) {
+        return calendar.getComponents(Component.VEVENT).stream()
+            .map(component -> (VEvent) component)
+            .findFirst()
+            .map(vEvent -> vEvent.getProperty(Property.STATUS)
+                .map(Property::getValue)
+                .filter("CANCELLED"::equals)
+                .isPresent())
+            .orElse(false);
     }
 
     private String getCalendarEventReportResponse(String eventUid) throws Exception {

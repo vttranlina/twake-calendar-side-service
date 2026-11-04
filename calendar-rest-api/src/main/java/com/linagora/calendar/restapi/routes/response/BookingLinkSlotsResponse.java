@@ -19,42 +19,88 @@
 package com.linagora.calendar.restapi.routes.response;
 
 import java.time.Instant;
+import java.time.ZoneId;
+import java.time.ZonedDateTime;
 import java.util.List;
+import java.util.Optional;
 import java.util.Set;
 
 import com.fasterxml.jackson.annotation.JsonFormat;
+import com.fasterxml.jackson.annotation.JsonInclude;
 import com.fasterxml.jackson.annotation.JsonProperty;
 import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.SerializationFeature;
+import com.fasterxml.jackson.datatype.jdk8.Jdk8Module;
 import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
 import com.linagora.calendar.api.booking.AvailableSlotsCalculator.AvailabilitySlot;
+import com.linagora.calendar.restapi.routes.dto.BookingLinkAlarmDTO;
+import com.linagora.calendar.storage.OpenPaaSUser;
 import com.linagora.calendar.storage.booking.BookingLink;
+import com.linagora.calendar.storage.booking.BookingLinkExtraAttendeeUtil;
+import com.linagora.calendar.storage.booking.EventTransparency;
+import com.linagora.calendar.storage.booking.EventVisibility;
 
+@JsonInclude(JsonInclude.Include.NON_ABSENT)
 public record BookingLinkSlotsResponse(long durationMinutes,
+                                       boolean autoAccept,
+                                       Optional<JsonNode> extraAttendees,
+                                       Optional<String> name,
+                                       Optional<String> description,
+                                       String color,
+                                       Optional<String> location,
+                                       Optional<List<ResourceDTO>> resources,
+                                       Optional<String> visibility,
+                                       Optional<String> transparency,
+                                       Optional<List<BookingLinkAlarmDTO>> alarm,
+                                       OwnerDTO owner,
                                        RangeDTO range,
                                        List<SlotDTO> slots) {
     private static final ObjectMapper OBJECT_MAPPER = new ObjectMapper()
         .registerModule(new JavaTimeModule())
+        .registerModule(new Jdk8Module())
         .disable(SerializationFeature.WRITE_DATES_AS_TIMESTAMPS);
 
-    public static BookingLinkSlotsResponse of(BookingLink bookingLink, Instant from, Instant to, Set<AvailabilitySlot> slots) {
-        return new BookingLinkSlotsResponse(bookingLink.duration().toMinutes(), new RangeDTO(from, to),
+    public static BookingLinkSlotsResponse of(BookingLink bookingLink, OpenPaaSUser owner, Instant from, Instant to,
+                                              Set<AvailabilitySlot> slots, ZoneId zoneId, List<ResourceDTO> resourceList,
+                                              List<OpenPaaSUser> extraAttendees) {
+        return new BookingLinkSlotsResponse(bookingLink.duration().toMinutes(),
+            bookingLink.autoAccept(),
+            BookingLinkExtraAttendeeUtil.serializeWithUserDetails(bookingLink.extraAttendees(), extraAttendees),
+            bookingLink.name(),
+            bookingLink.description(),
+            bookingLink.colorOrDefault(),
+            bookingLink.location(),
+            Optional.of(resourceList).filter(list -> !list.isEmpty()),
+            bookingLink.visibility().map(EventVisibility::value),
+            bookingLink.transparency().map(EventTransparency::value),
+            BookingLinkAlarmDTO.from(bookingLink.alarm()),
+            new OwnerDTO(owner.fullName(), owner.username().asString()),
+            new RangeDTO(from.atZone(zoneId), to.atZone(zoneId)),
             slots.stream()
                 .map(AvailabilitySlot::start)
                 .sorted()
-                .map(SlotDTO::new)
+                .map(start -> new SlotDTO(start.atZone(zoneId)))
                 .toList());
     }
 
+    public record ResourceDTO(@JsonProperty("name") String name,
+                              @JsonProperty("photoUrl") Optional<String> photoUrl) {
+    }
+
+    public record OwnerDTO(@JsonProperty("displayName") String displayName,
+                           @JsonProperty("email") String email) {
+    }
+
     public record RangeDTO(@JsonProperty("from")
-                           @JsonFormat(shape = JsonFormat.Shape.STRING) Instant from,
+                           @JsonFormat(shape = JsonFormat.Shape.STRING) ZonedDateTime from,
                            @JsonProperty("to")
-                           @JsonFormat(shape = JsonFormat.Shape.STRING) Instant to) {
+                           @JsonFormat(shape = JsonFormat.Shape.STRING) ZonedDateTime to) {
     }
 
     public record SlotDTO(@JsonProperty("start")
-                          @JsonFormat(shape = JsonFormat.Shape.STRING) Instant start) {
+                          @JsonFormat(shape = JsonFormat.Shape.STRING) ZonedDateTime start) {
     }
 
     public byte[] jsonAsBytes() throws JsonProcessingException {

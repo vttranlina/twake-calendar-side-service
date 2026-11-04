@@ -58,6 +58,7 @@ import com.google.inject.Scopes;
 import com.google.inject.Singleton;
 import com.google.inject.multibindings.Multibinder;
 import com.google.inject.multibindings.ProvidesIntoSet;
+import com.linagora.calendar.api.BookedEventTokenSigner;
 import com.linagora.calendar.api.JwtSigner;
 import com.linagora.calendar.api.JwtVerifier;
 import com.linagora.calendar.api.ParticipationTokenSigner;
@@ -69,11 +70,14 @@ import com.linagora.calendar.restapi.auth.OidcAuthenticationStrategy;
 import com.linagora.calendar.restapi.auth.OidcEndpointsInfoResolver;
 import com.linagora.calendar.restapi.auth.OidcFallbackCookieAuthenticationStrategy;
 import com.linagora.calendar.restapi.routes.AvatarRoute;
+import com.linagora.calendar.restapi.routes.BookedEventCancelRoute;
+import com.linagora.calendar.restapi.routes.BookedEventGetRoute;
 import com.linagora.calendar.restapi.routes.BookingLinkCreateRoute;
 import com.linagora.calendar.restapi.routes.BookingLinkDeleteRoute;
 import com.linagora.calendar.restapi.routes.BookingLinkGetRoute;
 import com.linagora.calendar.restapi.routes.BookingLinkListRoute;
 import com.linagora.calendar.restapi.routes.BookingLinkPatchRoute;
+import com.linagora.calendar.restapi.routes.BookingLinkRequestAcknowledgementNotifier;
 import com.linagora.calendar.restapi.routes.BookingLinkReservationRoute;
 import com.linagora.calendar.restapi.routes.BookingLinkResetPublicIdRoute;
 import com.linagora.calendar.restapi.routes.BookingLinkSlotsRoute;
@@ -85,6 +89,7 @@ import com.linagora.calendar.restapi.routes.ConfigurationRoute;
 import com.linagora.calendar.restapi.routes.DomainRoute;
 import com.linagora.calendar.restapi.routes.DomainSettingsRoute;
 import com.linagora.calendar.restapi.routes.DownloadCalendarRoute;
+import com.linagora.calendar.restapi.routes.EntityRoute;
 import com.linagora.calendar.restapi.routes.EventParticipationRoute;
 import com.linagora.calendar.restapi.routes.FileUploadRoute;
 import com.linagora.calendar.restapi.routes.ImportResultNotifier;
@@ -97,11 +102,13 @@ import com.linagora.calendar.restapi.routes.LogoRoute;
 import com.linagora.calendar.restapi.routes.PeopleSearchRoute;
 import com.linagora.calendar.restapi.routes.ProfileAvatarRoute;
 import com.linagora.calendar.restapi.routes.ProfileUpdateRoute;
+import com.linagora.calendar.restapi.routes.PublicAgendaCancellationNotifier;
 import com.linagora.calendar.restapi.routes.PublicAgendaProposalNotifier;
 import com.linagora.calendar.restapi.routes.ResourceIconRoute;
 import com.linagora.calendar.restapi.routes.ResourceParticipationRoute;
 import com.linagora.calendar.restapi.routes.ResourceRoute;
 import com.linagora.calendar.restapi.routes.SecretLinkRoute;
+import com.linagora.calendar.restapi.routes.TeamCalendarRoute;
 import com.linagora.calendar.restapi.routes.ThemeRoute;
 import com.linagora.calendar.restapi.routes.UserConfigurationPatchRoute;
 import com.linagora.calendar.restapi.routes.UserConfigurationsRoute;
@@ -115,6 +122,7 @@ import com.linagora.calendar.restapi.routes.configuration.StoredConfigurationEnt
 import com.linagora.calendar.restapi.routes.people.search.ContactSearchProvider;
 import com.linagora.calendar.restapi.routes.people.search.PeopleSearchProvider;
 import com.linagora.calendar.restapi.routes.people.search.ResourceSearchProvider;
+import com.linagora.calendar.restapi.routes.people.search.TeamCalendarSearchProvider;
 import com.linagora.calendar.restapi.routes.people.search.UserSearchProvider;
 import com.linagora.calendar.storage.SimpleSessionProvider;
 import com.linagora.calendar.storage.TokenInfoResolver;
@@ -151,6 +159,8 @@ public class RestApiModule extends AbstractModule {
 
         Multibinder<JMAPRoutes> routes = Multibinder.newSetBinder(binder(), JMAPRoutes.class);
         routes.addBinding().to(AvatarRoute.class);
+        routes.addBinding().to(BookedEventCancelRoute.class);
+        routes.addBinding().to(BookedEventGetRoute.class);
         routes.addBinding().to(BookingLinkCreateRoute.class);
         routes.addBinding().to(BookingLinkDeleteRoute.class);
         routes.addBinding().to(BookingLinkGetRoute.class);
@@ -161,6 +171,7 @@ public class RestApiModule extends AbstractModule {
         routes.addBinding().to(BookingLinkReservationRoute.class);
         routes.addBinding().to(DomainRoute.class);
         routes.addBinding().to(DomainSettingsRoute.class);
+        routes.addBinding().to(EntityRoute.class);
         routes.addBinding().to(ThemeRoute.class);
         routes.addBinding().to(LogoRoute.class);
         routes.addBinding().to(JwtRoutes.class);
@@ -183,6 +194,7 @@ public class RestApiModule extends AbstractModule {
         routes.addBinding().to(ResourceIconRoute.class);
         routes.addBinding().to(ResourceParticipationRoute.class);
         routes.addBinding().to(ResourceRoute.class);
+        routes.addBinding().to(TeamCalendarRoute.class);
         routes.addBinding().to(CalendarTicketRoutes.class);
         routes.addBinding().to(WebsocketRoute.class);
 
@@ -203,16 +215,20 @@ public class RestApiModule extends AbstractModule {
         bind(SecretLinkPermissionChecker.class).to(NoopPermissionChecker.class);
 
         bind(ParticipationTokenSigner.class).to(ParticipationTokenSigner.Default.class);
+        bind(BookedEventTokenSigner.class).to(BookedEventTokenSigner.Default.class);
 
         Multibinder<PeopleSearchProvider> peopleSearchProviderMultibinder = Multibinder.newSetBinder(binder(), PeopleSearchProvider.class);
         peopleSearchProviderMultibinder.addBinding().to(ContactSearchProvider.class);
         peopleSearchProviderMultibinder.addBinding().to(ResourceSearchProvider.class);
         peopleSearchProviderMultibinder.addBinding().to(UserSearchProvider.class);
+        peopleSearchProviderMultibinder.addBinding().to(TeamCalendarSearchProvider.class);
 
         bind(ImportWebSocketNotifier.class).in(Scopes.SINGLETON);
         bind(SendMailNotifier.class).in(Scopes.SINGLETON);
         bind(BookingLinkSlotsService.class).in(Scopes.SINGLETON);
         bind(PublicAgendaProposalNotifier.class).in(Scopes.SINGLETON);
+        bind(BookingLinkRequestAcknowledgementNotifier.class).in(Scopes.SINGLETON);
+        bind(PublicAgendaCancellationNotifier.class).in(Scopes.SINGLETON);
 
         Multibinder<ImportResultNotifier> importResultNotifierMultibinder = Multibinder.newSetBinder(binder(), ImportResultNotifier.class);
         importResultNotifierMultibinder.addBinding().to(ImportWebSocketNotifier.class);

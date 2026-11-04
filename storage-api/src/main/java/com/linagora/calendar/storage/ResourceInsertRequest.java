@@ -18,12 +18,7 @@
 
 package com.linagora.calendar.storage;
 
-import java.util.List;
-
-import com.linagora.calendar.storage.model.ResourceAdministrator;
-
-public record ResourceInsertRequest(List<ResourceAdministrator> administrators,
-                                    OpenPaaSId creator,
+public record ResourceInsertRequest(OpenPaaSId creator,
                                     String description,
                                     OpenPaaSId domain,
                                     String icon,

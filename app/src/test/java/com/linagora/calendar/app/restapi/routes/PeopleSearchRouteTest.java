@@ -28,7 +28,6 @@ import static org.hamcrest.Matchers.hasSize;
 import static org.hamcrest.Matchers.not;
 
 import java.nio.charset.StandardCharsets;
-import java.util.List;
 import java.util.UUID;
 
 import jakarta.inject.Inject;
@@ -48,21 +47,19 @@ import org.junit.jupiter.params.provider.ValueSource;
 
 import com.google.inject.multibindings.Multibinder;
 import com.linagora.calendar.app.AppTestHelper;
+import com.linagora.calendar.app.ResourceProbe;
 import com.linagora.calendar.app.TwakeCalendarConfiguration;
 import com.linagora.calendar.app.TwakeCalendarExtension;
 import com.linagora.calendar.app.TwakeCalendarGuiceServer;
 import com.linagora.calendar.app.modules.CalendarDataProbe;
 import com.linagora.calendar.app.modules.MemoryAutoCompleteModule;
 import com.linagora.calendar.restapi.RestApiServerProbe;
-import com.linagora.calendar.storage.OpenPaaSDomain;
 import com.linagora.calendar.storage.OpenPaaSDomainDAO;
-import com.linagora.calendar.storage.OpenPaaSId;
 import com.linagora.calendar.storage.OpenPaaSUser;
-import com.linagora.calendar.storage.ResourceDAO;
-import com.linagora.calendar.storage.ResourceInsertRequest;
+import com.linagora.calendar.storage.TeamCalendarInsertRequest;
+import com.linagora.calendar.storage.TeamCalendarRepository;
 import com.linagora.calendar.storage.model.Resource;
-import com.linagora.calendar.storage.model.ResourceAdministrator;
-import com.linagora.calendar.storage.model.ResourceId;
+import com.linagora.calendar.storage.model.TeamCalendar;
 
 import io.restassured.RestAssured;
 import io.restassured.authentication.PreemptiveBasicAuthScheme;
@@ -71,50 +68,20 @@ import io.restassured.http.ContentType;
 import net.javacrumbs.jsonunit.core.Option;
 
 class PeopleSearchRouteTest {
-
-    static class ResourceProbe implements GuiceProbe {
-        private final ResourceDAO resourceDAO;
+    static class TeamCalendarProbe implements GuiceProbe {
+        private final TeamCalendarRepository teamCalendarRepository;
         private final OpenPaaSDomainDAO domainDAO;
 
         @Inject
-        ResourceProbe(ResourceDAO resourceDAO, OpenPaaSDomainDAO domainDAO) {
-            this.resourceDAO = resourceDAO;
+        TeamCalendarProbe(TeamCalendarRepository teamCalendarRepository, OpenPaaSDomainDAO domainDAO) {
+            this.teamCalendarRepository = teamCalendarRepository;
             this.domainDAO = domainDAO;
         }
 
-        public Resource save(OpenPaaSUser requestUser, String name, String icon) {
-            return save(requestUser, name, icon, List.of(requestUser.id()));
-        }
-
-        public Resource save(OpenPaaSUser requestUser, String name, String icon, List<OpenPaaSId> adminIds) {
-            ResourceInsertRequest insertRequest = buildInsertRequest(requestUser, name, icon, adminIds);
-
-            return resourceDAO.insert(insertRequest)
-                .flatMap(resourceDAO::findById)
+        public TeamCalendar save(Domain domain, String name, String displayName) {
+            return domainDAO.retrieve(domain)
+                .flatMap(openPaaSDomain -> teamCalendarRepository.create(new TeamCalendarInsertRequest(openPaaSDomain, name, displayName)))
                 .block();
-        }
-
-        public ResourceId saveAndRemove(OpenPaaSUser requestUser, String name, String icon) {
-            ResourceInsertRequest insertRequest = buildInsertRequest(requestUser, name, icon, List.of(requestUser.id()));
-
-            return resourceDAO.insert(insertRequest)
-                .flatMap(resourceId -> resourceDAO.softDelete(resourceId).thenReturn(resourceId))
-                .block();
-        }
-
-        public List<Resource> listAll() {
-            return resourceDAO.findAll().collectList().block();
-        }
-
-        private ResourceInsertRequest buildInsertRequest(OpenPaaSUser requestUser, String name, String icon, List<OpenPaaSId> adminIds) {
-            List<ResourceAdministrator> administrators = adminIds.stream()
-                .map(id -> new ResourceAdministrator(id, "user"))
-                .toList();
-
-            OpenPaaSDomain domain = domainDAO.retrieve(requestUser.username().getDomainPart().orElseThrow())
-                .block();
-
-            return new ResourceInsertRequest(administrators, requestUser.id(), name + " description", domain.id(), icon, name);
         }
     }
 
@@ -139,8 +106,9 @@ class PeopleSearchRouteTest {
             .dbChoice(TwakeCalendarConfiguration.DbChoice.MEMORY),
         AppTestHelper.BY_PASS_MODULE.apply(rabbitMQExtension),
         binder -> {
-            Multibinder.newSetBinder(binder, GuiceProbe.class)
-                .addBinding().to(ResourceProbe.class);
+            Multibinder<GuiceProbe> guiceProbeMultibinder = Multibinder.newSetBinder(binder, GuiceProbe.class);
+            guiceProbeMultibinder.addBinding().to(ResourceProbe.class);
+            guiceProbeMultibinder.addBinding().to(TeamCalendarProbe.class);
         });
 
     @AfterAll
@@ -231,6 +199,46 @@ class PeopleSearchRouteTest {
                     ]
                   }
                 ]""");
+    }
+
+    @Test
+    void shouldOrderResultsByTypeUserThenResourceThenContactAndAlphabetically(TwakeCalendarGuiceServer server) {
+        // given a user, a resource and contacts all matching the query
+        OpenPaaSUser openPaaSUser = server.getProbe(CalendarDataProbe.class).getUser(USERNAME);
+        server.getProbe(ResourceProbe.class).save(openPaaSUser, "team-room", "laptop");
+
+        String userEmail = "team-lead@" + DOMAIN;
+        addUser(server, Username.of(userEmail), "team", "lead");
+        addContact(server, userEmail, "team", "lead");
+
+        addContact(server, "team-other@" + DOMAIN, "zzz", "team");
+        addContact(server, "team-alias@" + DOMAIN, "aaa", "team");
+
+        // when
+        String response = given()
+            .body("""
+                {
+                  "q" : "team",
+                  "objectTypes" : [ "user", "resource", "contact" ],
+                  "limit" : 10
+                }""")
+        .when()
+            .post()
+        .then()
+            .statusCode(HttpStatus.SC_OK)
+            .extract()
+            .body()
+            .asString();
+
+        // then: user first, then resource, then contacts; alphabetical within each type
+        assertThatJson(response).node("[0].objectType").isEqualTo("user");
+        assertThatJson(response).node("[0].names[0].displayName").isEqualTo("team lead");
+        assertThatJson(response).node("[1].objectType").isEqualTo("resource");
+        assertThatJson(response).node("[1].names[0].displayName").isEqualTo("team-room");
+        assertThatJson(response).node("[2].objectType").isEqualTo("contact");
+        assertThatJson(response).node("[2].names[0].displayName").isEqualTo("aaa team");
+        assertThatJson(response).node("[3].objectType").isEqualTo("contact");
+        assertThatJson(response).node("[3].names[0].displayName").isEqualTo("zzz team");
     }
 
     @Test
@@ -472,7 +480,7 @@ class PeopleSearchRouteTest {
         // given
         OpenPaaSUser openPaaSUser = server.getProbe(CalendarDataProbe.class).getUser(USERNAME);
         ResourceProbe resourceProbe = server.getProbe(ResourceProbe.class);
-        resourceProbe.save(openPaaSUser, "meeting-room", "laptop");
+        Resource resource = resourceProbe.save(openPaaSUser, "meeting-room", "laptop");
 
         // when
         String response = given()
@@ -491,7 +499,6 @@ class PeopleSearchRouteTest {
             .asString();
 
         // then
-        Resource firstResource = resourceProbe.listAll().getFirst();
         assertThatJson(response)
             .withOptions(Option.IGNORING_ARRAY_ORDER)
             .isEqualTo("""
@@ -504,7 +511,7 @@ class PeopleSearchRouteTest {
                     "phoneNumbers": [],
                     "photos": [ { "url": "https://twcalendar.linagora.com/images/icon/laptop.svg", "type": "default" } ]
                   }
-                ]""".formatted(firstResource.id().value(), firstResource.id().value() + "@" + DOMAIN));
+                ]""".formatted(resource.id().value(), resource.id().value() + "@" + DOMAIN));
     }
 
     @Test
@@ -595,6 +602,235 @@ class PeopleSearchRouteTest {
         assertThatJson(response)
             .isArray()
             .hasSize(2);
+    }
+
+    @Test
+    void shouldReturnTeamCalendarWhenTeamCalendarTypeIncluded(TwakeCalendarGuiceServer server) {
+        // given
+        TeamCalendar salesTeamCalendar = server.getProbe(TeamCalendarProbe.class)
+            .save(Domain.of(DOMAIN), "sales", "Sales Team");
+        server.getProbe(TeamCalendarProbe.class)
+            .save(Domain.of(DOMAIN), "support", "Support Team");
+
+        // when
+        String response = given()
+            .body("""
+                {
+                  "q" : "sale",
+                  "objectTypes" : [ "team-calendar" ],
+                  "limit" : 10
+                }""")
+        .when()
+            .post()
+        .then()
+            .statusCode(HttpStatus.SC_OK)
+            .extract()
+            .body()
+            .asString();
+
+        // then
+        assertThatJson(response)
+            .isEqualTo("""
+                [
+                  {
+                    "id": "%s",
+                    "objectType": "team-calendar",
+                    "names": [ { "displayName": "Sales Team", "type": "default" } ],
+                    "emailAddresses": [ { "value": "sales@%s", "type": "default" } ],
+                    "phoneNumbers": []
+                  }
+                ]""".formatted(salesTeamCalendar.id().value(), DOMAIN));
+    }
+
+    @Test
+    void shouldReturnTeamCalendarMatchingDisplayName(TwakeCalendarGuiceServer server) {
+        // given
+        TeamCalendar salesTeamCalendar = server.getProbe(TeamCalendarProbe.class)
+            .save(Domain.of(DOMAIN), "com-team", "Sales Team");
+
+        // when
+        String response = given()
+            .body("""
+                {
+                  "q" : "Sales",
+                  "objectTypes" : [ "team-calendar" ],
+                  "limit" : 10
+                }""")
+        .when()
+            .post()
+        .then()
+            .statusCode(HttpStatus.SC_OK)
+            .extract()
+            .body()
+            .asString();
+
+        // then
+        assertThatJson(response)
+            .isEqualTo("""
+                [
+                  {
+                    "id": "%s",
+                    "objectType": "team-calendar",
+                    "names": [ { "displayName": "Sales Team", "type": "default" } ],
+                    "emailAddresses": [ { "value": "com-team@%s", "type": "default" } ],
+                    "phoneNumbers": []
+                  }
+                ]""".formatted(salesTeamCalendar.id().value(), DOMAIN));
+    }
+
+    @Test
+    void shouldReturnTeamCalendarMatchingDerivedEmailAddress(TwakeCalendarGuiceServer server) {
+        // given
+        TeamCalendarProbe teamCalendarProbe = server.getProbe(TeamCalendarProbe.class);
+        TeamCalendar salesTeamCalendar = teamCalendarProbe.save(Domain.of(DOMAIN), "sales", "Commercial Team");
+        teamCalendarProbe.save(Domain.of(DOMAIN), "support", "Support Team");
+
+        // when
+        String response = given()
+            .body("""
+                {
+                  "q" : "sales@%s",
+                  "objectTypes" : [ "team-calendar" ],
+                  "limit" : 10
+                }""".formatted(DOMAIN))
+        .when()
+            .post()
+        .then()
+            .statusCode(HttpStatus.SC_OK)
+            .extract()
+            .body()
+            .asString();
+
+        // then
+        assertThatJson(response)
+            .isEqualTo("""
+                [
+                  {
+                    "id": "%s",
+                    "objectType": "team-calendar",
+                    "names": [ { "displayName": "Commercial Team", "type": "default" } ],
+                    "emailAddresses": [ { "value": "sales@%s", "type": "default" } ],
+                    "phoneNumbers": []
+                  }
+                ]""".formatted(salesTeamCalendar.id().value(), DOMAIN));
+    }
+
+    @Test
+    void shouldReturnTeamCalendarTogetherWithOtherObjectTypes(TwakeCalendarGuiceServer server) {
+        // given a contact and a team calendar both matching the query
+        addContact(server, "sales@domain.tld", "sales", "contact");
+        server.getProbe(TeamCalendarProbe.class)
+            .save(Domain.of(DOMAIN), "sales", "Sales Team");
+
+        // when
+        String response = given()
+            .body("""
+                {
+                  "q" : "sales",
+                  "objectTypes" : [ "user", "contact", "team-calendar" ],
+                  "limit" : 10
+                }""")
+        .when()
+            .post()
+        .then()
+            .statusCode(HttpStatus.SC_OK)
+            .extract()
+            .body()
+            .asString();
+
+        // then contacts come before team calendars
+        assertThatJson(response).isArray().hasSize(2);
+        assertThatJson(response).node("[0].objectType").isEqualTo("contact");
+        assertThatJson(response).node("[1].objectType").isEqualTo("team-calendar");
+    }
+
+    @Test
+    void shouldNotReturnTeamCalendarWhenTeamCalendarTypeExcluded(TwakeCalendarGuiceServer server) {
+        // given
+        server.getProbe(TeamCalendarProbe.class)
+            .save(Domain.of(DOMAIN), "sales", "Sales Team");
+
+        // when
+        String response = given()
+            .body("""
+                {
+                  "q" : "sales",
+                  "objectTypes" : [ "user", "contact" ],
+                  "limit" : 10
+                }""")
+        .when()
+            .post()
+        .then()
+            .statusCode(HttpStatus.SC_OK)
+            .extract()
+            .body()
+            .asString();
+
+        // then
+        assertThatJson(response)
+            .isArray()
+            .isEmpty();
+    }
+
+    @Test
+    void shouldRespectLimitWhenSearchingTeamCalendars(TwakeCalendarGuiceServer server) {
+        // given
+        TeamCalendarProbe teamCalendarProbe = server.getProbe(TeamCalendarProbe.class);
+        teamCalendarProbe.save(Domain.of(DOMAIN), "sales-1", "Sales Team 1");
+        teamCalendarProbe.save(Domain.of(DOMAIN), "sales-2", "Sales Team 2");
+        teamCalendarProbe.save(Domain.of(DOMAIN), "sales-3", "Sales Team 3");
+
+        // when
+        String response = given()
+            .body("""
+                {
+                  "q" : "sales",
+                  "objectTypes" : [ "team-calendar" ],
+                  "limit" : 2
+                }""")
+        .when()
+            .post()
+        .then()
+            .statusCode(HttpStatus.SC_OK)
+            .extract()
+            .body()
+            .asString();
+
+        // then
+        assertThatJson(response)
+            .isArray()
+            .hasSize(2);
+    }
+
+    @Test
+    void shouldOnlyReturnTeamCalendarsFromAuthenticatedUserDomain(TwakeCalendarGuiceServer server) {
+        // given team calendars in two different domains
+        Domain foreignDomain = Domain.of("foreign-domain.tld");
+        server.getProbe(CalendarDataProbe.class).addDomain(foreignDomain);
+
+        TeamCalendarProbe teamCalendarProbe = server.getProbe(TeamCalendarProbe.class);
+        TeamCalendar ownedTeamCalendar = teamCalendarProbe.save(Domain.of(DOMAIN), "sales", "Sales Team");
+        teamCalendarProbe.save(foreignDomain, "sales", "Foreign Sales Team");
+
+        // when
+        String response = given()
+            .body("""
+                {
+                  "q" : "sales",
+                  "objectTypes" : [ "team-calendar" ],
+                  "limit" : 10
+                }""")
+        .when()
+            .post()
+        .then()
+            .statusCode(HttpStatus.SC_OK)
+            .extract()
+            .body()
+            .asString();
+
+        // then
+        assertThatJson(response).isArray().hasSize(1);
+        assertThatJson(response).node("[0].id").isEqualTo(ownedTeamCalendar.id().value());
     }
 
     @Test

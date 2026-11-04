@@ -19,57 +19,37 @@
 package com.linagora.calendar.amqp;
 
 import static com.linagora.calendar.amqp.CalendarAmqpModule.INJECT_KEY_DAV;
-import static org.apache.james.backends.rabbitmq.Constants.DURABLE;
 import static org.apache.james.backends.rabbitmq.Constants.EMPTY_ROUTING_KEY;
 import static org.apache.james.util.ReactorUtils.DEFAULT_CONCURRENCY;
 
 import java.io.Closeable;
-import java.util.Arrays;
-import java.util.EnumMap;
 import java.util.Map;
-import java.util.function.Consumer;
 import java.util.function.Supplier;
 
+import jakarta.annotation.PreDestroy;
 import jakarta.inject.Inject;
 import jakarta.inject.Singleton;
 
-import org.apache.commons.lang3.BooleanUtils;
 import org.apache.james.backends.rabbitmq.QueueArguments;
 import org.apache.james.backends.rabbitmq.ReactorRabbitMQChannelPool;
-import org.apache.james.backends.rabbitmq.ReceiverProvider;
 import org.apache.james.lifecycle.api.Startable;
 import org.apache.james.metrics.api.MetricFactory;
 import org.apache.james.util.ReactorUtils;
-import org.apache.james.vacation.api.AccountId;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import com.google.inject.name.Named;
-import com.linagora.calendar.storage.OpenPaaSId;
-import com.linagora.calendar.storage.OpenPaaSUserDAO;
-import com.linagora.calendar.storage.ResourceDAO;
-import com.linagora.calendar.storage.eventsearch.CalendarEvents;
 import com.linagora.calendar.storage.eventsearch.CalendarSearchService;
-import com.linagora.calendar.storage.exception.CalendarSearchIndexingException;
-import com.linagora.calendar.storage.model.ResourceId;
+import com.linagora.tmail.rabbitmq.ManagedRabbitMQConsumer;
+import com.linagora.tmail.rabbitmq.QueueDeclaration;
 import com.rabbitmq.client.BuiltinExchangeType;
 
-import reactor.core.Disposable;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
-import reactor.core.scheduler.Schedulers;
 import reactor.rabbitmq.AcknowledgableDelivery;
-import reactor.rabbitmq.BindingSpecification;
-import reactor.rabbitmq.ConsumeOptions;
-import reactor.rabbitmq.ExchangeSpecification;
-import reactor.rabbitmq.QueueSpecification;
-import reactor.rabbitmq.Receiver;
-import reactor.rabbitmq.Sender;
 
 public class EventIndexerConsumer implements Closeable, Startable {
-    private static final boolean IGNORE_EVENT_IF_USER_NOT_FOUND = BooleanUtils.toBoolean(System.getProperty("calendar.event.consumer.ignoreIfUserNotFound", "false"));
     private static final Logger LOGGER = LoggerFactory.getLogger(EventIndexerConsumer.class);
-    private static final boolean REQUEUE_ON_NACK = true;
 
     public enum Queue {
         ADD("calendar:event:created", "tcalendar:event:created:search", "tcalendar:event:created:search-dead-letter"),
@@ -100,132 +80,72 @@ public class EventIndexerConsumer implements Closeable, Startable {
         }
     }
 
-    private final ReceiverProvider receiverProvider;
-    private final Consumer<Queue> declareExchangeAndQueue;
     private final CalendarSearchService calendarSearchService;
-    private final OpenPaaSUserDAO openPaaSUserDAO;
-    private final ResourceDAO resourceDAO;
     private final MetricFactory metricFactory;
-    private final Map<Queue, Disposable> consumeDisposableMap;
+    private final Map<Queue, ManagedRabbitMQConsumer> consumers;
 
     @Inject
     @Singleton
     public EventIndexerConsumer(ReactorRabbitMQChannelPool channelPool,
                                 CalendarSearchService calendarSearchService,
-                                OpenPaaSUserDAO openPaaSUserDAO,
-                                @Named(INJECT_KEY_DAV) Supplier<QueueArguments.Builder> queueArgumentSupplier, ResourceDAO resourceDAO,
+                                @Named(INJECT_KEY_DAV) Supplier<QueueArguments.Builder> queueArgumentSupplier,
                                 MetricFactory metricFactory) {
-        this.receiverProvider = channelPool::createReceiver;
         this.calendarSearchService = calendarSearchService;
-        this.openPaaSUserDAO = openPaaSUserDAO;
-        this.resourceDAO = resourceDAO;
         this.metricFactory = metricFactory;
+        this.consumers = Map.of(
+            Queue.ADD, createConsumer(channelPool, queueArgumentSupplier, Queue.ADD, handlerAddOrUpdate),
+            Queue.UPDATE, createConsumer(channelPool, queueArgumentSupplier, Queue.UPDATE, handlerAddOrUpdate),
+            Queue.DELETE, createConsumer(channelPool, queueArgumentSupplier, Queue.DELETE, handlerDelete));
+    }
 
-        Sender sender = channelPool.getSender();
-        this.declareExchangeAndQueue = eventQueue -> Flux.concat(
-                sender.declareExchange(ExchangeSpecification.exchange(eventQueue.exchangeName)
-                    .durable(DURABLE).type(BuiltinExchangeType.FANOUT.getType())),
-                sender.declareExchange(ExchangeSpecification.exchange(eventQueue.deadLetter)
-                    .durable(DURABLE).type(BuiltinExchangeType.FANOUT.getType())),
-                sender.declareQueue(QueueSpecification
-                    .queue(eventQueue.deadLetter)
-                    .durable(DURABLE)
-                    .arguments(queueArgumentSupplier.get()
-                        .build())),
-                sender.bind(BindingSpecification.binding()
-                    .exchange(eventQueue.deadLetter)
-                    .queue(eventQueue.deadLetter)
-                    .routingKey(EMPTY_ROUTING_KEY)),
-                sender.declareQueue(QueueSpecification
-                    .queue(eventQueue.queueName)
-                    .durable(DURABLE)
-                    .arguments(queueArgumentSupplier.get()
-                        .deadLetter(eventQueue.deadLetter)
-                        .build())),
-                sender.bind(BindingSpecification.binding()
-                    .exchange(eventQueue.exchangeName)
-                    .queue(eventQueue.queueName)
-                    .routingKey(EMPTY_ROUTING_KEY)))
-            .then()
-            .block();
-
-        this.consumeDisposableMap = new EnumMap<>(Queue.class);
+    private ManagedRabbitMQConsumer createConsumer(ReactorRabbitMQChannelPool channelPool,
+                                                   Supplier<QueueArguments.Builder> queueArgumentSupplier,
+                                                   Queue queue, CalendarEventHandler handler) {
+        return new ManagedRabbitMQConsumer.Factory(channelPool)
+            .create(ManagedRabbitMQConsumer.Parameters.builder()
+                .queueDeclaration(QueueDeclaration.builder()
+                    .binding(queue.exchangeName, BuiltinExchangeType.FANOUT, EMPTY_ROUTING_KEY)
+                    .queue(queue.queueName)
+                    .deadLetterQueue(queue.deadLetter)
+                    .build())
+                .queueArguments(queueArgumentSupplier)
+                .qos(DEFAULT_CONCURRENCY)
+                .concurrency(DEFAULT_CONCURRENCY)
+                .handleDelivery(delivery -> messageConsume(delivery, handler.deserialize(delivery.getBody()), handler))
+                .build());
     }
 
     public void init() {
-        Arrays.stream(Queue.values())
-            .forEach(declareExchangeAndQueue);
-
-        start();
-    }
-
-    public void start() {
-        consumeDisposableMap.put(Queue.ADD, doConsumeCalendarEventMessages(Queue.ADD, handlerAdd));
-        consumeDisposableMap.put(Queue.UPDATE, doConsumeCalendarEventMessages(Queue.UPDATE, handlerAddOrUpdate));
-        consumeDisposableMap.put(Queue.DELETE, doConsumeCalendarEventMessages(Queue.DELETE, handlerDelete));
+        consumers.values().forEach(ManagedRabbitMQConsumer::init);
     }
 
     public void restart() {
-        close();
-        consumeDisposableMap.clear();
-        start();
+        consumers.values().forEach(ManagedRabbitMQConsumer::restart);
     }
 
     @Override
+    @PreDestroy
     public void close() {
-        consumeDisposableMap.values().forEach(disposable -> {
-            if (!disposable.isDisposed()) {
-                disposable.dispose();
-            }
-        });
+        consumers.values().forEach(ManagedRabbitMQConsumer::close);
     }
 
     public interface CalendarEventHandler {
-        Mono<?> handle(AccountId ownerAccountId, CalendarEventMessage calendarEventMessage);
+        Mono<?> handle(CalendarEventMessage calendarEventMessage);
 
         Mono<CalendarEventMessage> deserialize(byte[] messagesAsBytes);
     }
 
-    private final CalendarEventHandler handlerAdd = new CalendarEventHandler() {
-        @Override
-        public Mono<?> handle(AccountId ownerAccountId, CalendarEventMessage calendarEventMessage) {
-            return Mono.fromCallable(calendarEventMessage::extractCalendarEvents)
-                .flatMap(calendarEvents -> calendarSearchService.index(ownerAccountId, calendarEvents))
-                .then();
-        }
-
-        @Override
-        public Mono<CalendarEventMessage> deserialize(byte[] messagesAsBytes) {
-            return Mono.fromCallable(() -> CalendarEventMessage.CreatedOrUpdated.deserialize(messagesAsBytes));
-        }
-    };
-
+    // Both created and updated events are indexed the same way: each occurrence (master and overridden
+    // occurrences) is upserted as its own document guarded by its sequence. We intentionally do NOT delete
+    // by eventUid before re-indexing recurring events: that delete bypasses the per-document sequence guard
+    // and races with concurrent/reordered messages (see issue #895). Search collapses on the uid and keeps
+    // the sequence-guarded master, so stale overridden occurrences are never surfaced.
     private final CalendarEventHandler handlerAddOrUpdate = new CalendarEventHandler() {
-
         @Override
-        public Mono<?> handle(AccountId ownerAccountId, CalendarEventMessage calendarEventMessage) {
+        public Mono<?> handle(CalendarEventMessage calendarEventMessage) {
             return Mono.fromCallable(calendarEventMessage::extractCalendarEvents)
-                .flatMap(calendarEvents -> indexEvents(ownerAccountId, calendarEvents))
+                .flatMap(calendarSearchService::index)
                 .then();
-        }
-
-        private Mono<Void> indexEvents(AccountId ownerAccountId, CalendarEvents calendarEvents) {
-           if (hasRecurrenceEvents(calendarEvents)) {
-                return calendarSearchService.delete(ownerAccountId, calendarEvents.eventUid())
-                    .then(calendarSearchService.index(ownerAccountId, calendarEvents))
-                    .onErrorResume(error -> error instanceof CalendarSearchIndexingException && error.getCause().getMessage().contains("version conflict, required seqNo"),
-                        error -> {
-                        LOGGER.info("Failed to delete recurring eventId: {} for accountId {} due to receiving duplicated messages from dav",
-                            calendarEvents.eventUid().value(), ownerAccountId.getIdentifier(), error);
-                        return Mono.empty();
-                    });
-            } else {
-                return calendarSearchService.index(ownerAccountId, calendarEvents);
-           }
-        }
-
-        private boolean hasRecurrenceEvents(CalendarEvents calendarEvents) {
-            return calendarEvents.events().size() > 1;
         }
 
         @Override
@@ -236,11 +156,12 @@ public class EventIndexerConsumer implements Closeable, Startable {
 
     private final CalendarEventHandler handlerDelete = new CalendarEventHandler() {
         @Override
-        public Mono<?> handle(AccountId ownerAccountId, CalendarEventMessage calendarEventMessage) {
+        public Mono<?> handle(CalendarEventMessage calendarEventMessage) {
             return Flux.fromIterable(((CalendarEventMessage.Deleted) calendarEventMessage).extractEventUid())
-                .flatMap(eventUid -> calendarSearchService.delete(ownerAccountId, eventUid)
+                .flatMap(eventUid -> calendarSearchService.delete(calendarEventMessage.extractCalendarURL(), eventUid)
                     .onErrorResume(error -> {
-                        LOGGER.warn("Failed to delete eventId: {} for accountId {} ", eventUid.value(), ownerAccountId.getIdentifier(), error);
+                        LOGGER.warn("Failed to delete eventUid {} from calendarURL {}",
+                            eventUid.value(), calendarEventMessage.extractCalendarURL().serialize(), error);
                         return Mono.empty();
                     }))
                 .then();
@@ -252,53 +173,10 @@ public class EventIndexerConsumer implements Closeable, Startable {
         }
     };
 
-    private Disposable doConsumeCalendarEventMessages(Queue queue, CalendarEventHandler calendarEventHandler) {
-        return delivery(queue.queueName)
-            .flatMap(delivery -> messageConsume(delivery,
-                calendarEventHandler.deserialize(delivery.getBody()),
-                calendarEventHandler), DEFAULT_CONCURRENCY)
-            .subscribeOn(Schedulers.boundedElastic())
-            .subscribe();
-    }
-
-    public Flux<AcknowledgableDelivery> delivery(String queue) {
-        return Flux.using(receiverProvider::createReceiver,
-            receiver -> receiver.consumeManualAck(queue, new ConsumeOptions().qos(DEFAULT_CONCURRENCY)),
-            Receiver::close);
-    }
-
-    private Mono<?> messageConsume(AcknowledgableDelivery ackDelivery, Mono<CalendarEventMessage> messagePublisher, CalendarEventHandler calendarEventHandler) {
+    private Mono<Void> messageConsume(AcknowledgableDelivery ackDelivery, Mono<CalendarEventMessage> messagePublisher, CalendarEventHandler calendarEventHandler) {
         return messagePublisher
             .flatMap(message -> Mono.from(metricFactory.decoratePublisherWithTimerMetric("calendar.event.indexing",
-                getAccountId(message.extractCalendarURL().base())
-                    .flatMap(accountId -> calendarEventHandler.handle(accountId, message))
-                    .then(ReactorUtils.logAsMono(() -> LOGGER.debug("Consumed calendar event successfully {} '{}'", message.getClass().getSimpleName(), message.eventPath))))))
-            .doOnSuccess(result -> ackDelivery.ack())
-            .onErrorResume(error -> {
-                LOGGER.error("Error when consume calendar event", error);
-                ackDelivery.nack(!REQUEUE_ON_NACK);
-                return Mono.empty();
-            });
-    }
-
-    private Mono<AccountId> getAccountId(OpenPaaSId openPaaSId) {
-        return openPaaSUserDAO.retrieve(openPaaSId)
-            .map(user -> AccountId.fromUsername(user.username()))
-            .switchIfEmpty(Mono.defer(() -> handleMissingUser(openPaaSId)));
-    }
-
-    private Mono<AccountId> handleMissingUser(OpenPaaSId openPaaSId) {
-        if (IGNORE_EVENT_IF_USER_NOT_FOUND) {
-            LOGGER.warn("Ignoring calendar event for calendar id '{}', as the user was not found", openPaaSId.value());
-            return Mono.empty();
-        }
-
-        return Mono.defer(() -> resourceDAO.findById(ResourceId.from(openPaaSId)))
-            .switchIfEmpty(Mono.defer(() -> {
-                String msg = "Unable to find account with calendar id '%s'".formatted(openPaaSId.value());
-                LOGGER.error(msg);
-                return Mono.error(new CalendarEventConsumerException(msg));
-            }))
-            .then(Mono.empty());
+                calendarEventHandler.handle(message)
+                    .then(ReactorUtils.logAsMono(() -> LOGGER.debug("Consumed calendar event message successfully {} '{}'", message.getClass().getSimpleName(), message.eventPath))))));
     }
 }

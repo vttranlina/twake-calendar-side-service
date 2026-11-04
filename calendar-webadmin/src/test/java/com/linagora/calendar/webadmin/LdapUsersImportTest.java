@@ -38,7 +38,6 @@ import org.apache.james.task.MemoryTaskManager;
 import org.apache.james.task.TaskExecutionDetails;
 import org.apache.james.task.TaskManager;
 import org.apache.james.webadmin.WebAdminServer;
-import org.apache.james.webadmin.WebAdminUtils;
 import org.apache.james.webadmin.routes.TasksRoutes;
 import org.apache.james.webadmin.utils.JsonTransformer;
 import org.junit.jupiter.api.AfterEach;
@@ -106,6 +105,7 @@ class LdapUsersImportTest {
 
         String taskId = given()
             .queryParam("task", "importFromLDAP")
+            .queryParam("usersPerSecond", 12)
             .when()
             .post()
             .jsonPath()
@@ -121,6 +121,7 @@ class LdapUsersImportTest {
             .body("type", is("import-ldap-users"))
             .body("additionalInformation.processedUserCount", is(1))
             .body("additionalInformation.failedUserCount", is(0))
+            .body("additionalInformation.runningOptions.usersPerSecond", is(12))
             .body("additionalInformation.timestamp", is(notNullValue()))
             .body("additionalInformation.type", is("import-ldap-users"))
             .body("startedDate", is(notNullValue()))

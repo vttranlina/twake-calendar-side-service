@@ -53,8 +53,7 @@ import com.linagora.calendar.dav.CalDavClient;
 import com.linagora.calendar.dav.CalDavEventRepository;
 import com.linagora.calendar.dav.DavModuleTestHelper;
 import com.linagora.calendar.dav.DavTestHelper;
-import com.linagora.calendar.dav.DockerSabreDavSetup;
-import com.linagora.calendar.dav.Fixture;
+import static com.linagora.calendar.storage.TestFixture.awaitAtMost;
 import com.linagora.calendar.dav.SabreDavExtension;
 import com.linagora.calendar.scheduling.AlarmEventSchedulerConfiguration;
 import com.linagora.calendar.smtp.MailSenderConfiguration;
@@ -91,7 +90,7 @@ public class AlarmEventSchedulerTest {
 
     @RegisterExtension
     @Order(1)
-    static SabreDavExtension sabreDavExtension = new SabreDavExtension(DockerSabreDavSetup.SINGLETON);
+    static SabreDavExtension sabreDavExtension = SabreDavExtension.shared();
 
     @RegisterExtension
     @Order(2)
@@ -136,7 +135,8 @@ public class AlarmEventSchedulerTest {
 
 
     @BeforeEach
-    void setUp(TwakeCalendarGuiceServer server) throws Exception {
+    void setUp() throws Exception {
+        clock.setInstant(Instant.now());
         this.organizer = sabreDavExtension.newTestUser(Optional.of("organizer_"));
         davTestHelper = new DavTestHelper(sabreDavExtension.dockerSabreDavSetup().davConfiguration(), TECHNICAL_TOKEN_SERVICE_TESTING);
         calDavEventRepository = new CalDavEventRepository(new CalDavClient(sabreDavExtension.dockerSabreDavSetup().davConfiguration(), TECHNICAL_TOKEN_SERVICE_TESTING));
@@ -178,7 +178,7 @@ public class AlarmEventSchedulerTest {
         // Given
         davTestHelper.upsertCalendar(organizer, calendarData, eventUid);
 
-        Fixture.awaitAtMost.untilAsserted(() ->
+        awaitAtMost.untilAsserted(() ->
             assertThat(alarmStore.find(eventUid, organizer.username().asString())).isPresent());
 
         clearSmtpInbox();
@@ -190,7 +190,7 @@ public class AlarmEventSchedulerTest {
 
         Supplier<JsonPath> smtpMailsResponseSupplier = () -> given(mockSMTPRequestSpecification()).get("/smtpMails").jsonPath();
 
-        Fixture.awaitAtMost.untilAsserted(() -> {
+        awaitAtMost.untilAsserted(() -> {
             JsonPath jp = smtpMailsResponseSupplier.get();
             assertThat(jp.getList("")).hasSize(1);
             String organizerAddr = organizer.username().asString();
@@ -201,7 +201,7 @@ public class AlarmEventSchedulerTest {
                 .contains("Subject: Notification: Twake Calendar - Sprint planning #04");
         });
 
-        Fixture.awaitAtMost.untilAsserted(() ->
+        awaitAtMost.untilAsserted(() ->
             assertThat(alarmStore.find(eventUid, organizer.username().asString())).isEmpty());
     }
 
@@ -221,10 +221,13 @@ public class AlarmEventSchedulerTest {
             BEGIN:VALARM
             TRIGGER:-PT15M
             ACTION:EMAIL
-            ATTENDEE:mailto:%s
+            %s
             SUMMARY:Test multi attendees
             DESCRIPTION:This is an automatic alarm sent by OpenPaas
-            END:VALARM""".formatted(organizer.username().asString());
+            END:VALARM""".formatted(alarmAttendeeLines(List.of(
+            attendee1.username().asString(),
+            attendee2.username().asString(),
+            attendee3.username().asString())));
 
         // Event ICS with 3 attendees
         String calendarData = generateEventWithVALARM(
@@ -239,7 +242,7 @@ public class AlarmEventSchedulerTest {
         davTestHelper.upsertCalendar(organizer, calendarData, eventUid);
 
         // Update attendee participation status
-        Fixture.awaitAtMost.untilAsserted(() -> {
+        awaitAtMost.untilAsserted(() -> {
             assertThatCode(() -> {
                 calDavEventRepository.updatePartStat(attendee1.username(), attendee1.id(), eventUid, PartStat.ACCEPTED).block();
                 calDavEventRepository.updatePartStat(attendee2.username(), attendee2.id(), eventUid, PartStat.ACCEPTED).block();
@@ -248,7 +251,7 @@ public class AlarmEventSchedulerTest {
         });
 
         // Then (DB state before trigger)
-        Fixture.awaitAtMost.untilAsserted(() -> {
+        awaitAtMost.untilAsserted(() -> {
             assertThat(alarmStore.find(eventUid.value(), attendee1.username().asString())).isPresent();
             assertThat(alarmStore.find(eventUid.value(), attendee2.username().asString())).isPresent();
             assertThat(alarmStore.find(eventUid.value(), attendee3.username().asString())).isEmpty(); // DECLINED
@@ -265,7 +268,7 @@ public class AlarmEventSchedulerTest {
 
         // Then (emails should be sent only to accepted attendees)
         String alarmEmailSubjectExpected = "Subject: Notification: Twake Calendar - Sprint planning #04";
-        Fixture.awaitAtMost.untilAsserted(() -> {
+        awaitAtMost.untilAsserted(() -> {
             JsonPath jp = smtpMailsResponseSupplier.get();
 
             // Attendee1
@@ -282,7 +285,7 @@ public class AlarmEventSchedulerTest {
         });
 
         // Then (cleanup: alarms removed after sending)
-        Fixture.awaitAtMost.untilAsserted(() -> {
+        awaitAtMost.untilAsserted(() -> {
             assertThat(alarmStore.find(eventUid.value(), attendee1.username().asString())).isEmpty();
             assertThat(alarmStore.find(eventUid.value(), attendee2.username().asString())).isEmpty();
         });
@@ -337,6 +340,12 @@ public class AlarmEventSchedulerTest {
             organizerEmail,
             attendeeLines,
             vAlarm);
+    }
+
+    private String alarmAttendeeLines(List<String> emails) {
+        return emails.stream()
+            .map("ATTENDEE:mailto:%s"::formatted)
+            .collect(Collectors.joining("\n"));
     }
 
 }

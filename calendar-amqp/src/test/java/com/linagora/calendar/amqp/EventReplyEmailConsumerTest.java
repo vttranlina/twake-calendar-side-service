@@ -74,8 +74,8 @@ import org.junit.jupiter.api.extension.RegisterExtension;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 import org.mockito.Mockito;
-import org.testcontainers.shaded.org.awaitility.Awaitility;
-import org.testcontainers.shaded.org.awaitility.core.ConditionFactory;
+import org.awaitility.Awaitility;
+import org.awaitility.core.ConditionFactory;
 
 import com.github.fge.lambdas.Throwing;
 import com.linagora.calendar.api.EventParticipationActionLinkFactory;
@@ -85,8 +85,6 @@ import com.linagora.calendar.dav.CalDavClient;
 import com.linagora.calendar.dav.CalDavEventRepository;
 import com.linagora.calendar.dav.DavTestHelper;
 import com.linagora.calendar.dav.DockerSabreDavSetup;
-import com.linagora.calendar.dav.Fixture;
-import com.linagora.calendar.dav.SabreDavExtension;
 import com.linagora.calendar.smtp.EventEmailFilter;
 import com.linagora.calendar.smtp.MailSender;
 import com.linagora.calendar.smtp.MailSenderConfiguration;
@@ -99,7 +97,7 @@ import com.linagora.calendar.storage.OpenPaaSUser;
 import com.linagora.calendar.storage.OpenPaaSUserDAO;
 import com.linagora.calendar.storage.ResourceInsertRequest;
 import com.linagora.calendar.storage.configuration.resolver.SettingsBasedResolver;
-import com.linagora.calendar.storage.model.ResourceAdministrator;
+import com.linagora.calendar.storage.eventsearch.EventUid;
 import com.linagora.calendar.storage.model.ResourceId;
 import com.linagora.calendar.storage.mongodb.MongoDBOpenPaaSDomainDAO;
 import com.linagora.calendar.storage.mongodb.MongoDBOpenPaaSUserDAO;
@@ -121,10 +119,15 @@ public class EventReplyEmailConsumerTest {
         .pollDelay(Duration.ofMillis(500))
         .await();
     private final ConditionFactory awaitAtMost = calmlyAwait.atMost(200, TimeUnit.SECONDS);
+    private final ConditionFactory negativeAwait = Awaitility.with()
+        .pollInterval(Duration.ofMillis(200))
+        .pollDelay(Duration.ZERO)
+        .await()
+        .during(Duration.ofSeconds(1));
 
     @RegisterExtension
     @Order(1)
-    static SabreDavExtension sabreDavExtension = new SabreDavExtension(DockerSabreDavSetup.SINGLETON);
+    static SabreDavWithAsyncSchedulingExtension sabreDavExtension = new SabreDavWithAsyncSchedulingExtension();
 
     @RegisterExtension
     @Order(2)
@@ -265,13 +268,8 @@ public class EventReplyEmailConsumerTest {
         davTestHelper.upsertCalendar(organizer, initialCalendarData, eventUid);
 
         // When: Attendee replies to the event (e.g. accepts the invitation)
-        String eventDavIdOnAttendee = waitForEventCreation(attendee);
-        String replyCalendarData = generateCalendarData(
-            eventUid,
-            organizer.username().asString(),
-            attendee.username().asString(),
-            new PartStat(partStatValue));
-        davTestHelper.upsertCalendar(attendee, replyCalendarData, eventDavIdOnAttendee);
+        waitForEventCreation(attendee);
+        updateAttendeePartStat(eventUid, new PartStat(partStatValue));
 
         // Wait for the mail to be received via mock SMTP
         awaitAtMost
@@ -355,10 +353,8 @@ public class EventReplyEmailConsumerTest {
 
         davTestHelper.upsertCalendar(organizer, sampleCalendarData, eventUid);
 
-        String eventDavIdOnAttendee = waitForEventCreation(attendee);
-        String replyCalendarData = sampleCalendarData.replace(PartStat.NEEDS_ACTION.getValue(), PartStat.ACCEPTED.getValue());
-
-        davTestHelper.upsertCalendar(attendee, replyCalendarData, eventDavIdOnAttendee);
+        waitForEventCreation(attendee);
+        updateAttendeePartStat(eventUid, PartStat.ACCEPTED);
 
         awaitAtMost
             .atMost(Duration.ofSeconds(20))
@@ -420,18 +416,13 @@ public class EventReplyEmailConsumerTest {
             attendee.username().asString(),
             PartStat.NEEDS_ACTION);
         davTestHelper.upsertCalendar(organizer, calendarData, eventUid);
-        String eventDavIdOnAttendee = waitForEventCreation(attendee);
+        waitForEventCreation(attendee);
 
         // Mock exception
         when(eventEmailFilter.shouldProcess(any(MailAddress.class)))
             .thenThrow(new RuntimeException("Temporary exception"));
 
-        String replyDataFirst = generateCalendarData(
-            eventUid,
-            organizer.username().asString(),
-            attendee.username().asString(),
-            PartStat.ACCEPTED);
-        davTestHelper.upsertCalendar(attendee, replyDataFirst, eventDavIdOnAttendee);
+        updateAttendeePartStat(eventUid, PartStat.ACCEPTED);
 
         Thread.sleep(1000); // Wait for the exception to be processed
 
@@ -440,12 +431,7 @@ public class EventReplyEmailConsumerTest {
         when(eventEmailFilter.shouldProcess(any(MailAddress.class)))
             .thenReturn(true);
 
-        String replyDataSecond = generateCalendarData(
-            eventUid,
-            organizer.username().asString(),
-            attendee.username().asString(),
-            PartStat.DECLINED);
-        davTestHelper.upsertCalendar(attendee, replyDataSecond, eventDavIdOnAttendee);
+        updateAttendeePartStat(eventUid, PartStat.DECLINED);
 
         awaitAtMost
             .atMost(Duration.ofSeconds(20))
@@ -458,7 +444,7 @@ public class EventReplyEmailConsumerTest {
     }
 
     @Test
-    void shouldNotSendEmailWhenRecipientIsNotInWhitelist() throws InterruptedException {
+    void shouldNotSendEmailWhenRecipientIsNotInWhitelist() {
         when(eventEmailFilter.shouldProcess(any(MailAddress.class)))
             .thenReturn(false);
 
@@ -472,25 +458,18 @@ public class EventReplyEmailConsumerTest {
         davTestHelper.upsertCalendar(organizer, initialCalendarData, eventUid);
 
         // When: Attendee replies to the event
-        String eventDavIdOnAttendee = waitForEventCreation(attendee);
-        String replyCalendarData = generateCalendarData(
-            eventUid,
-            organizer.username().asString(),
-            attendee.username().asString(),
-            PartStat.ACCEPTED);
-        davTestHelper.upsertCalendar(attendee, replyCalendarData, eventDavIdOnAttendee);
+        waitForEventCreation(attendee);
+        updateAttendeePartStat(eventUid, PartStat.ACCEPTED);
 
-        Thread.sleep(1000); // Wait for the message to be processed
-        assertThat(smtpMailsResponseSupplier.get().getList("")).isEmpty();
+        negativeAwait
+            .untilAsserted(() -> assertThat(smtpMailsResponseSupplier.get().getList("")).isEmpty());
     }
 
     @Test
     void shouldNotSendReplyWhenUpdatePartStatOfResource() throws Exception {
-        ResourceAdministrator administrator = new ResourceAdministrator(organizer.id(), "user");
         OpenPaaSDomain openPaaSDomain = domainDAO.retrieve(organizer.username().getDomainPart().get()).block();
         ResourceInsertRequest insertRequest = new ResourceInsertRequest(
-            List.of(administrator),
-            administrator.refId(),
+            organizer.id(),
             "This is a projector made in China",
             openPaaSDomain.id(),
             "projector",
@@ -538,7 +517,7 @@ public class EventReplyEmailConsumerTest {
             .replace("{partStat}", PartStat.NEEDS_ACTION.getValue());
 
         davTestHelper.upsertCalendar(organizer, icalData, eventUid);
-        Fixture.awaitAtMost.untilAsserted(() ->
+        awaitAtMost.untilAsserted(() ->
             assertThat(davTestHelper.findFirstEventId(resourceId, openPaaSDomain.id()))
                 .withFailMessage("Event not created for resource: " + resourceId.value())
                 .isPresent());
@@ -547,8 +526,8 @@ public class EventReplyEmailConsumerTest {
         calDavEventRepository().updatePartStat(openPaaSDomain, resourceId, eventPathId, PartStat.ACCEPTED).block();
 
 
-        Thread.sleep(2000); // Wait for the message to be processed
-        assertThat(smtpMailsResponseSupplier.get().getList("")).isEmpty();
+        negativeAwait
+            .untilAsserted(() -> assertThat(smtpMailsResponseSupplier.get().getList("")).isEmpty());
     }
 
     private CalDavEventRepository calDavEventRepository() throws SSLException {
@@ -564,13 +543,8 @@ public class EventReplyEmailConsumerTest {
             attendee.username().asString(),
             PartStat.NEEDS_ACTION);
         davTestHelper.upsertCalendar(organizer, calendarData, eventUid);
-        String eventDavIdOnAttendee = waitForEventCreation(attendee);
-        String replyData = generateCalendarData(
-            eventUid,
-            organizer.username().asString(),
-            attendee.username().asString(),
-            PartStat.ACCEPTED);
-        davTestHelper.upsertCalendar(attendee, replyData, eventDavIdOnAttendee);
+        waitForEventCreation(attendee);
+        updateAttendeePartStat(eventUid, PartStat.ACCEPTED);
 
         awaitAtMost
             .atMost(Duration.ofSeconds(20))
@@ -582,6 +556,16 @@ public class EventReplyEmailConsumerTest {
     private static final Supplier<JsonPath> smtpMailsResponseSupplier = () -> given(mockSMTPRequestSpecification())
         .get("/smtpMails")
         .jsonPath();
+
+    private void updateAttendeePartStat(String eventUid, PartStat partStat) {
+        try {
+            calDavEventRepository()
+                .updatePartStat(attendee.username(), attendee.id(), new EventUid(eventUid), partStat)
+                .block();
+        } catch (SSLException e) {
+            throw new RuntimeException(e);
+        }
+    }
 
     private String waitForEventCreation(OpenPaaSUser user) {
         awaitAtMost.untilAsserted(() ->

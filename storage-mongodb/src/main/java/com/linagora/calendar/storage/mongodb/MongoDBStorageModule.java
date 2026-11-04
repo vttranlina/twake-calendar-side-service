@@ -23,6 +23,7 @@ import java.io.FileNotFoundException;
 import org.apache.james.core.Domain;
 import org.apache.james.core.healthcheck.HealthCheck;
 import org.apache.james.domainlist.api.DomainList;
+import org.apache.james.events.EventBus;
 import org.apache.james.metrics.api.MetricFactory;
 import org.apache.james.utils.InitializationOperation;
 import org.apache.james.utils.InitilizationOperationBuilder;
@@ -44,8 +45,10 @@ import com.linagora.calendar.storage.OpenPaaSDomainDAO;
 import com.linagora.calendar.storage.OpenPaaSDomainList;
 import com.linagora.calendar.storage.OpenPaaSUserDAO;
 import com.linagora.calendar.storage.ResourceDAO;
+import com.linagora.calendar.storage.TeamCalendarRepository;
 import com.linagora.calendar.storage.UploadedFileDAO;
 import com.linagora.calendar.storage.booking.BookingLinkDAO;
+import com.linagora.calendar.storage.booking.EventBusBookingLinkDAO;
 import com.linagora.calendar.storage.configuration.UserConfigurationDAO;
 import com.linagora.calendar.storage.secretlink.SecretLinkStore;
 import com.linagora.tmail.james.jmap.ticket.TicketStore;
@@ -80,11 +83,13 @@ public class MongoDBStorageModule extends AbstractModule {
 
         bind(ResourceDAO.class).to(MongoDBResourceDAO.class);
 
+        bind(MongoDBTeamCalendarRepository.class).in(Scopes.SINGLETON);
+        bind(TeamCalendarRepository.class).to(MongoDBTeamCalendarRepository.class);
+
         bind(MongoDBTicketDAO.class).in(Scopes.SINGLETON);
         bind(TicketStore.class).to(MongoDBTicketDAO.class);
 
         bind(MongoDBBookingLinkDAO.class).in(Scopes.SINGLETON);
-        bind(BookingLinkDAO.class).to(MongoDBBookingLinkDAO.class);
 
         bind(MongoDBDomainSettingsDAO.class).in(Scopes.SINGLETON);
         bind(DomainSettingsDAO.class).to(MongoDBDomainSettingsDAO.class);
@@ -92,6 +97,12 @@ public class MongoDBStorageModule extends AbstractModule {
         Multibinder.newSetBinder(binder(), HealthCheck.class)
             .addBinding()
             .to(MongoDBHealthCheck.class);
+    }
+
+    @Provides
+    @Singleton
+    BookingLinkDAO bookingLinkDAO(MongoDBBookingLinkDAO delegate, EventBus eventBus) {
+        return new EventBusBookingLinkDAO(delegate, eventBus);
     }
 
     @Provides

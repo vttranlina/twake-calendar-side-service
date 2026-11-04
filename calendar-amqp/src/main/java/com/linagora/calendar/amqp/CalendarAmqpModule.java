@@ -55,10 +55,12 @@ public class CalendarAmqpModule extends AbstractModule {
         bind(EventResourceConsumer.class).in(Scopes.SINGLETON);
         bind(EventCalendarConsumer.class).in(Scopes.SINGLETON);
         bind(EventCalendarNotificationConsumer.class).in(Scopes.SINGLETON);
+        bind(EventContactNotificationConsumer.class).in(Scopes.SINGLETON);
         bind(CalendarDelegatedNotificationConsumer.class).in(Scopes.SINGLETON);
         bind(CalendarListNotificationConsumer.class).in(Scopes.SINGLETON);
         bind(CalendarListNotificationHandler.class).in(Scopes.SINGLETON);
         bind(ItipLocalDeliveryConsumer.class).in(Scopes.SINGLETON);
+        bind(EventAuditLogConsumer.class).in(Scopes.SINGLETON);
 
         Multibinder<HealthCheck> healthCheckMultibinder = Multibinder.newSetBinder(binder(), HealthCheck.class);
         healthCheckMultibinder.addBinding().to(RabbitMQCalendarQueueConsumerHealthCheck.class);
@@ -91,8 +93,8 @@ public class CalendarAmqpModule extends AbstractModule {
     }
 
     @ProvidesIntoSet
-    SimpleConnectionPool.ReconnectionHandler provideReconnectionHandler(EventIndexerReconnectionHandler reconnectionHandler) {
-        return reconnectionHandler;
+    SimpleConnectionPool.ReconnectionHandler provideReconnectionHandler(EventIndexerConsumer consumer) {
+        return new ConsumerReconnectionHandler(consumer::restart, "Error while handle reconnection for disconnector consumer");
     }
 
     @ProvidesIntoSet
@@ -103,8 +105,8 @@ public class CalendarAmqpModule extends AbstractModule {
     }
 
     @ProvidesIntoSet
-    SimpleConnectionPool.ReconnectionHandler provideEventEmailReconnectionHandler(EventEmailReconnectionHandler reconnectionHandler) {
-        return reconnectionHandler;
+    SimpleConnectionPool.ReconnectionHandler provideEventEmailReconnectionHandler(EventEmailConsumer consumer) {
+        return new ConsumerReconnectionHandler(consumer::restart, "Error while handle reconnection for email consumer");
     }
 
     @ProvidesIntoSet
@@ -122,8 +124,8 @@ public class CalendarAmqpModule extends AbstractModule {
     }
 
     @ProvidesIntoSet
-    SimpleConnectionPool.ReconnectionHandler provideEventAlarmReconnectionHandler(EventAlarmReconnectionHandler reconnectionHandler) {
-        return reconnectionHandler;
+    SimpleConnectionPool.ReconnectionHandler provideEventAlarmReconnectionHandler(EventAlarmConsumer consumer) {
+        return new ConsumerReconnectionHandler(consumer::restart, "Error while handle reconnection for disconnector consumer");
     }
 
     @ProvidesIntoSet
@@ -134,8 +136,8 @@ public class CalendarAmqpModule extends AbstractModule {
     }
 
     @ProvidesIntoSet
-    SimpleConnectionPool.ReconnectionHandler provideEventResourceReconnectionHandler(EventResourceReconnectionHandler reconnectionHandler) {
-        return reconnectionHandler;
+    SimpleConnectionPool.ReconnectionHandler provideEventResourceReconnectionHandler(EventResourceConsumer consumer) {
+        return new ConsumerReconnectionHandler(consumer::restart, "Error while handle reconnection for disconnector consumer");
     }
 
     @ProvidesIntoSet
@@ -146,8 +148,8 @@ public class CalendarAmqpModule extends AbstractModule {
     }
 
     @ProvidesIntoSet
-    SimpleConnectionPool.ReconnectionHandler provideCalendarDelegatedNotificationReconnectionHandler(CalendarDelegatedNotificationReconnectionHandler reconnectionHandler) {
-        return reconnectionHandler;
+    SimpleConnectionPool.ReconnectionHandler provideCalendarDelegatedNotificationReconnectionHandler(CalendarDelegatedNotificationConsumer consumer) {
+        return new ConsumerReconnectionHandler(consumer::restart, "Error while handling reconnection for CalendarDelegatedNotificationConsumer");
     }
 
     @ProvidesIntoSet
@@ -158,8 +160,8 @@ public class CalendarAmqpModule extends AbstractModule {
     }
 
     @ProvidesIntoSet
-    SimpleConnectionPool.ReconnectionHandler provideEventCalendarReconnectionHandler(EventCalendarReconnectionHandler reconnectionHandler) {
-        return reconnectionHandler;
+    SimpleConnectionPool.ReconnectionHandler provideEventCalendarReconnectionHandler(EventCalendarConsumer consumer) {
+        return new ConsumerReconnectionHandler(consumer::restart, "Error while handle reconnection for disconnector consumer");
     }
 
     @ProvidesIntoSet
@@ -170,8 +172,8 @@ public class CalendarAmqpModule extends AbstractModule {
     }
 
     @ProvidesIntoSet
-    SimpleConnectionPool.ReconnectionHandler provideEventCalendarNotificationReconnectionHandler(EventCalendarNotificationReconnectionHandler reconnectionHandler) {
-        return reconnectionHandler;
+    SimpleConnectionPool.ReconnectionHandler provideEventCalendarNotificationReconnectionHandler(EventCalendarNotificationConsumer consumer) {
+        return new ConsumerReconnectionHandler(consumer::restart, "Error while handle reconnection for EventCalendarNotificationConsumer");
     }
 
     @ProvidesIntoSet
@@ -182,8 +184,20 @@ public class CalendarAmqpModule extends AbstractModule {
     }
 
     @ProvidesIntoSet
-    SimpleConnectionPool.ReconnectionHandler provideCalendarListNotificationReconnectionHandler(CalendarListNotificationReconnectionHandler reconnectionHandler) {
-        return reconnectionHandler;
+    SimpleConnectionPool.ReconnectionHandler provideEventContactNotificationReconnectionHandler(EventContactNotificationConsumer consumer) {
+        return new ConsumerReconnectionHandler(consumer::restart, "Error while handling reconnection for EventContactNotificationConsumer");
+    }
+
+    @ProvidesIntoSet
+    public InitializationOperation initializeEventContactNotificationConsumer(EventContactNotificationConsumer instance) {
+        return InitilizationOperationBuilder
+            .forClass(EventContactNotificationConsumer.class)
+            .init(instance::init);
+    }
+
+    @ProvidesIntoSet
+    SimpleConnectionPool.ReconnectionHandler provideCalendarListNotificationReconnectionHandler(CalendarListNotificationConsumer consumer) {
+        return new ConsumerReconnectionHandler(consumer::restart, "Error while handle reconnection for CalendarListNotificationConsumer");
     }
 
     @ProvidesIntoSet
@@ -194,14 +208,26 @@ public class CalendarAmqpModule extends AbstractModule {
     }
 
     @ProvidesIntoSet
-    SimpleConnectionPool.ReconnectionHandler provideItipLocalDeliveryReconnectionHandler(ItipLocalDeliveryReconnectionHandler reconnectionHandler) {
-        return reconnectionHandler;
+    SimpleConnectionPool.ReconnectionHandler provideItipLocalDeliveryReconnectionHandler(ItipLocalDeliveryConsumer consumer) {
+        return new ConsumerReconnectionHandler(consumer::restart, "Error while handling reconnection for ItipLocalDeliveryConsumer");
     }
 
     @ProvidesIntoSet
     public InitializationOperation initializeItipLocalDeliveryConsumer(ItipLocalDeliveryConsumer instance) {
         return InitilizationOperationBuilder
             .forClass(ItipLocalDeliveryConsumer.class)
+            .init(instance::init);
+    }
+
+    @ProvidesIntoSet
+    SimpleConnectionPool.ReconnectionHandler provideEventAuditLogReconnectionHandler(EventAuditLogConsumer consumer) {
+        return new ConsumerReconnectionHandler(consumer::restart, "Error while handle reconnection for audit log consumer");
+    }
+
+    @ProvidesIntoSet
+    public InitializationOperation initializeEventAuditLogConsumer(EventAuditLogConsumer instance) {
+        return InitilizationOperationBuilder
+            .forClass(EventAuditLogConsumer.class)
             .init(instance::init);
     }
 

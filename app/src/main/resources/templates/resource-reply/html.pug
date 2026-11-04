@@ -163,7 +163,7 @@ div(style='')
                                             a.link(href=`//${content.event.location.value}` style='text-decoration: none; color: #4d91c9;') #{content.event.location.value}
                                         else
                                           | #{content.event.location.value} (
-                                          a(href=`https://www.openstreetmap.org/search?query=${content.event.location.value}`) #{translator.get('see_in_map')}
+                                          a(href=`https://www.openstreetmap.org/search?query=${content.event.location.urlEncodedValue}`) #{translator.get('see_in_map')}
                                           | )
                                   if (content.event.videoConferenceLink)
                                     tr
@@ -187,7 +187,7 @@ div(style='')
                                     tr
                                       td(valign='top')
                                         strong #{translator.get('notes')}
-                                      td #{content.event.description}
+                                      td(style='white-space: pre-line;') #{content.event.description}
                       //if mso | IE
             //if mso | IE
   //if mso | IE

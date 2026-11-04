@@ -26,4 +26,6 @@ public interface DomainSettingsDAO {
     Mono<DomainSettings> retrieve(Domain domain);
 
     Mono<Void> save(Domain domain, DomainSettings settings);
+
+    Mono<Void> patch(Domain domain, DomainSettingsPatch patch);
 }

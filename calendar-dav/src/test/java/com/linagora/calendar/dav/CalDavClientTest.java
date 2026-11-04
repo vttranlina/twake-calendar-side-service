@@ -24,14 +24,22 @@ import static net.javacrumbs.jsonunit.assertj.JsonAssertions.assertThatJson;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
+import java.net.URI;
 import java.nio.charset.StandardCharsets;
+import java.time.Clock;
 import java.time.Instant;
 import java.util.List;
+import java.util.Map;
+import java.util.Optional;
 import java.util.UUID;
+import java.util.function.Function;
 
 import javax.net.ssl.SSLException;
 
 import org.apache.commons.lang3.StringUtils;
+import org.apache.james.core.Username;
+import org.bson.Document;
+import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -41,8 +49,11 @@ import org.testcontainers.shaded.com.google.common.collect.ImmutableList;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.linagora.calendar.api.CalendarUtil;
+import com.linagora.calendar.dav.CalDavClient.CalendarAccess;
+import com.linagora.calendar.dav.CalDavClient.CalendarPropertiesUpdate;
 import com.linagora.calendar.dav.CalDavClient.NewCalendar;
 import com.linagora.calendar.dav.FreeBusyQueryResponseObject.BusyInterval;
+import com.linagora.calendar.dav.dto.CalendarDetailsResponse;
 import com.linagora.calendar.dav.dto.CalendarReportJsonResponse;
 import com.linagora.calendar.dav.dto.CalendarReportXmlResponse;
 import com.linagora.calendar.dav.dto.CalendarReportXmlResponse.CalendarObject;
@@ -54,19 +65,33 @@ import com.linagora.calendar.storage.MailboxSessionUtil;
 import com.linagora.calendar.storage.OpenPaaSDomain;
 import com.linagora.calendar.storage.OpenPaaSId;
 import com.linagora.calendar.storage.OpenPaaSUser;
+import com.linagora.calendar.storage.ResourceInsertRequest;
+import com.linagora.calendar.storage.TeamCalendarInsertRequest;
+import com.linagora.calendar.storage.model.ResourceId;
+import com.linagora.calendar.storage.model.TeamCalendar;
 import com.linagora.calendar.storage.mongodb.MongoDBOpenPaaSDomainDAO;
+import com.linagora.calendar.storage.mongodb.MongoDBResourceDAO;
+import com.linagora.calendar.storage.mongodb.MongoDBTeamCalendarRepository;
+import com.mongodb.reactivestreams.client.MongoClient;
+import com.mongodb.reactivestreams.client.MongoClients;
+import com.mongodb.reactivestreams.client.MongoDatabase;
 
 import net.fortuna.ical4j.model.Calendar;
 import net.fortuna.ical4j.model.Component;
+import net.fortuna.ical4j.model.Property;
+import net.fortuna.ical4j.model.PropertyList;
 import net.fortuna.ical4j.model.component.VEvent;
+import reactor.core.publisher.Mono;
 
 public class CalDavClientTest {
+    private static final String SABRE_DATABASE = "sabre";
 
     @RegisterExtension
-    static SabreDavExtension sabreDavExtension = new SabreDavExtension(DockerSabreDavSetup.SINGLETON);
+    static SabreDavExtension sabreDavExtension = SabreDavExtension.shared();
     private static DavTestHelper davTestHelper;
 
     private CalDavClient testee;
+    private MongoClient sabreMongoClient;
 
     @BeforeAll
     static void setUp() throws SSLException {
@@ -78,8 +103,38 @@ public class CalDavClientTest {
         testee = new CalDavClient(sabreDavExtension.dockerSabreDavSetup().davConfiguration(), TECHNICAL_TOKEN_SERVICE_TESTING);
     }
 
+    @AfterEach
+    void tearDownEach() {
+        if (sabreMongoClient != null) {
+            sabreMongoClient.close();
+            sabreMongoClient = null;
+        }
+    }
+
     private OpenPaaSUser createOpenPaaSUser() {
         return sabreDavExtension.newTestUser();
+    }
+
+    private OpenPaaSId retrieveDefaultDomainId() {
+        return sabreDavExtension.dockerSabreDavSetup()
+            .getOpenPaaSProvisioningService()
+            .getDomain()
+            .map(OpenPaaSDomain::id)
+            .block();
+    }
+
+    private long countCalendarInstances(String principalUri) {
+        return Mono.from(sabreMongoDB()
+                .getCollection("calendarinstances")
+                .countDocuments(new Document("principaluri", principalUri)))
+            .block();
+    }
+
+    private MongoDatabase sabreMongoDB() {
+        if (sabreMongoClient == null) {
+            sabreMongoClient = MongoClients.create(sabreDavExtension.dockerSabreDavSetup().getMongoDbIpAddress().toString());
+        }
+        return sabreMongoClient.getDatabase(SABRE_DATABASE);
     }
 
     @Test
@@ -172,7 +227,19 @@ public class CalDavClientTest {
         Calendar calendar = CalendarUtil.parseIcs(ics.getBytes(StandardCharsets.UTF_8));
         VEvent expected = (VEvent) calendar.getComponent(Component.VEVENT).get();
 
-        assertThat((VEvent) exportedCalendar.getComponent(Component.VEVENT).get()).isEqualTo(expected);
+        Function<VEvent, VEvent> withoutAlarmUid = vEvent -> {
+            VEvent copy = vEvent.copy();
+            copy.getComponentList()
+                .getComponents(Component.VALARM)
+                .forEach(alarm -> alarm.setPropertyList(new PropertyList(alarm.getProperties()
+                    .stream()
+                    .filter(property -> !property.getName().equals(Property.UID))
+                    .toList())));
+            return copy;
+        };
+
+        assertThat(withoutAlarmUid.apply((VEvent) exportedCalendar.getComponent(Component.VEVENT).get()))
+            .isEqualTo(withoutAlarmUid.apply(expected));
     }
 
     @Test
@@ -249,6 +316,28 @@ public class CalDavClientTest {
 
         assertThatThrownBy(() -> testee.findUserCalendars(user.username(), new OpenPaaSId("invalid")).collectList().block())
             .isInstanceOf(DavClientException.class);
+    }
+
+    @Test
+    void fetchCalendarDetailsShouldReturnCalendarDetails() {
+        OpenPaaSUser owner = createOpenPaaSUser();
+        OpenPaaSUser delegate = createOpenPaaSUser();
+        String calendarId = UUID.randomUUID().toString();
+        CalendarURL calendarURL = new CalendarURL(owner.id(), new OpenPaaSId(calendarId));
+        String delegateMailto = "mailto:" + delegate.username().asString();
+        CalendarSharingUpdate sharingUpdate = CalendarSharingUpdate.grant(
+            CalendarSharingUpdate.AddSharee.of(delegateMailto, DavRight.READ_WRITE));
+
+        testee.createNewCalendar(owner.username(), owner.id(), new NewCalendar(calendarId, "Shared calendar", "#0000FF", "")).block();
+        testee.updateCalendarShares(owner.username(), calendarURL, sharingUpdate).block();
+
+        CalendarDetailsResponse response = testee.fetchCalendarDetails(retrieveDefaultDomainId(), calendarURL, Map.of("withRights", "true")).block();
+
+        assertThat(response.invites())
+            .anySatisfy(invite -> {
+                assertThat(invite.href()).isEqualTo(delegateMailto);
+                assertThat(invite.access()).contains(3);
+            });
     }
 
     @Test
@@ -474,6 +563,40 @@ public class CalDavClientTest {
         List<CalendarURL> uris = testee.findUserCalendars(user.username(), user.id()).collectList().block();
 
         assertThat(uris).containsExactlyInAnyOrder(CalendarURL.from(user.id()), anotherCalendarURL);
+    }
+
+    @Test
+    void deleteCalendarHomeShouldDeleteTeamCalendarHome() {
+        OpenPaaSUser member = createOpenPaaSUser();
+        OpenPaaSDomain domain = sabreDavExtension.dockerSabreDavSetup()
+            .getOpenPaaSProvisioningService()
+            .getDomain()
+            .block();
+        TeamCalendar teamCalendar = new MongoDBTeamCalendarRepository(sabreDavExtension.dockerSabreDavSetup().getMongoDB(), Clock.systemUTC())
+            .create(new TeamCalendarInsertRequest(domain, "team-" + UUID.randomUUID(), "Team Calendar"))
+            .block();
+        OpenPaaSId calendarId = teamCalendar.id().asOpenPaaSId();
+        CalendarURL teamCalendarURL = CalendarURL.from(calendarId);
+        String teamCalendarPrincipalUri = "principals/team-calendars/" + teamCalendar.id().value();
+        CalendarSharingUpdate sharingUpdate = CalendarSharingUpdate.grant(member.username(), DavRight.READ_WRITE);
+
+        testee.updateCalendarShares(domain.id(), teamCalendarURL, sharingUpdate).block();
+
+        assertThat(countCalendarInstances(teamCalendarPrincipalUri))
+            .isPositive();
+
+        testee.deleteCalendarHome(domain.id(), calendarId).block();
+
+        assertThat(countCalendarInstances(teamCalendarPrincipalUri))
+            .isZero();
+    }
+
+    @Test
+    void deleteCalendarHomeShouldNotThrowWhenCalendarHomeDoesNotExist() {
+        createOpenPaaSUser();
+        OpenPaaSId domainId = retrieveDefaultDomainId();
+
+        testee.deleteCalendarHome(domainId, new OpenPaaSId(UUID.randomUUID().toString().replace("-", "").substring(0, 24))).block();
     }
 
     @Test
@@ -1039,6 +1162,58 @@ public class CalDavClientTest {
     }
 
     @Test
+    void calendarQueryReportXmlShouldQueryResourceCalendar() {
+        // Given a resource calendar already contains an event.
+        OpenPaaSUser admin = createOpenPaaSUser();
+        OpenPaaSDomain domain = new MongoDBOpenPaaSDomainDAO(sabreDavExtension.dockerSabreDavSetup().getMongoDB())
+            .retrieve(admin.username().getDomainPart().get())
+            .block();
+        ResourceId resourceId = new MongoDBResourceDAO(sabreDavExtension.dockerSabreDavSetup().getMongoDB(), Clock.systemUTC())
+            .insert(new ResourceInsertRequest(
+                admin.id(),
+                "Resource calendar used by CalDAV REPORT tests",
+                domain.id(),
+                "projector",
+                "Projector"))
+            .block();
+        String uid = UUID.randomUUID().toString();
+        String resourceEmail = Username.fromLocalPartWithDomain(resourceId.value(), domain.domain()).asString();
+        String ics = """
+            BEGIN:VCALENDAR
+            VERSION:2.0
+            CALSCALE:GREGORIAN
+            PRODID:-//SabreDAV//SabreDAV 3.2.2//EN
+            BEGIN:VEVENT
+            UID:%s
+            DTSTAMP:20250101T100000Z
+            DTSTART:20250102T120000Z
+            DTEND:20250102T130000Z
+            SUMMARY:Test Event
+            ORGANIZER:mailto:%s
+            ATTENDEE;PARTSTAT=TENTATIVE;RSVP=TRUE;ROLE=REQ-PARTICIPANT;CUTYPE=RESOURCE;CN=Projector:mailto:%s
+            END:VEVENT
+            END:VCALENDAR
+            """.formatted(uid, admin.username().asString(), resourceEmail);
+
+        CalendarURL resourceCalendarURL = CalendarURL.from(resourceId.asOpenPaaSId());
+        URI resourceEventUri = URI.create("/calendars/" + resourceId.value() + "/" + resourceId.value() + "/" + uid + ".ics");
+        davTestHelper.upsertCalendar(domain.id(), resourceEventUri, ics).block();
+        String resourceEventId = uid;
+
+        // When querying the resource calendar through the domain technical token.
+        List<CalendarObject> items = testee.calendarQueryReportXml(domain.id(), resourceCalendarURL, CalendarQuery.ofFilters())
+            .block()
+            .extractCalendarObjects();
+
+        // Then the REPORT returns the resource calendar object created by SabreDAV.
+        assertThat(items).hasSize(1);
+        assertThat(items).extracting(calendarObject -> calendarObject.href().toString())
+            .containsExactly("/calendars/" + resourceId.value() + "/" + resourceId.value() + "/" + resourceEventId + ".ics");
+        assertThat(items).extracting(CalendarObject::calendarData)
+            .anySatisfy(calendarData -> assertThat(calendarData).contains("UID:" + uid));
+    }
+
+    @Test
     void findBusyIntervalsShouldReturnOnlyOpaqueEventsOverlappingRange() {
         // GIVEN: A calendar containing one OPAQUE event and one TRANSPARENT event
         OpenPaaSUser user = createOpenPaaSUser();
@@ -1414,5 +1589,150 @@ public class CalDavClientTest {
         OpenPaaSUser otherUser = createOpenPaaSUser();
 
         assertThat(testee.calendarExists(otherUser.username(), CalendarURL.from(user.id())).block()).isFalse();
+    }
+
+    @Test
+    void updateCalendarPropertiesShouldUpdateProvidedProperties() {
+        OpenPaaSUser user = createOpenPaaSUser();
+        String calendarId = UUID.randomUUID().toString();
+        testee.createNewCalendar(user.username(), user.id(), new NewCalendar(calendarId, "Original name", "#000000", "Original description")).block();
+        CalendarURL calendarURL = new CalendarURL(user.id(), new OpenPaaSId(calendarId));
+
+        testee.updateCalendarProperties(user.username(), calendarURL,
+            new CalendarPropertiesUpdate(Optional.of("Updated name"), Optional.of("#FF0000"), Optional.of("Updated description"))).block();
+
+        String metadata = davTestHelper.getCalendarMetadata(user, new OpenPaaSId(calendarId)).block();
+        assertThatJson(metadata).node("dav:name").isEqualTo("Updated name");
+        assertThatJson(metadata).node("apple:color").isEqualTo("#FF0000");
+        assertThatJson(metadata).node("caldav:description").isEqualTo("Updated description");
+    }
+
+    @Test
+    void updateCalendarPropertiesShouldNotAlterAbsentProperties() {
+        OpenPaaSUser user = createOpenPaaSUser();
+        String calendarId = UUID.randomUUID().toString();
+        testee.createNewCalendar(user.username(), user.id(), new NewCalendar(calendarId, "Original name", "#000000", "Original description")).block();
+        CalendarURL calendarURL = new CalendarURL(user.id(), new OpenPaaSId(calendarId));
+
+        testee.updateCalendarProperties(user.username(), calendarURL,
+            CalendarPropertiesUpdate.withName("Updated name")).block();
+
+        String metadata = davTestHelper.getCalendarMetadata(user, new OpenPaaSId(calendarId)).block();
+        assertThatJson(metadata).node("dav:name").isEqualTo("Updated name");
+        assertThatJson(metadata).node("apple:color").isEqualTo("#000000");
+        assertThatJson(metadata).node("caldav:description").isEqualTo("Original description");
+    }
+
+    @Test
+    void updateCalendarPropertiesShouldThrowWhenCalendarDoesNotExist() {
+        OpenPaaSUser user = createOpenPaaSUser();
+        CalendarURL calendarURL = new CalendarURL(user.id(), new OpenPaaSId(UUID.randomUUID().toString()));
+
+        assertThatThrownBy(() -> testee.updateCalendarProperties(user.username(), calendarURL,
+            CalendarPropertiesUpdate.withName("Updated name")).block())
+            .isInstanceOf(CalendarNotFoundException.class);
+    }
+
+    @Test
+    void updateCalendarSharesShouldGrantDelegation() {
+        OpenPaaSUser owner = createOpenPaaSUser();
+        OpenPaaSUser delegate = createOpenPaaSUser();
+        String calendarId = UUID.randomUUID().toString();
+        testee.createNewCalendar(owner.username(), owner.id(), new NewCalendar(calendarId, "Shared calendar", "#0000FF", "")).block();
+        CalendarURL calendarURL = new CalendarURL(owner.id(), new OpenPaaSId(calendarId));
+
+        testee.updateCalendarShares(owner.username(), calendarURL,
+            CalendarSharingUpdate.grant(delegate.username(), DavRight.READ_WRITE)).block();
+
+        assertThat(testee.findUserCalendars(delegate.username(), delegate.id()).collectList().block())
+            .anyMatch(url -> !url.calendarId().equals(delegate.id()));
+    }
+
+    @Test
+    void updateCalendarSharesShouldRevokeDelegation() {
+        OpenPaaSUser owner = createOpenPaaSUser();
+        OpenPaaSUser delegate = createOpenPaaSUser();
+        String calendarId = UUID.randomUUID().toString();
+        testee.createNewCalendar(owner.username(), owner.id(), new NewCalendar(calendarId, "Shared calendar", "#0000FF", "")).block();
+        CalendarURL calendarURL = new CalendarURL(owner.id(), new OpenPaaSId(calendarId));
+        testee.updateCalendarShares(owner.username(), calendarURL,
+            CalendarSharingUpdate.grant(delegate.username(), DavRight.READ_WRITE)).block();
+
+        testee.updateCalendarShares(owner.username(), calendarURL,
+            CalendarSharingUpdate.revoke(delegate.username())).block();
+
+        assertThat(testee.findUserCalendars(delegate.username(), delegate.id()).collectList().block())
+            .allMatch(url -> url.calendarId().equals(delegate.id()));
+    }
+
+    @Test
+    void resolveCalendarAccessShouldReturnWritableForOwnCalendar() {
+        OpenPaaSUser user = createOpenPaaSUser();
+        CalendarURL calendarURL = CalendarURL.from(user.id());
+
+        assertThat(testee.resolveCalendarAccess(user.username(), calendarURL).block()).isEqualTo(CalendarAccess.WRITABLE);
+    }
+
+    @Test
+    void resolveCalendarAccessShouldReturnNotFoundForNonExistingCalendar() {
+        OpenPaaSUser user = createOpenPaaSUser();
+        CalendarURL calendarURL = new CalendarURL(user.id(), new OpenPaaSId(UUID.randomUUID().toString()));
+
+        assertThat(testee.resolveCalendarAccess(user.username(), calendarURL).block()).isEqualTo(CalendarAccess.NOT_FOUND);
+    }
+
+    @Test
+    void resolveCalendarAccessShouldReturnWritableForReadWriteDelegatedCalendar() {
+        OpenPaaSUser owner = createOpenPaaSUser();
+        OpenPaaSUser delegate = createOpenPaaSUser();
+        CalendarURL delegatedCalendar = shareCalendar(owner, delegate,
+            CalendarSharingUpdate.AddSharee.of(delegate.username(), DavRight.READ_WRITE));
+
+        assertThat(testee.resolveCalendarAccess(delegate.username(), delegatedCalendar).block()).isEqualTo(CalendarAccess.WRITABLE);
+    }
+
+    @Test
+    void resolveCalendarAccessShouldReturnReadOnlyForReadOnlyDelegatedCalendar() {
+        OpenPaaSUser owner = createOpenPaaSUser();
+        OpenPaaSUser delegate = createOpenPaaSUser();
+        CalendarURL delegatedCalendar = shareCalendar(owner, delegate,
+            CalendarSharingUpdate.AddSharee.of(delegate.username(), DavRight.READ));
+
+        assertThat(testee.resolveCalendarAccess(delegate.username(), delegatedCalendar).block()).isEqualTo(CalendarAccess.READ_ONLY);
+    }
+
+    @Test
+    void resolveCalendarAccessShouldReturnWritableForAdministrationDelegatedCalendar() {
+        OpenPaaSUser owner = createOpenPaaSUser();
+        OpenPaaSUser delegate = createOpenPaaSUser();
+        CalendarURL delegatedCalendar = shareCalendar(owner, delegate,
+            CalendarSharingUpdate.AddSharee.of(delegate.username(), DavRight.ADMINISTRATION));
+
+        assertThat(testee.resolveCalendarAccess(delegate.username(), delegatedCalendar).block()).isEqualTo(CalendarAccess.WRITABLE);
+    }
+
+    private CalendarURL shareCalendar(OpenPaaSUser owner, OpenPaaSUser delegate, CalendarSharingUpdate.AddSharee sharee) {
+        String calendarId = UUID.randomUUID().toString();
+        testee.createNewCalendar(owner.username(), owner.id(), new NewCalendar(calendarId, "Shared calendar", "#0000FF", "")).block();
+        CalendarURL calendarURL = new CalendarURL(owner.id(), new OpenPaaSId(calendarId));
+
+        testee.updateCalendarShares(owner.username(), calendarURL,
+            CalendarSharingUpdate.grant(sharee)).block();
+
+        return testee.findUserCalendars(delegate.username(), delegate.id()).collectList().block().stream()
+            .filter(url -> !url.calendarId().equals(delegate.id()))
+            .findFirst()
+            .orElseThrow();
+    }
+
+    @Test
+    void updateCalendarSharesShouldThrowWhenCalendarDoesNotExist() {
+        OpenPaaSUser owner = createOpenPaaSUser();
+        OpenPaaSUser delegate = createOpenPaaSUser();
+        CalendarURL calendarURL = new CalendarURL(owner.id(), new OpenPaaSId(UUID.randomUUID().toString()));
+
+        assertThatThrownBy(() -> testee.updateCalendarShares(owner.username(), calendarURL,
+            CalendarSharingUpdate.grant(delegate.username(), DavRight.READ)).block())
+            .isInstanceOf(CalendarNotFoundException.class);
     }
 }

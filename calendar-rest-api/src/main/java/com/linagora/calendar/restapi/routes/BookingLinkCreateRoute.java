@@ -41,15 +41,23 @@ import org.apache.james.mailbox.MailboxSession;
 import org.apache.james.metrics.api.MetricFactory;
 
 import com.fasterxml.jackson.annotation.JsonProperty;
+import com.fasterxml.jackson.databind.JsonNode;
 import com.google.common.base.Preconditions;
 import com.google.common.base.Strings;
 import com.linagora.calendar.api.booking.AvailabilityRule;
 import com.linagora.calendar.api.booking.AvailabilityRules;
 import com.linagora.calendar.dav.CalDavClient;
+import com.linagora.calendar.restapi.ForbiddenException;
 import com.linagora.calendar.restapi.routes.dto.AvailabilityRuleDTO;
+import com.linagora.calendar.restapi.routes.dto.BookingLinkAlarmDTO;
 import com.linagora.calendar.storage.CalendarURL;
+import com.linagora.calendar.storage.booking.BookingLinkColorUtil;
 import com.linagora.calendar.storage.booking.BookingLinkDAO;
+import com.linagora.calendar.storage.booking.BookingLinkExtraAttendeeUtil;
 import com.linagora.calendar.storage.booking.BookingLinkInsertRequest;
+import com.linagora.calendar.storage.booking.BookingLinkResourceUtil;
+import com.linagora.calendar.storage.booking.EventTransparency;
+import com.linagora.calendar.storage.booking.EventVisibility;
 import com.linagora.calendar.storage.configuration.resolver.BusinessHoursSettingReader;
 import com.linagora.calendar.storage.configuration.resolver.SettingsBasedResolver;
 
@@ -64,7 +72,17 @@ public class BookingLinkCreateRoute extends CalendarRoute {
     public record CreateBookingLinkRequestDTO(@JsonProperty("calendarUrl") String calendarUrl,
                                               @JsonProperty("durationMinutes") Integer durationMinutes,
                                               @JsonProperty("active") Boolean active,
-                                              @JsonProperty("availabilityRules") Optional<List<AvailabilityRuleDTO>> availabilityRules) {
+                                              @JsonProperty("autoAccept") Optional<Boolean> autoAccept,
+                                              @JsonProperty("availabilityRules") Optional<List<AvailabilityRuleDTO>> availabilityRules,
+                                              @JsonProperty("extraAttendees") Optional<JsonNode> extraAttendees,
+                                              @JsonProperty("name") Optional<String> name,
+                                              @JsonProperty("description") Optional<String> description,
+                                              @JsonProperty("color") Optional<String> color,
+                                              @JsonProperty("location") Optional<String> location,
+                                              @JsonProperty("visibility") Optional<String> visibility,
+                                              @JsonProperty("transparency") Optional<String> transparency,
+                                              @JsonProperty("resources") Optional<List<String>> resources,
+                                              @JsonProperty("alarm") Optional<List<BookingLinkAlarmDTO>> alarm) {
 
         public static BookingLinkInsertRequest toBookingLinkInsertRequest(CreateBookingLinkRequestDTO request,
                                                                           ZoneId defaultZone,
@@ -79,7 +97,19 @@ public class BookingLinkCreateRoute extends CalendarRoute {
 
             Optional<AvailabilityRules> availabilityRules = getAvailabilityRules(request, defaultZone).or(() -> defaultAvailabilityRules);
 
-            return new BookingLinkInsertRequest(calendarURL, duration, request.active, availabilityRules);
+            return new BookingLinkInsertRequest(calendarURL, duration, request.active,
+                request.autoAccept.orElse(BookingLinkInsertRequest.AUTO_ACCEPT), availabilityRules,
+                BookingLinkExtraAttendeeUtil.parse(request.extraAttendees),
+                normalize(request.name), normalize(request.description), BookingLinkColorUtil.sanitize(request.color),
+                normalize(request.location),
+                normalize(request.visibility).map(EventVisibility::fromString),
+                normalize(request.transparency).map(EventTransparency::fromString),
+                BookingLinkResourceUtil.parse(request.resources),
+                BookingLinkAlarmDTO.toBookingLinkAlarms(request.alarm));
+        }
+
+        private static Optional<String> normalize(Optional<String> value) {
+            return value.map(String::trim).filter(s -> !s.isEmpty());
         }
 
         private static Optional<AvailabilityRules> getAvailabilityRules(CreateBookingLinkRequestDTO request, ZoneId defaultZone) {
@@ -98,17 +128,23 @@ public class BookingLinkCreateRoute extends CalendarRoute {
     private final BookingLinkDAO bookingLinkDAO;
     private final CalDavClient calDavClient;
     private final SettingsBasedResolver settingsResolver;
+    private final BookingLinkExtraAttendeeResolver extraAttendeeResolver;
+    private final BookingLinkResourceResolver resourceResolver;
 
     @Inject
     public BookingLinkCreateRoute(Authenticator authenticator,
                                   MetricFactory metricFactory,
                                   BookingLinkDAO bookingLinkDAO,
                                   CalDavClient calDavClient,
-                                  @Named("businessHours") SettingsBasedResolver settingsResolver) {
+                                  @Named("businessHours") SettingsBasedResolver settingsResolver,
+                                  BookingLinkExtraAttendeeResolver extraAttendeeResolver,
+                                  BookingLinkResourceResolver resourceResolver) {
         super(authenticator, metricFactory);
         this.bookingLinkDAO = bookingLinkDAO;
         this.calDavClient = calDavClient;
         this.settingsResolver = settingsResolver;
+        this.extraAttendeeResolver = extraAttendeeResolver;
+        this.resourceResolver = resourceResolver;
     }
 
     @Override
@@ -126,6 +162,8 @@ public class BookingLinkCreateRoute extends CalendarRoute {
                     CreateBookingLinkRequestDTO.toBookingLinkInsertRequest(dto, resolvedSettings.zoneId(), getDefaultAvailabilityRules(resolvedSettings))))
             .flatMap(insertRequest ->
                 validateCalendarAccess(insertRequest.calendarUrl(), session)
+                    .then(extraAttendeeResolver.validate(session.getUser(), insertRequest.extraAttendees().participants()))
+                    .then(resourceResolver.validate(session.getUser(), insertRequest.resources()))
                     .thenReturn(insertRequest))
             .flatMap(insertRequest -> bookingLinkDAO.insert(session.getUser(), insertRequest))
             .flatMap(bookingLink -> response.status(HttpResponseStatus.CREATED)
@@ -136,12 +174,11 @@ public class BookingLinkCreateRoute extends CalendarRoute {
     }
 
     private Mono<Void> validateCalendarAccess(CalendarURL calendarURL, MailboxSession session) {
-        return calDavClient.calendarExists(session.getUser(), calendarURL)
-            .flatMap(exists -> {
-                if (exists) {
-                    return Mono.empty();
-                }
-                return Mono.error(new IllegalArgumentException("Calendar not found or access denied: " + calendarURL.asUri()));
+        return calDavClient.resolveCalendarAccess(session.getUser(), calendarURL)
+            .flatMap(access -> switch (access) {
+                case WRITABLE -> Mono.<Void>empty();
+                case READ_ONLY -> Mono.error(new ForbiddenException("User does not have write access to calendar: " + calendarURL.asUri()));
+                case NOT_FOUND -> Mono.error(new IllegalArgumentException("Calendar not found or access denied: " + calendarURL.asUri()));
             });
     }
 

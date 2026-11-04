@@ -20,7 +20,6 @@ package com.linagora.calendar.amqp.model;
 
 import static com.linagora.calendar.storage.event.EventParseUtils.DuplicateAttendeePolicy.KEEP_FIRST;
 
-import java.nio.charset.StandardCharsets;
 import java.time.ZoneId;
 import java.time.ZonedDateTime;
 import java.util.List;
@@ -42,14 +41,10 @@ import com.linagora.calendar.storage.event.EventParseUtils;
 import net.fortuna.ical4j.model.Calendar;
 import net.fortuna.ical4j.model.Component;
 import net.fortuna.ical4j.model.component.VEvent;
-import net.fortuna.ical4j.model.property.Method;
 
 public record CalendarEventNotificationEmail(MailAddress senderEmail,
                                              MailAddress recipientEmail,
-                                             Method method,
                                              Calendar event,
-                                             boolean notifyEvent,
-                                             String calendarURI,
                                              String eventPath) {
 
     public static final Function<Calendar, VEvent> GET_FIRST_VEVENT_FUNCTION =
@@ -61,10 +56,7 @@ public record CalendarEventNotificationEmail(MailAddress senderEmail,
         return new CalendarEventNotificationEmail(
             dto.senderEmail(),
             dto.recipientEmail(),
-            dto.method(),
             dto.event(),
-            dto.notifyEvent(),
-            dto.calendarURI(),
             dto.eventPath()
         );
     }
@@ -77,7 +69,7 @@ public record CalendarEventNotificationEmail(MailAddress senderEmail,
         List<EventFields.Person> resourceList = EventParseUtils.getResources(vEvent, KEEP_FIRST);
 
         ImmutableMap.Builder<String, Object> eventBuilder = ImmutableMap.builder();
-        eventBuilder.put("organizer", toPugModel(EventParseUtils.getOrganizer(vEvent)))
+        eventBuilder.put("organizer", PersonModel.from(EventParseUtils.getOrganizer(vEvent)).toPugModel())
             .put("attendees", toPeoplePugModel(attendees))
             .put("summary", summary)
             .put("allDay", EventParseUtils.isAllDay(vEvent))
@@ -102,10 +94,6 @@ public record CalendarEventNotificationEmail(MailAddress senderEmail,
         return people.stream()
             .collect(ImmutableMap.toImmutableMap(person -> person.email().asString(),
                 this::toPugModel));
-    }
-
-    public byte[] eventAsBytes() {
-        return event().toString().getBytes(StandardCharsets.UTF_8);
     }
 
     public VEvent getFirstVEvent() {

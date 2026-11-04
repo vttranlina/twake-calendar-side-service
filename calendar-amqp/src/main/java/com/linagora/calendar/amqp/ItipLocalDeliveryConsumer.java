@@ -19,28 +19,26 @@
 package com.linagora.calendar.amqp;
 
 import static com.linagora.calendar.amqp.CalendarAmqpModule.INJECT_KEY_DAV;
-import static org.apache.james.backends.rabbitmq.Constants.DURABLE;
 import static org.apache.james.backends.rabbitmq.Constants.EMPTY_ROUTING_KEY;
 import static org.apache.james.util.ReactorUtils.DEFAULT_CONCURRENCY;
 
 import java.io.Closeable;
 import java.net.URI;
+import java.time.Clock;
 import java.util.List;
 import java.util.Locale;
-import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
 import java.util.function.Supplier;
 import java.util.stream.Collectors;
 
+import jakarta.annotation.PreDestroy;
 import jakarta.inject.Inject;
 
 import org.apache.commons.lang3.StringUtils;
 import org.apache.commons.lang3.Strings;
 import org.apache.james.backends.rabbitmq.QueueArguments;
-import org.apache.james.backends.rabbitmq.QueueArguments.Builder;
 import org.apache.james.backends.rabbitmq.ReactorRabbitMQChannelPool;
-import org.apache.james.backends.rabbitmq.ReceiverProvider;
 import org.apache.james.core.MailAddress;
 import org.apache.james.core.Username;
 import org.apache.james.lifecycle.api.Startable;
@@ -57,6 +55,8 @@ import com.linagora.calendar.dav.dto.CalendarReportJsonResponse;
 import com.linagora.calendar.storage.CalendarURL;
 import com.linagora.calendar.storage.OpenPaaSId;
 import com.linagora.calendar.storage.event.EventParseUtils;
+import com.linagora.tmail.rabbitmq.ManagedRabbitMQConsumer;
+import com.linagora.tmail.rabbitmq.QueueDeclaration;
 import com.rabbitmq.client.BuiltinExchangeType;
 
 import net.fortuna.ical4j.model.Calendar;
@@ -64,17 +64,10 @@ import net.fortuna.ical4j.model.Component;
 import net.fortuna.ical4j.model.component.VEvent;
 import net.fortuna.ical4j.model.parameter.PartStat;
 import net.fortuna.ical4j.model.property.Method;
-import reactor.core.Disposable;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
-import reactor.core.scheduler.Schedulers;
 import reactor.rabbitmq.AcknowledgableDelivery;
-import reactor.rabbitmq.BindingSpecification;
-import reactor.rabbitmq.ConsumeOptions;
-import reactor.rabbitmq.ExchangeSpecification;
 import reactor.rabbitmq.OutboundMessage;
-import reactor.rabbitmq.QueueSpecification;
-import reactor.rabbitmq.Receiver;
 import reactor.rabbitmq.Sender;
 
 /**
@@ -95,92 +88,53 @@ public class ItipLocalDeliveryConsumer implements Closeable, Startable {
     public static final String QUEUE_NAME = "tcalendar:itip:localDelivery";
     public static final String DEAD_LETTER_QUEUE = "tcalendar:itip:localDelivery:dead-letter";
     private static final boolean SKIP = true;
+    private static final String X_OPENPAAS_TEAM_CALENDAR_ID = "X-OPENPAAS-TEAM-CALENDAR-ID";
 
     private static final Logger LOGGER = LoggerFactory.getLogger(ItipLocalDeliveryConsumer.class);
-    private static final boolean REQUEUE_ON_NACK = true;
-    private final ReceiverProvider receiverProvider;
+    private final ManagedRabbitMQConsumer consumer;
     private final Sender sender;
     private final CalDavClient calDavClient;
     private final LocalRecipientResolver localRecipientResolver;
     private final ItipEmailNotificationPublisher itipEmailNotificationPublisher;
-    private final int prefetchCount;
-    private final Supplier<QueueArguments.Builder> queueArgumentSupplier;
-    private Disposable consumeDisposable;
 
     @Inject
     public ItipLocalDeliveryConsumer(ReactorRabbitMQChannelPool channelPool,
                                      @Named(INJECT_KEY_DAV) Supplier<QueueArguments.Builder> queueArgumentSupplier,
                                      CalDavClient calDavClient,
                                      LocalRecipientResolver localRecipientResolver,
-                                     @Named("itipEventMessagesPrefetchCount") int prefetchCount) {
-        this.receiverProvider = channelPool::createReceiver;
+                                     @Named("itipEventMessagesPrefetchCount") int prefetchCount,
+                                     Clock clock) {
         this.sender = channelPool.getSender();
         this.calDavClient = calDavClient;
         this.localRecipientResolver = localRecipientResolver;
-        this.prefetchCount = prefetchCount;
-        this.queueArgumentSupplier = queueArgumentSupplier;
         this.itipEmailNotificationPublisher = new ItipEmailNotificationPublisher(sender,
-            bytes -> new OutboundMessage(EventEmailConsumer.EXCHANGE_NAME, EMPTY_ROUTING_KEY, bytes));
-    }
-
-    private static void declareExchangeAndQueue(Supplier<Builder> queueArgumentSupplier, Sender sender) {
-        Flux.concat(
-                sender.declareExchange(ExchangeSpecification.exchange(EXCHANGE_NAME)
-                    .durable(DURABLE).type(BuiltinExchangeType.FANOUT.getType())),
-                sender.declareExchange(ExchangeSpecification.exchange(DEAD_LETTER_QUEUE)
-                    .durable(DURABLE).type(BuiltinExchangeType.FANOUT.getType())),
-                sender.declareQueue(QueueSpecification
-                    .queue(DEAD_LETTER_QUEUE)
-                    .durable(DURABLE)
-                    .arguments(queueArgumentSupplier.get().build())),
-                sender.bind(BindingSpecification.binding()
-                    .exchange(DEAD_LETTER_QUEUE)
-                    .queue(DEAD_LETTER_QUEUE)
-                    .routingKey(EMPTY_ROUTING_KEY)),
-                sender.declareQueue(QueueSpecification
+            bytes -> new OutboundMessage(EventEmailConsumer.EXCHANGE_NAME, EMPTY_ROUTING_KEY, bytes), clock);
+        this.consumer = new ManagedRabbitMQConsumer.Factory(channelPool)
+            .create(ManagedRabbitMQConsumer.Parameters.builder()
+                .queueDeclaration(QueueDeclaration.builder()
+                    .binding(EXCHANGE_NAME, BuiltinExchangeType.FANOUT, EMPTY_ROUTING_KEY)
                     .queue(QUEUE_NAME)
-                    .durable(DURABLE)
-                    .arguments(queueArgumentSupplier.get().deadLetter(DEAD_LETTER_QUEUE).build())),
-                sender.bind(BindingSpecification.binding()
-                    .exchange(EXCHANGE_NAME)
-                    .queue(QUEUE_NAME)
-                    .routingKey(EMPTY_ROUTING_KEY)))
-            .then()
-            .block();
+                    .deadLetterQueue(DEAD_LETTER_QUEUE)
+                    .build())
+                .queueArguments(queueArgumentSupplier)
+                .qos(prefetchCount)
+                .concurrency(DEFAULT_CONCURRENCY)
+                .handleDelivery(this::consumeMessage)
+                .build());
     }
 
     public void init() {
-        start();
-    }
-
-    public void start() {
-        declareExchangeAndQueue(queueArgumentSupplier, sender);
-        consumeDisposable = doConsumeMessages();
+        consumer.init();
     }
 
     public void restart() {
-        close();
-        start();
+        consumer.restart();
     }
 
     @Override
+    @PreDestroy
     public void close() {
-        if (consumeDisposable != null && !consumeDisposable.isDisposed()) {
-            consumeDisposable.dispose();
-        }
-    }
-
-    public Flux<AcknowledgableDelivery> delivery(String queue) {
-        return Flux.using(receiverProvider::createReceiver,
-            receiver -> receiver.consumeManualAck(queue, new ConsumeOptions().qos(prefetchCount)),
-            Receiver::close);
-    }
-
-    private Disposable doConsumeMessages() {
-        return delivery(QUEUE_NAME)
-            .flatMap(this::consumeMessage, DEFAULT_CONCURRENCY)
-            .subscribeOn(Schedulers.boundedElastic())
-            .subscribe();
+        consumer.close();
     }
 
     private Mono<Void> consumeMessage(AcknowledgableDelivery ackDelivery) {
@@ -190,12 +144,6 @@ public class ItipLocalDeliveryConsumer implements Closeable, Startable {
                     return fanOut(dto);
                 }
                 return processSingleRecipient(dto);
-            })
-            .doOnSuccess(ignored -> ackDelivery.ack())
-            .onErrorResume(error -> {
-                LOGGER.error("Error consuming calendar:itip:localDelivery message", error);
-                ackDelivery.nack(!REQUEUE_ON_NACK);
-                return Mono.empty();
             });
     }
 
@@ -225,7 +173,11 @@ public class ItipLocalDeliveryConsumer implements Closeable, Startable {
     // ---- Processing phase --------------------------------------------------------------------
 
     private Mono<Void> processSingleRecipient(ItipLocalDeliveryDTO localDelivery) {
-        Username recipientUsername = Username.of(localDelivery.strippedRecipient());
+        Optional<Username> maybeRecipient = parseRecipient(localDelivery);
+        if (maybeRecipient.isEmpty()) {
+            return Mono.empty();
+        }
+        Username recipientUsername = maybeRecipient.get();
         Optional<Calendar> oldEventCalendar = localDelivery.oldMessage().map(CalendarUtil::parseIcs);
 
         return Mono.fromCallable(() -> CalendarUtil.parseIcs(localDelivery.message()))
@@ -235,15 +187,30 @@ public class ItipLocalDeliveryConsumer implements Closeable, Startable {
                     Optional<OpenPaaSId> localRecipientId = resolved.map(LocalRecipientResolver.ResolvedRecipient::id);
                     boolean isResource = resolved.map(recipient -> recipient instanceof LocalRecipientResolver.ResolvedRecipient.LocalResource).orElse(false);
                     return sendItipIfNecessary(localDelivery, recipientUsername, localRecipientId, calendar)
-                        .then(isResource ? Mono.empty() : publishEmailNotification(localDelivery, recipientUsername, localRecipientId, oldEventCalendar));
+                        .then(isResource ? Mono.empty() : publishEmailNotification(localDelivery, recipientUsername, localRecipientId, calendar, oldEventCalendar));
                 }));
+    }
+
+    /**
+     * Parses the single recipient address. An invalid address is necessarily not a local
+     * recipient, so there is nothing to deliver: we log and ignore the message rather than
+     * dead-lettering it.
+     */
+    private Optional<Username> parseRecipient(ItipLocalDeliveryDTO localDelivery) {
+        try {
+            return Optional.of(Username.of(localDelivery.strippedRecipient()));
+        } catch (IllegalArgumentException e) {
+            LOGGER.warn("Ignoring iTIP local delivery for uid {}: invalid recipient address '{}'",
+                localDelivery.uid(), localDelivery.strippedRecipient(), e);
+            return Optional.empty();
+        }
     }
 
     private boolean localDeliveryIgnored(ItipLocalDeliveryDTO localDelivery,
                                          Calendar calendar,
                                          Optional<Calendar> oldEventCalendar) {
         if (Method.VALUE_REQUEST.equalsIgnoreCase(localDelivery.method())
-            && hasInvalidRequestOrganizer(localDelivery, calendar, oldEventCalendar)) {
+            && hasInvalidRequestOrganizer(localDelivery, calendar)) {
             return SKIP;
         }
         if (Method.VALUE_REPLY.equalsIgnoreCase(localDelivery.method())
@@ -294,28 +261,14 @@ public class ItipLocalDeliveryConsumer implements Closeable, Startable {
     }
 
     private boolean hasInvalidRequestOrganizer(ItipLocalDeliveryDTO localDelivery,
-                                               Calendar calendar,
-                                               Optional<Calendar> oldEventCalendar) {
+                                               Calendar calendar) {
         Set<Username> currentOrganizers = extractOrganizer(calendar);
         if (currentOrganizers.size() != 1) {
             return SKIP;
         }
 
         Username currentOrganizer = currentOrganizers.iterator().next();
-        if (organizerChanged(currentOrganizer, oldEventCalendar)) {
-            return SKIP;
-        }
-
         return senderIsNotOrganizer(localDelivery, currentOrganizer);
-    }
-
-    private boolean organizerChanged(Username currentOrganizer, Optional<Calendar> oldEventCalendar) {
-        return oldEventCalendar
-            .map(oldCalendar -> {
-                Set<Username> oldOrganizers = extractOrganizer(oldCalendar);
-                return oldOrganizers.size() != 1 || !oldOrganizers.iterator().next().equals(currentOrganizer);
-            })
-            .orElse(!SKIP);
     }
 
     private boolean senderIsNotOrganizer(ItipLocalDeliveryDTO localDelivery, Username organizer) {
@@ -325,7 +278,7 @@ public class ItipLocalDeliveryConsumer implements Closeable, Startable {
     private Set<Username> extractOrganizer(Calendar calendar) {
         return calendar.getComponents(Component.VEVENT).stream()
             .map(vEvent -> EventParseUtils.getOrganizer((VEvent) vEvent))
-            .filter(Objects::nonNull)
+            .flatMap(Optional::stream)
             .map(person -> person.email().asString())
             .filter(StringUtils::isNotBlank)
             .map(email -> Username.of(normalizeEmail(email)))
@@ -339,8 +292,9 @@ public class ItipLocalDeliveryConsumer implements Closeable, Startable {
     private Mono<Void> publishEmailNotification(ItipLocalDeliveryDTO localDelivery,
                                                 Username recipientUsername,
                                                 Optional<OpenPaaSId> localRecipientId,
+                                                Calendar calendar,
                                                 Optional<Calendar> oldEventCalendar) {
-        return resolveEventPath(localDelivery, recipientUsername, localRecipientId)
+        return resolveEventPath(localDelivery, recipientUsername, localRecipientId, calendar)
             .flatMap(eventPath -> itipEmailNotificationPublisher.send(localDelivery, eventPath, oldEventCalendar))
             .then(ReactorUtils.logAsMono(() ->
                 LOGGER.debug("Published email notifications for uid {} to {}", localDelivery.uid(), localDelivery.strippedRecipient())));
@@ -348,10 +302,15 @@ public class ItipLocalDeliveryConsumer implements Closeable, Startable {
 
     private Mono<URI> resolveEventPath(ItipLocalDeliveryDTO localDelivery,
                                        Username recipientUsername,
-                                       Optional<OpenPaaSId> localRecipientId) {
+                                       Optional<OpenPaaSId> localRecipientId,
+                                       Calendar calendar) {
         return Mono.justOrEmpty(localRecipientId)
             .flatMap(recipientId -> retrieveRecipientEventHref(recipientUsername, recipientId, localDelivery.uid()))
-            .switchIfEmpty(Mono.just(defaultEventPath(localDelivery.calendarId(), localDelivery.uid())));
+            .switchIfEmpty(Mono.defer(() -> {
+                String eventPathCalendarId = EventParseUtils.getPropertyValueIgnoreCase(EventParseUtils.getFirstEvent(calendar), X_OPENPAAS_TEAM_CALENDAR_ID)
+                    .orElse(localDelivery.calendarId());
+                return Mono.just(defaultEventPath(eventPathCalendarId, localDelivery.uid()));
+            }));
     }
 
     private URI defaultEventPath(String calendarId, String uid) {

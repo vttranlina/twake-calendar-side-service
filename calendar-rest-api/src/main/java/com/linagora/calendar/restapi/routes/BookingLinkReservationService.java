@@ -31,16 +31,18 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import com.google.common.base.Preconditions;
+import com.linagora.calendar.api.BookedEventTokenSigner.BookedEvent;
 import com.linagora.calendar.api.booking.AvailableSlotsCalculator.AvailabilitySlot;
 import com.linagora.calendar.dav.CalDavClient;
+import com.linagora.calendar.dav.CalDavClient.CalendarAccess;
+import com.linagora.calendar.restapi.ForbiddenException;
 import com.linagora.calendar.restapi.RestApiConfiguration;
+import com.linagora.calendar.restapi.routes.BookingLinkEventIcsBuilder.BookingEventOptions;
 import com.linagora.calendar.restapi.routes.BookingLinkEventIcsBuilder.BuildResult;
 import com.linagora.calendar.restapi.routes.BookingLinkReservationService.BookingRequest.BookingAttendee;
 import com.linagora.calendar.storage.OpenPaaSUser;
 import com.linagora.calendar.storage.OpenPaaSUserDAO;
 import com.linagora.calendar.storage.booking.BookingLink;
-import com.linagora.calendar.storage.booking.BookingLinkDAO;
-import com.linagora.calendar.storage.booking.BookingLinkNotFoundException;
 import com.linagora.calendar.storage.booking.BookingLinkPublicId;
 
 import reactor.core.publisher.Mono;
@@ -48,35 +50,52 @@ import reactor.core.publisher.Mono;
 public class BookingLinkReservationService {
     private static final Logger LOGGER = LoggerFactory.getLogger(BookingLinkReservationService.class);
 
-    private final BookingLinkDAO bookingLinkDAO;
     private final BookingLinkSlotsService bookingLinkSlotsService;
     private final BookingLinkEventIcsBuilder bookingLinkEventIcsBuilder;
     private final CalDavClient calDavClient;
     private final OpenPaaSUserDAO openPaaSUserDAO;
     private final PublicAgendaProposalNotifier publicAgendaProposalNotifier;
+    private final BookingLinkRequestAcknowledgementNotifier bookingLinkRequestAcknowledgementNotifier;
+    private final BookingLinkExtraAttendeeResolver extraAttendeeResolver;
+    private final BookingLinkResourceResolver resourceResolver;
 
     @Inject
-    public BookingLinkReservationService(BookingLinkDAO bookingLinkDAO,
-                                         Clock clock,
+    public BookingLinkReservationService(Clock clock,
                                          BookingLinkSlotsService bookingLinkSlotsService,
                                          RestApiConfiguration restApiConfiguration,
                                          CalDavClient calDavClient,
                                          OpenPaaSUserDAO openPaaSUserDAO,
-                                         PublicAgendaProposalNotifier publicAgendaProposalNotifier) {
-        this.bookingLinkDAO = bookingLinkDAO;
+                                         PublicAgendaProposalNotifier publicAgendaProposalNotifier,
+                                         BookingLinkRequestAcknowledgementNotifier bookingLinkRequestAcknowledgementNotifier,
+                                         BookingLinkExtraAttendeeResolver extraAttendeeResolver,
+                                         BookingLinkResourceResolver resourceResolver) {
         this.calDavClient = calDavClient;
         this.bookingLinkSlotsService = bookingLinkSlotsService;
         this.openPaaSUserDAO = openPaaSUserDAO;
+        this.extraAttendeeResolver = extraAttendeeResolver;
+        this.resourceResolver = resourceResolver;
         this.publicAgendaProposalNotifier = publicAgendaProposalNotifier;
+        this.bookingLinkRequestAcknowledgementNotifier = bookingLinkRequestAcknowledgementNotifier;
         this.bookingLinkEventIcsBuilder = new BookingLinkEventIcsBuilder(clock, new MeetingConferenceLinkResolver.Visio(restApiConfiguration));
 
     }
 
-    public Mono<Void> book(BookingLinkPublicId publicId, BookingRequest request) {
-        return bookingLinkDAO.findActiveByPublicId(publicId)
-            .switchIfEmpty(Mono.error(() -> new BookingLinkNotFoundException(publicId)))
-            .flatMap(bookingLink -> validateSlotAvailability(bookingLink, request.slotStartUtc())
+    public Mono<BookedEvent> book(BookingLinkPublicId publicId, BookingRequest request) {
+        return bookingLinkSlotsService.getBookingLink(publicId)
+            .flatMap(bookingLink -> validateCalendarWriteAccess(bookingLink)
+                .then(validateSlotAvailability(bookingLink, request.slotStartUtc()))
                 .then(createBooking(bookingLink, request)));
+    }
+
+    private Mono<Void> validateCalendarWriteAccess(BookingLink bookingLink) {
+        return calDavClient.resolveCalendarAccess(bookingLink.username(), bookingLink.calendarUrl())
+            .flatMap(access -> {
+                if (access == CalendarAccess.WRITABLE) {
+                    return Mono.empty();
+                }
+                return Mono.error(new ForbiddenException("Booking link owner no longer has write access to calendar: "
+                    + bookingLink.calendarUrl().asUri()));
+            });
     }
 
     private Mono<Void> validateSlotAvailability(BookingLink bookingLink, Instant startUtc) {
@@ -90,24 +109,66 @@ public class BookingLinkReservationService {
             .then();
     }
 
-    private Mono<Void> createBooking(BookingLink bookingLink, BookingRequest request) {
-        return openPaaSUserDAO.retrieve(bookingLink.username())
-            .flatMap(organizer -> {
+    private Mono<BookedEvent> createBooking(BookingLink bookingLink, BookingRequest request) {
+        return Mono.zip(openPaaSUserDAO.retrieve(bookingLink.username()), resolveExtraAttendees(bookingLink), resolveResources(bookingLink))
+            .flatMap(tuple -> {
+                OpenPaaSUser organizer = tuple.getT1();
+                BookingEventOptions options = new BookingEventOptions(bookingLink.location(),
+                    bookingLink.visibility(), bookingLink.transparency(), tuple.getT3(), bookingLink.alarm());
                 BuildResult eventIcsResult = bookingLinkEventIcsBuilder.build(request,
-                    BookingAttendee.from(organizer.fullName(), organizer.username().asString()), bookingLink.duration());
+                    BookingAttendee.from(organizer.fullName(), organizer.username().asString()), tuple.getT2(),
+                    bookingLink.duration(), bookingLink.publicId(), bookingLink.autoAccept(), options);
+
+                BookedEvent bookedEvent = new BookedEvent(
+                    bookingLink.publicId().value(),
+                    bookingLink.calendarUrl().calendarId().value(),
+                    bookingLink.calendarUrl().base().value(),
+                    eventIcsResult.eventIdAsString());
 
                 return calDavClient.importCalendar(bookingLink.calendarUrl(), eventIcsResult.eventIdAsString(), bookingLink.username(), eventIcsResult.icsBytes())
                     .onErrorMap(throwable -> BookingLinkReservationException.createEventFailed(bookingLink.publicId(), eventIcsResult.eventIdAsString(), throwable))
-                    .then(notifyBookingCreated(new BookingCreated(bookingLink, request, organizer, eventIcsResult)));
-            })
-            .then();
+                    .then(notifyBookingCreated(new BookingCreated(bookingLink, request, organizer, eventIcsResult, bookedEvent)))
+                    .thenReturn(bookedEvent);
+            });
+    }
+
+    private Mono<List<BookingAttendee>> resolveExtraAttendees(BookingLink bookingLink) {
+        return extraAttendeeResolver.resolveExisting(bookingLink.extraAttendees().participants())
+            .map(user -> BookingAttendee.from(user.fullName(), user.username().asString()))
+            .collectList();
+    }
+
+    private Mono<List<BookingAttendee>> resolveResources(BookingLink bookingLink) {
+        return resourceResolver.resolveExisting(bookingLink.username(), bookingLink.resources())
+            .map(resource -> BookingAttendee.from(resource.name(), resource.mailAddress().asString()))
+            .collectList();
     }
 
     private Mono<Void> notifyBookingCreated(BookingCreated bookingCreated) {
+        if (bookingCreated.bookingLink().autoAccept()) {
+            // The organizer auto-accepts upon event creation: no validation proposal is sent to the organizer
+            // and no acknowledgement is sent to the booker. The regular IMIP flow applies under the hood.
+            return Mono.empty();
+        }
+        return Mono.when(notifyOrganizer(bookingCreated), notifyRequester(bookingCreated));
+    }
+
+    private Mono<Void> notifyOrganizer(BookingCreated bookingCreated) {
         return publicAgendaProposalNotifier.notify(bookingCreated)
             .onErrorResume(error -> {
                 LOGGER.warn("Failed to send proposal notification for booking {}: {}",
                     bookingCreated.eventIcsResult().eventIdAsString(), error.getMessage(), error);
+                return Mono.empty();
+            });
+    }
+
+    private Mono<Void> notifyRequester(BookingCreated bookingCreated) {
+        return bookingLinkRequestAcknowledgementNotifier.notify(bookingCreated)
+            .onErrorResume(error -> {
+                LOGGER.warn("Failed to send request acknowledgement notification for booking {} to {}: {}",
+                    bookingCreated.eventIcsResult().eventIdAsString(),
+                    bookingCreated.request().creator().email().asString(),
+                    error.getMessage(), error);
                 return Mono.empty();
             });
     }
@@ -140,7 +201,8 @@ public class BookingLinkReservationService {
     public record BookingCreated(BookingLink bookingLink,
                                  BookingRequest request,
                                  OpenPaaSUser organizer,
-                                 BuildResult eventIcsResult) {
+                                 BuildResult eventIcsResult,
+                                 BookedEvent bookedEvent) {
     }
 
 }

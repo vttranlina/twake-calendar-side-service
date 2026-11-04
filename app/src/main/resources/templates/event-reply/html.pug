@@ -155,7 +155,7 @@ div(style='')
                                             a.link(href=`//${content.event.location.value}`) #{content.event.location.value}
                                         else
                                           | #{content.event.location.value} (
-                                          a(href=`https://www.openstreetmap.org/search?query=${content.event.location.value}`) #{translator.get('see_in_map')}
+                                          a(href=`https://www.openstreetmap.org/search?query=${content.event.location.urlEncodedValue}`) #{translator.get('see_in_map')}
                                           | )
                                   tr
                                     td(valign='top')
@@ -172,7 +172,7 @@ div(style='')
                                     tr
                                       td(valign='top')
                                         strong #{translator.get('notes')}
-                                      td #{content.event.description}
+                                      td(style='white-space: pre-line;') #{content.event.description}
                       //if mso | IE
             //if mso | IE
   //if mso | IE

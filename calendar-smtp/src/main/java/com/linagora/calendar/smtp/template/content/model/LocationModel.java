@@ -19,6 +19,8 @@
 package com.linagora.calendar.smtp.template.content.model;
 
 import java.net.URI;
+import java.net.URLEncoder;
+import java.nio.charset.StandardCharsets;
 import java.util.Map;
 
 import org.apache.commons.lang3.StringUtils;
@@ -28,8 +30,14 @@ public record LocationModel(String value) {
     public Map<String, Object> toPugModel() {
         return Map.of(
             "value", value,
+            "urlEncodedValue", urlEncodedValue(),
             "isValidURL", isValidURL(),
             "isAbsoluteURL", isAbsoluteURL());
+    }
+
+    private String urlEncodedValue() {
+        return URLEncoder.encode(value, StandardCharsets.UTF_8)
+            .replace("+", "%20");
     }
 
     private boolean isValidURL() {

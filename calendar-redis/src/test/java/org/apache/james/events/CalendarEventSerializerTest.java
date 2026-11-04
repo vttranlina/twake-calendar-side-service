@@ -27,15 +27,31 @@ import java.util.Optional;
 
 import org.junit.jupiter.api.Test;
 
+import com.linagora.calendar.storage.AddressBookChangeEvent;
+import com.linagora.calendar.storage.AddressBookURL;
+import com.linagora.calendar.storage.BookingLinkStateChangedEvent;
 import com.linagora.calendar.storage.CalendarChangeEvent;
 import com.linagora.calendar.storage.CalendarListChangedEvent;
 import com.linagora.calendar.storage.CalendarURL;
 import com.linagora.calendar.storage.EventBusAlarmEvent;
 import com.linagora.calendar.storage.ImportEvent;
+import com.linagora.calendar.storage.OpenPaaSId;
 import com.linagora.calendar.storage.model.ImportId;
 import org.apache.james.core.Username;
 
 public class CalendarEventSerializerTest {
+    public static final String ADDRESS_BOOK_CHANGE_JSON = """
+        {
+            "type": "CalendarEventSerializer$AddressBookChangeDTO",
+            "eventId": "12345678-1234-1234-1234-123456789012",
+            "username": "addressbookchange",
+            "addressBookUrl": "/addressbooks/baseId/addressBookId"
+        }
+        """;
+    public static final AddressBookChangeEvent ADDRESS_BOOK_CHANGE_EVENT = new AddressBookChangeEvent(
+        Event.EventId.of("12345678-1234-1234-1234-123456789012"),
+        new AddressBookURL(new OpenPaaSId("baseId"), "addressBookId"));
+
     public static final String CALENDAR_CHANGE_JSON = """
         {
             "type": "CalendarEventSerializer$CalendarChangeDTO",
@@ -105,7 +121,31 @@ public class CalendarEventSerializerTest {
         CalendarURL.deserialize("baseId/calendarId"),
         CalendarListChangedEvent.ChangeType.UPDATED);
 
+    public static final String BOOKING_LINK_STATE_CHANGED_JSON = """
+        {
+            "type": "CalendarEventSerializer$BookingLinkStateChangedDTO",
+            "eventId": "cccccccc-dddd-eeee-ffff-000000000000",
+            "username": "bookinguser"
+        }
+        """;
+
+    public static final BookingLinkStateChangedEvent BOOKING_LINK_STATE_CHANGED_EVENT = new BookingLinkStateChangedEvent(
+        Event.EventId.of("cccccccc-dddd-eeee-ffff-000000000000"),
+        Username.of("bookinguser"));
+
     private final CalendarEventSerializer serializer = new CalendarEventSerializer();
+
+    @Test
+    void shouldSerializeAddressBookChangeEvent() {
+        String json = serializer.toJson(ADDRESS_BOOK_CHANGE_EVENT).json();
+        assertThatJson(json).isEqualTo(ADDRESS_BOOK_CHANGE_JSON);
+    }
+
+    @Test
+    void shouldDeserializeJsonToAddressBookChangeEvent() {
+        Event event = serializer.asEvent(ADDRESS_BOOK_CHANGE_JSON).event();
+        assertThat(event).isEqualTo(ADDRESS_BOOK_CHANGE_EVENT);
+    }
 
     @Test
     void shouldSerializeCalendarChangeEvent() {
@@ -153,5 +193,17 @@ public class CalendarEventSerializerTest {
     void shouldDeserializeJsonToCalendarListChangedEvent() {
         Event event = serializer.asEvent(CALENDAR_LIST_CHANGED_JSON).event();
         assertThat(event).isEqualTo(CALENDAR_LIST_CHANGED_EVENT);
+    }
+
+    @Test
+    void shouldSerializeBookingLinkStateChangedEvent() {
+        String json = serializer.toJson(BOOKING_LINK_STATE_CHANGED_EVENT).json();
+        assertThatJson(json).isEqualTo(BOOKING_LINK_STATE_CHANGED_JSON);
+    }
+
+    @Test
+    void shouldDeserializeJsonToBookingLinkStateChangedEvent() {
+        Event event = serializer.asEvent(BOOKING_LINK_STATE_CHANGED_JSON).event();
+        assertThat(event).isEqualTo(BOOKING_LINK_STATE_CHANGED_EVENT);
     }
 }

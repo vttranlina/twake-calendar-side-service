@@ -19,20 +19,22 @@
 package com.linagora.calendar.amqp;
 
 import static com.linagora.calendar.amqp.CalendarAmqpModule.INJECT_KEY_DAV;
+import static com.linagora.calendar.amqp.model.CalendarEventBookingNotificationEmail.X_PUBLICLY_CREATOR_HEADER;
 import static com.linagora.calendar.amqp.model.CalendarEventNotificationEmail.GET_FIRST_VEVENT_FUNCTION;
-import static org.apache.james.backends.rabbitmq.Constants.DURABLE;
 import static org.apache.james.backends.rabbitmq.Constants.EMPTY_ROUTING_KEY;
 import static org.apache.james.util.ReactorUtils.DEFAULT_CONCURRENCY;
 
 import java.io.Closeable;
+import java.util.Optional;
 import java.util.function.Supplier;
 
+import jakarta.annotation.PreDestroy;
 import jakarta.inject.Inject;
 
 import org.apache.commons.lang3.BooleanUtils;
+import org.apache.commons.lang3.Strings;
 import org.apache.james.backends.rabbitmq.QueueArguments;
 import org.apache.james.backends.rabbitmq.ReactorRabbitMQChannelPool;
-import org.apache.james.backends.rabbitmq.ReceiverProvider;
 import org.apache.james.lifecycle.api.Startable;
 import org.apache.james.metrics.api.Metric;
 import org.apache.james.metrics.api.MetricFactory;
@@ -40,10 +42,12 @@ import org.apache.james.util.ReactorUtils;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import com.fasterxml.jackson.databind.DeserializationFeature;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.datatype.jdk8.Jdk8Module;
 import com.google.inject.name.Named;
 import com.linagora.calendar.amqp.model.CalendarEventBookingConfirmedNotificationEmail;
+import com.linagora.calendar.amqp.model.CalendarEventBookingDeclinedNotificationEmail;
 import com.linagora.calendar.amqp.model.CalendarEventCancelNotificationEmail;
 import com.linagora.calendar.amqp.model.CalendarEventCounterNotificationEmail;
 import com.linagora.calendar.amqp.model.CalendarEventInviteNotificationEmail;
@@ -51,34 +55,30 @@ import com.linagora.calendar.amqp.model.CalendarEventReplyNotificationEmail;
 import com.linagora.calendar.amqp.model.CalendarEventUpdateNotificationEmail;
 import com.linagora.calendar.smtp.EventEmailFilter;
 import com.linagora.calendar.storage.event.EventParseUtils;
+import com.linagora.tmail.rabbitmq.ManagedRabbitMQConsumer;
+import com.linagora.tmail.rabbitmq.QueueDeclaration;
 import com.rabbitmq.client.BuiltinExchangeType;
 
 import net.fortuna.ical4j.model.Calendar;
+import net.fortuna.ical4j.model.component.VEvent;
+import net.fortuna.ical4j.model.parameter.PartStat;
 import net.fortuna.ical4j.model.property.Method;
-import reactor.core.Disposable;
-import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
-import reactor.core.scheduler.Schedulers;
 import reactor.rabbitmq.AcknowledgableDelivery;
-import reactor.rabbitmq.BindingSpecification;
-import reactor.rabbitmq.ConsumeOptions;
-import reactor.rabbitmq.ExchangeSpecification;
-import reactor.rabbitmq.QueueSpecification;
-import reactor.rabbitmq.Receiver;
-import reactor.rabbitmq.Sender;
 
 public class EventEmailConsumer implements Closeable, Startable {
     public static final String EXCHANGE_NAME = "calendar:event:notificationEmail:send";
     public static final String QUEUE_NAME = "tcalendar:event:notificationEmail:send";
     public static final String DEAD_LETTER_QUEUE = "tcalendar:event:notificationEmail:send:dead-letter";
+    public static final String X_PUBLICLY_CREATED_HEADER = "X-PUBLICLY-CREATED";
+    public static final String X_PUBLICLY_CANCELLED_BY_HEADER = "X-PUBLICLY-CANCELLED-BY";
 
-    private static final String X_PUBLICLY_CREATED_HEADER = "X-PUBLICLY-CREATED";
     private static final boolean PUBLIC_AGENDA_EVENT = true;
     private static final Logger LOGGER = LoggerFactory.getLogger(EventEmailConsumer.class);
-    private static final boolean REQUEUE_ON_NACK = true;
-    private static final ObjectMapper OBJECT_MAPPER = new ObjectMapper().registerModule(new Jdk8Module());
+    private static final ObjectMapper OBJECT_MAPPER = new ObjectMapper().registerModule(new Jdk8Module())
+        .configure(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES, false);
 
-    private final ReceiverProvider receiverProvider;
+    private final ManagedRabbitMQConsumer consumer;
     private final EventMailHandler eventMailHandler;
     private final EventEmailFilter eventEmailFilter;
     private final Metric inviteSentMetric;
@@ -89,42 +89,26 @@ public class EventEmailConsumer implements Closeable, Startable {
     private final Metric publicAgendaSentMetric;
     private final MetricFactory metricFactory;
 
-    private Disposable consumeDisposable;
-
     @Inject
     public EventEmailConsumer(ReactorRabbitMQChannelPool channelPool,
                               @Named(INJECT_KEY_DAV) Supplier<QueueArguments.Builder> queueArgumentSupplier,
                               EventMailHandler eventMailHandler,
                               EventEmailFilter eventEmailFilter,
                               MetricFactory metricFactory) {
-        this.receiverProvider = channelPool::createReceiver;
         this.eventMailHandler = eventMailHandler;
         this.eventEmailFilter = eventEmailFilter;
-
-        Sender sender = channelPool.getSender();
-        Flux.concat(
-                sender.declareExchange(ExchangeSpecification.exchange(EXCHANGE_NAME)
-                    .durable(DURABLE).type(BuiltinExchangeType.FANOUT.getType())),
-                sender.declareExchange(ExchangeSpecification.exchange(DEAD_LETTER_QUEUE)
-                    .durable(DURABLE).type(BuiltinExchangeType.FANOUT.getType())),
-                sender.declareQueue(QueueSpecification
-                    .queue(DEAD_LETTER_QUEUE)
-                    .durable(DURABLE)
-                    .arguments(queueArgumentSupplier.get().build())),
-                sender.bind(BindingSpecification.binding()
-                    .exchange(DEAD_LETTER_QUEUE)
-                    .queue(DEAD_LETTER_QUEUE)
-                    .routingKey(EMPTY_ROUTING_KEY)),
-                sender.declareQueue(QueueSpecification
+        this.consumer = new ManagedRabbitMQConsumer.Factory(channelPool)
+            .create(ManagedRabbitMQConsumer.Parameters.builder()
+                .queueDeclaration(QueueDeclaration.builder()
+                    .binding(EXCHANGE_NAME, BuiltinExchangeType.FANOUT, EMPTY_ROUTING_KEY)
                     .queue(QUEUE_NAME)
-                    .durable(DURABLE)
-                    .arguments(queueArgumentSupplier.get().deadLetter(DEAD_LETTER_QUEUE).build())),
-                sender.bind(BindingSpecification.binding()
-                    .exchange(EXCHANGE_NAME)
-                    .queue(QUEUE_NAME)
-                    .routingKey(EMPTY_ROUTING_KEY)))
-            .then()
-            .block();
+                    .deadLetterQueue(DEAD_LETTER_QUEUE)
+                    .build())
+                .queueArguments(queueArgumentSupplier)
+                .qos(DEFAULT_CONCURRENCY)
+                .concurrency(DEFAULT_CONCURRENCY)
+                .handleDelivery(this::consumeMessage)
+                .build());
 
         this.metricFactory = metricFactory;
         inviteSentMetric = metricFactory.generate("calendar.imip.invite");
@@ -136,36 +120,17 @@ public class EventEmailConsumer implements Closeable, Startable {
     }
 
     public void init() {
-        start();
-    }
-
-    public void start() {
-        consumeDisposable = doConsumeCalendarEventMessages();
+        consumer.init();
     }
 
     public void restart() {
-        close();
-        start();
+        consumer.restart();
     }
 
     @Override
+    @PreDestroy
     public void close() {
-        if (consumeDisposable != null && !consumeDisposable.isDisposed()) {
-            consumeDisposable.dispose();
-        }
-    }
-
-    private Disposable doConsumeCalendarEventMessages() {
-        return delivery(QUEUE_NAME)
-            .flatMap(this::consumeMessage, DEFAULT_CONCURRENCY)
-            .subscribeOn(Schedulers.boundedElastic())
-            .subscribe();
-    }
-
-    public Flux<AcknowledgableDelivery> delivery(String queue) {
-        return Flux.using(receiverProvider::createReceiver,
-            receiver -> receiver.consumeManualAck(queue, new ConsumeOptions().qos(DEFAULT_CONCURRENCY)),
-            Receiver::close);
+        consumer.close();
     }
 
     private Mono<Void> consumeMessage(AcknowledgableDelivery ackDelivery) {
@@ -173,13 +138,7 @@ public class EventEmailConsumer implements Closeable, Startable {
             Mono.fromCallable(() -> OBJECT_MAPPER.readValue(ackDelivery.getBody(), CalendarEventNotificationEmailDTO.class))
                 .filter(dto -> eventEmailFilter.shouldProcess(dto.recipientEmail()))
                 .flatMap(message -> handleMessage(message)
-                    .then(ReactorUtils.logAsMono(() -> LOGGER.debug("Consumed calendar mail event message successfully {} '{}'", message.getClass().getSimpleName(), message.eventPath()))))
-                .doOnSuccess(result -> ackDelivery.ack())
-                .onErrorResume(error -> {
-                    LOGGER.error("Error when consume calendar mail event message", error);
-                    ackDelivery.nack(!REQUEUE_ON_NACK);
-                    return Mono.empty();
-                })));
+                    .then(ReactorUtils.logAsMono(() -> LOGGER.debug("Consumed calendar mail event message successfully {} '{}'", message.getClass().getSimpleName(), message.eventPath()))))));
     }
 
     private Mono<Void> handleMessage(CalendarEventNotificationEmailDTO calendarEventMessage) {
@@ -188,6 +147,10 @@ public class EventEmailConsumer implements Closeable, Startable {
                 if (publicAgendaEvent(calendarEventMessage.event())) {
                     LOGGER.info("Received public agenda calendar event message with method REQUEST and eventPath {}",
                         calendarEventMessage.eventPath());
+                    if (organizerDeclined(calendarEventMessage.event())) {
+                        yield eventMailHandler.handleBookingDeclinedEvent(CalendarEventBookingDeclinedNotificationEmail.from(calendarEventMessage))
+                            .doOnSuccess(any -> publicAgendaSentMetric.increment());
+                    }
                     yield eventMailHandler.handlePublicAgendaEvent(CalendarEventBookingConfirmedNotificationEmail.from(calendarEventMessage))
                         .doOnSuccess(any -> publicAgendaSentMetric.increment());
                 }
@@ -213,6 +176,12 @@ public class EventEmailConsumer implements Closeable, Startable {
                     .doOnSuccess(any -> replySentMetric.increment());
             }
             case Method.VALUE_CANCEL -> {
+                if (publicAgendaEvent(calendarEventMessage.event())) {
+                    if (shouldIgnoreBookerCancellationToCreator(calendarEventMessage)) {
+                        yield Mono.empty();
+                    }
+                }
+
                 LOGGER.info("Received calendar event message with method CANCEL and eventPath {}", calendarEventMessage.eventPath());
                 CalendarEventCancelNotificationEmail calendarEventCancelNotificationEmail = CalendarEventCancelNotificationEmail.from(calendarEventMessage);
                 yield eventMailHandler.handleCancelEvent(calendarEventCancelNotificationEmail)
@@ -225,6 +194,28 @@ public class EventEmailConsumer implements Closeable, Startable {
             }
             default -> throw new IllegalArgumentException("Unknown method: " + calendarEventMessage.method());
         };
+    }
+
+    private boolean shouldIgnoreBookerCancellationToCreator(CalendarEventNotificationEmailDTO dto) {
+        VEvent event = GET_FIRST_VEVENT_FUNCTION.apply(dto.event());
+        Optional<String> creator = EventParseUtils.getPropertyValueIgnoreCase(event, X_PUBLICLY_CREATOR_HEADER)
+            .map(ItipLocalDeliveryDTO::stripMailto);
+        Optional<String> cancelledBy = EventParseUtils.getPropertyValueIgnoreCase(event, X_PUBLICLY_CANCELLED_BY_HEADER)
+            .map(ItipLocalDeliveryDTO::stripMailto);
+
+        return creator.filter(value -> Strings.CI.equals(value, dto.recipientEmail().asString()))
+            .filter(value -> cancelledBy
+                .filter(cancelledByValue -> Strings.CI.equals(cancelledByValue, value))
+                .isPresent())
+            .isPresent();
+    }
+
+    private boolean organizerDeclined(Calendar calendar) {
+        VEvent event = GET_FIRST_VEVENT_FUNCTION.apply(calendar);
+        return EventParseUtils.getOrganizer(event)
+            .flatMap(organizer -> EventParseUtils.findAttendeePartStat(event, organizer.email()))
+            .filter(PartStat.DECLINED::equals)
+            .isPresent();
     }
 
     private boolean publicAgendaEvent(Calendar calendar) {

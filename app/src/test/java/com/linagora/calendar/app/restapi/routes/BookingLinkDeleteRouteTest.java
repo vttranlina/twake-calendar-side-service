@@ -26,7 +26,6 @@ import static org.assertj.core.api.Assertions.assertThat;
 
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
-import java.util.Optional;
 import java.util.UUID;
 
 import org.apache.http.HttpStatus;
@@ -45,7 +44,6 @@ import com.linagora.calendar.app.TwakeCalendarExtension;
 import com.linagora.calendar.app.TwakeCalendarGuiceServer;
 import com.linagora.calendar.app.modules.CalendarDataProbe;
 import com.linagora.calendar.dav.DavModuleTestHelper;
-import com.linagora.calendar.dav.DockerSabreDavSetup;
 import com.linagora.calendar.dav.SabreDavExtension;
 import com.linagora.calendar.restapi.RestApiServerProbe;
 import com.linagora.calendar.storage.CalendarURL;
@@ -65,7 +63,7 @@ class BookingLinkDeleteRouteTest {
 
     @RegisterExtension
     @Order(1)
-    static SabreDavExtension sabreDavExtension = new SabreDavExtension(DockerSabreDavSetup.SINGLETON);
+    static SabreDavExtension sabreDavExtension = SabreDavExtension.shared();
 
     @RegisterExtension
     @Order(2)
@@ -116,7 +114,7 @@ class BookingLinkDeleteRouteTest {
     @Test
     void shouldReturn204WhenDeletingExistingBookingLink() {
         BookingLink inserted = bookingLinkProbe.insertBookingLink(openPaaSUser.username(),
-            new BookingLinkInsertRequest(CalendarURL.from(openPaaSUser.id()), Duration.ofMinutes(30), ACTIVE, Optional.empty()));
+            BookingLinkInsertRequest.builder().calendarUrl(CalendarURL.from(openPaaSUser.id())).eventDuration(Duration.ofMinutes(30)).build());
 
         when()
             .delete("/api/booking-links/" + inserted.publicId().value())
@@ -127,7 +125,7 @@ class BookingLinkDeleteRouteTest {
     @Test
     void shouldDeleteBookingLink() {
         BookingLink inserted = bookingLinkProbe.insertBookingLink(openPaaSUser.username(),
-            new BookingLinkInsertRequest(CalendarURL.from(openPaaSUser.id()), Duration.ofMinutes(30), ACTIVE, Optional.empty()));
+            BookingLinkInsertRequest.builder().calendarUrl(CalendarURL.from(openPaaSUser.id())).eventDuration(Duration.ofMinutes(30)).build());
 
         when()
             .delete("/api/booking-links/" + inserted.publicId().value())
@@ -140,9 +138,9 @@ class BookingLinkDeleteRouteTest {
     @Test
     void shouldOnlyDeleteTheTargetedBookingLink() {
         BookingLink toDelete = bookingLinkProbe.insertBookingLink(openPaaSUser.username(),
-            new BookingLinkInsertRequest(CalendarURL.from(openPaaSUser.id()), Duration.ofMinutes(30), ACTIVE, Optional.empty()));
+            BookingLinkInsertRequest.builder().calendarUrl(CalendarURL.from(openPaaSUser.id())).eventDuration(Duration.ofMinutes(30)).build());
         BookingLink toKeep = bookingLinkProbe.insertBookingLink(openPaaSUser.username(),
-            new BookingLinkInsertRequest(CalendarURL.from(openPaaSUser.id()), Duration.ofMinutes(60), ACTIVE, Optional.empty()));
+            BookingLinkInsertRequest.builder().calendarUrl(CalendarURL.from(openPaaSUser.id())).eventDuration(Duration.ofMinutes(60)).build());
 
         when()
             .delete("/api/booking-links/" + toDelete.publicId().value())
@@ -166,7 +164,7 @@ class BookingLinkDeleteRouteTest {
     void shouldNotDeleteBookingLinkOfAnotherUser() {
         OpenPaaSUser otherUser = sabreDavExtension.newTestUser();
         BookingLink otherInserted = bookingLinkProbe.insertBookingLink(otherUser.username(),
-            new BookingLinkInsertRequest(CalendarURL.from(otherUser.id()), Duration.ofMinutes(30), ACTIVE, Optional.empty()));
+            BookingLinkInsertRequest.builder().calendarUrl(CalendarURL.from(otherUser.id())).eventDuration(Duration.ofMinutes(30)).build());
 
         when()
             .delete("/api/booking-links/" + otherInserted.publicId().value())
@@ -179,7 +177,7 @@ class BookingLinkDeleteRouteTest {
     @Test
     void shouldReturn401WhenUnauthenticated() {
         BookingLink inserted = bookingLinkProbe.insertBookingLink(openPaaSUser.username(),
-            new BookingLinkInsertRequest(CalendarURL.from(openPaaSUser.id()), Duration.ofMinutes(30), ACTIVE, Optional.empty()));
+            BookingLinkInsertRequest.builder().calendarUrl(CalendarURL.from(openPaaSUser.id())).eventDuration(Duration.ofMinutes(30)).build());
 
         with()
             .auth().none()

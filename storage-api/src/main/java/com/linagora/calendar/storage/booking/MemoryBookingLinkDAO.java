@@ -21,6 +21,7 @@ package com.linagora.calendar.storage.booking;
 import java.time.Clock;
 import java.time.Instant;
 import java.util.Comparator;
+import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 
@@ -56,7 +57,17 @@ public class MemoryBookingLinkDAO implements BookingLinkDAO {
                 .calendarUrl(request.calendarUrl())
                 .duration(request.eventDuration())
                 .active(request.active())
+                .autoAccept(request.autoAccept())
                 .availabilityRules(request.availabilityRules())
+                .extraAttendees(request.extraAttendees())
+                .name(request.name())
+                .description(request.description())
+                .color(request.color())
+                .location(request.location())
+                .visibility(request.visibility())
+                .transparency(request.transparency())
+                .resources(request.resources())
+                .alarm(request.alarm())
                 .createdAt(now)
                 .updatedAt(now)
                 .build();
@@ -91,7 +102,23 @@ public class MemoryBookingLinkDAO implements BookingLinkDAO {
                 builder.calendarUrl(request.calendarUrl().getOrElse(existing.calendarUrl()));
                 builder.duration(request.duration().getOrElse(existing.duration()));
                 builder.active(request.active().getOrElse(existing.active()));
+                builder.autoAccept(request.autoAccept().getOrElse(existing.autoAccept()));
                 builder.availabilityRules(request.availabilityRules().notKeptOrElse(existing.availabilityRules()));
+                builder.extraAttendees(request.extraAttendees()
+                    .notKeptOrElse(Optional.of(existing.extraAttendees()))
+                    .orElse(ExtraAttendees.NONE));
+                builder.name(request.name().notKeptOrElse(existing.name()));
+                builder.description(request.description().notKeptOrElse(existing.description()));
+                builder.color(request.color().notKeptOrElse(existing.color()));
+                builder.location(request.location().notKeptOrElse(existing.location()));
+                builder.visibility(request.visibility().notKeptOrElse(existing.visibility()));
+                builder.transparency(request.transparency().notKeptOrElse(existing.transparency()));
+                builder.resources(request.resources()
+                    .notKeptOrElse(Optional.of(existing.resources()))
+                    .orElse(List.of()));
+                builder.alarm(request.alarm()
+                    .notKeptOrElse(Optional.of(existing.alarm()))
+                    .orElse(List.of()));
                 return builder.updatedAt(now).build();
             });
 

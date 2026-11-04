@@ -41,10 +41,14 @@ public class CalendarQueueUtil {
             .addAll(Arrays.stream(EventCalendarNotificationConsumer.Queue.values())
                 .map(EventCalendarNotificationConsumer.Queue::queueName)
                 .collect(ImmutableList.toImmutableList()))
+            .addAll(Arrays.stream(EventContactNotificationConsumer.Queue.values())
+                .map(EventContactNotificationConsumer.Queue::queueName)
+                .collect(ImmutableList.toImmutableList()))
             .add(EventEmailConsumer.QUEUE_NAME)
             .add(CalendarDelegatedNotificationConsumer.QUEUE)
             .add(CalendarListNotificationConsumer.QUEUE_NAME)
             .add(ItipLocalDeliveryConsumer.QUEUE_NAME)
+            .add(EventAuditLogConsumer.AUDIT_QUEUE)
             .build();
     }
 
@@ -65,10 +69,14 @@ public class CalendarQueueUtil {
             .addAll(Arrays.stream(EventCalendarNotificationConsumer.Queue.values())
                 .map(EventCalendarNotificationConsumer.Queue::deadLetter)
                 .collect(ImmutableList.toImmutableList()))
+            .addAll(Arrays.stream(EventContactNotificationConsumer.Queue.values())
+                .map(EventContactNotificationConsumer.Queue::deadLetter)
+                .collect(ImmutableList.toImmutableList()))
             .add(EventEmailConsumer.DEAD_LETTER_QUEUE)
             .add(CalendarDelegatedNotificationConsumer.DEAD_LETTER_QUEUE)
             .add(CalendarListNotificationConsumer.DEAD_LETTER_QUEUE)
             .add(ItipLocalDeliveryConsumer.DEAD_LETTER_QUEUE)
+            .add(EventAuditLogConsumer.AUDIT_DEAD_LETTER)
             .build();
     }
 }

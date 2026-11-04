@@ -432,7 +432,9 @@ Example response:
     {
       "_id": "adminId",
       "id": "adminId",
-      "objectType": "user"
+      "objectType": "user",
+      "davRight": "dav:read-write",
+      "access": 3
     }
   ],
   "timestamps": {
@@ -444,9 +446,11 @@ Example response:
 }
 ```
 
+`davRight` and integer `access` are resolved from Sabre: 3 is `dav:read-write`, 5 is `dav:administration`.
+
 ### GET /linagora.esn.resource/api/resources/{resourceId} (Deprecated)
 
-Deprecated in favor of `GET /api/resources/{resourceId}`, kept for OpenPaaS backward compatibility.
+Deprecated in favor of `GET /api/resources/{resourceId}`. It returns the same administrator fields.
 
 
 ### GET /images/icon/{icon}.svg
@@ -474,7 +478,7 @@ Computes the user avatar by rendering first letter in a fixed color square.
 
 ### POST /api/people/search
 
-This badly named HTTP method allows looking up the following resources in an auto complete manner: `user`, `contact`, `resources`. 
+This badly named HTTP method allows looking up the following resources in an auto complete manner: `user`, `contact`, `resource`, `team-calendar`. 
 
 Sample payloads:
 
@@ -587,6 +591,70 @@ Will return
 ```
 
 Most fields are hard coded to please the SPAs.
+
+### GET /api/entity/{id}
+
+```
+GET /api/entity/{id}
+```
+
+Aggregates `GET /api/resources/{id}`, `GET /api/users/{id}`, `GET /api/domains/{id}` and
+`GET /api/team-calendars/{id}` behind a single endpoint. It resolves the type of the entity from its id and
+returns the matching entity wrapped under a discriminating key: `user`, `resource`, `domain` or `teamCalendar`.
+The wrapped payload is identical to the one served by the corresponding dedicated endpoint.
+
+Cross-domain access is denied: a non-existent id, or an entity belonging to a domain the authenticated user may
+not access, returns a `404`.
+
+A user response:
+
+```json
+{
+  "user": {
+    "preferredEmail": "btellier@linagora.com",
+    "_id": "abcdef",
+    "objectType": "user",
+    "...": "..."
+  }
+}
+```
+
+A resource response:
+
+```json
+{
+  "resource": {
+    "_id": "abc123",
+    "name": "Meeting Room A",
+    "...": "..."
+  }
+}
+```
+
+A domain response:
+
+```json
+{
+  "domain": {
+    "_id": "abc123",
+    "name": "linagora.com",
+    "...": "..."
+  }
+}
+```
+
+A team calendar response:
+
+```json
+{
+  "teamCalendar": {
+    "_id": "abc123",
+    "name": "engineering",
+    "displayName": "Engineering Team",
+    "...": "..."
+  }
+}
+```
 
 ### GET /api/technicalToken/introspect
 
@@ -705,7 +773,7 @@ Deprecated in favor of `POST /api/import`, kept for OpenPaaS backward compatibil
 
 ### GET /api/domain/settings
 
-Retrieve settings of the domain which the authenticated user belongs to.
+Retrieve the effective (resolved) settings of the domain which the authenticated user belongs to. All fields always have a value — unset domain settings fall back to configuration file defaults, then system defaults.
 
 ```
 GET /api/domain/settings
@@ -713,10 +781,21 @@ GET /api/domain/settings
 
 Will return:
 
-```
+```json
 {
   "userSearchMode": "limited",
   "resourceSearchEnabled": false,
-  "defaultCalendarPublicVisibility": "read"
-} 
+  "defaultCalendarPublicVisibility": "read",
+  "calendarPublicVisibilitySettingEnabled": true
+}
 ```
+
+**Field values**:
+- `userSearchMode`: `"enabled"` | `"limited"` | `"disabled"`
+- `resourceSearchEnabled`: `true` | `false`
+- `defaultCalendarPublicVisibility`: `"read"` | `"private"`
+- `calendarPublicVisibilitySettingEnabled`: `true` | `false`
+
+**Status codes**:
+- `200`: settings returned
+- `401`: unauthenticated

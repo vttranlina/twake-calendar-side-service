@@ -115,6 +115,7 @@ This endpoint returns a webdmin task with the following additional information:
 
 - processedUserCount: integer
 - failedUserCount: integer
+- runningOptions.usersPerSecond: integer
 
 ### Add missing fields to registered users
 
@@ -162,6 +163,7 @@ Synchronizes LDAP members for **all existing domains**.
 
 Optional query parameters:
 - `ignoredDomains` : [String] Comma-separated list of domains to exclude from synchronization
+- `ldapFilter` : [String] Optional, URL-encoded LDAP search filter (RFC 4515). See [Restricting members with an LDAP filter](#restricting-members-with-an-ldap-filter).
 
 Example:
 
@@ -176,6 +178,29 @@ POST /addressbook/domain-members/{domain}?task=sync
 
 Synchronizes LDAP members only for the specified domain.
 
+Optional query parameters:
+- `ldapFilter` : [String] Optional, URL-encoded LDAP search filter (RFC 4515). See [Restricting members with an LDAP filter](#restricting-members-with-an-ldap-filter).
+
+### Restricting members with an LDAP filter
+
+By default the synchronization selects every LDAP entry whose `objectClass` matches the configured user
+object class and whose `mail` belongs to the domain. The optional `ldapFilter` parameter lets you narrow
+that selection: the provided filter is **AND-combined** with the default one.
+
+A typical use case is hiding a *secret department* from the global `Domain Members` address book while still
+synchronizing everyone else. Pass an exclusion filter so the secret department is never projected:
+
+```
+POST /addressbook/domain-members?task=sync&ldapFilter=(!(departmentNumber=SECRET))
+```
+
+> ⚠️ The synchronization computes a diff and **removes** from the `Domain Members` address book every
+> contact that is no longer returned by LDAP. As a consequence, a filtered synchronization deletes the
+> excluded members from the address book. You must therefore **always** run the synchronization with the
+> same filter — a subsequent unfiltered synchronization would re-add the previously excluded members.
+
+An invalid `ldapFilter` value results in a `400 Bad Request`.
+
 ### Task additional information
 
 Both endpoints will return a webadmin task with the following additional information:
@@ -185,6 +210,7 @@ Both endpoints will return a webadmin task with the following additional informa
     "type": "sync-domain-members-contacts-ldap-to-dav",
     "domain": null,
     "ignoredDomains": [ "twake.app" ],
+    "ldapFilter": "(!(departmentNumber=SECRET))",
     "timestamp": "${json-unit.any-string}",
     "addedCount": 1,
     "addFailureContacts": [],
@@ -194,6 +220,60 @@ Both endpoints will return a webadmin task with the following additional informa
     "deleteFailureContacts": []
 }
 ```
+
+`ldapFilter` is only present when the parameter was supplied.
+
+## Delete domain members contacts
+
+Removes the contacts stored in the `Domain Members` address book. This does **not** touch LDAP; it only
+clears the contacts that were projected into the DAV (CardDav) `domain-members` address book.
+
+Only enabled if LDAP is configured.
+
+### 1. Delete contacts of all domains
+```
+DELETE /addressbook/domain-members
+```
+
+Removes the `Domain Members` contacts of **all existing domains**.
+
+Optional query parameters:
+- `ignoredDomains` : [String] Comma-separated list of domains to exclude from the deletion
+
+Example:
+
+```
+DELETE /addressbook/domain-members?ignoredDomains=twake.app,example.org
+```
+
+### 2. Delete contacts of a single domain
+```
+DELETE /addressbook/domain-members/{domain}
+```
+
+Removes the `Domain Members` contacts only for the specified domain.
+
+Status codes:
+- `201`: Task successfully submitted
+- `400`: Invalid domain or `ignoredDomains` parameter
+- `404`: The specified domain does not exist (single-domain endpoint only)
+
+### Task additional information
+
+Both endpoints will return a webadmin task with the following additional information:
+
+```
+"additionalInformation": {
+    "type": "clear-domain-members-contacts-dav",
+    "domain": "twake.app",
+    "ignoredDomains": null,
+    "timestamp": "${json-unit.any-string}",
+    "deletedCount": 12,
+    "deleteFailureContacts": []
+}
+```
+
+Where `domain` is set for the single-domain endpoint and `ignoredDomains` is set for the all-domains endpoint.
 
 ## Calendar events
 
@@ -213,6 +293,8 @@ This endpoint returns a webdmin task with the following additional information:
 
  - processedEventCount: integer
  - failedEventCount: integer
+ - runningOptions.eventsPerSecond: integer
+ - runningOptions.calendarsConcurrency: integer
  
 
 ### Alarm rescheduling
@@ -229,6 +311,7 @@ This endpoint returns a webdmin task with the following additional information:
 
 - processedEventCount: integer
 - failedEventCount: integer
+- runningOptions.eventsPerSecond: integer
 
 ### Calendar event archival
 
@@ -307,6 +390,9 @@ Example task result:
   "additionalInformation": {
     "archivedEventCount": 12,
     "failedEventCount": 0,
+    "runningOptions": {
+      "eventsPerSecond": 100
+    },
     "criteria": {
       "createdBefore": "2025-12-22T00:00:00Z",
       "lastModifiedBefore": null,
@@ -321,6 +407,7 @@ Example task result:
 Where:
 - `archivedEventCount`: Number of events successfully archived
 - `failedEventCount`: Number of events that failed to be archived
+- `runningOptions.eventsPerSecond`: Effective throttling parameter used by the task
 - `criteria`: Effective archival criteria applied for the task
 
 **Note:** When using the single-user archival endpoint (`POST /calendars/{username}?task=archive`),
@@ -356,8 +443,14 @@ Will list existing resources for that domain:
     "domain": "linagora.com",
     "creator":"user1@linagora.com",
     "administrators": [
-      {"email": "user1@linagora.com"},
-      {"email": "user2@linagora.com"}
+      {
+        "email": "user1@linagora.com",
+        "davRight": "dav:read-write"
+      },
+      {
+        "email": "user2@linagora.com",
+        "davRight": "dav:administration"
+      }
     ]
   }
 ]
@@ -386,8 +479,14 @@ Will return the corresponding resource:
     "icon": "laptop",
     "domain": "linagora.com",
     "administrators": [
-      {"email": "user1@linagora.com"},
-      {"email": "user2@linagora.com"}
+      {
+        "email": "user1@linagora.com",
+        "davRight": "dav:read-write"
+      },
+      {
+        "email": "user2@linagora.com",
+        "davRight": "dav:administration"
+      }
     ]
   }
 ```
@@ -414,8 +513,14 @@ POST /domains/linagora.com/resources
   "creator":"user1@linagora.com",
   "icon": "laptop",
   "administrators": [
-    {"email": "user1@linagora.com"},
-    {"email": "user2@linagora.com"}
+    {
+      "email": "user1@linagora.com",
+      "davRight": "dav:read-write"
+    },
+    {
+      "email": "user2@linagora.com",
+      "davRight": "dav:administration"
+    }
   ]
 }
 ```
@@ -442,9 +547,8 @@ Status codes:
 A resource without administrator is not subject to the validation flow: any event request with this resource is
 automatically accepted.
 
-Please note that resource administrators:
- - are emailed upon events created that book the resource
- - have delegation write access to the calendar of the resource
+An administrator has `email` and an optional `davRight`: `dav:read-write` (access 3, default) or
+`dav:administration` (access 5). Responses return `davRight`.
 
 ### Updating a resource
 
@@ -455,7 +559,10 @@ PATCH /domains/linagora.com/resources/RESOURCE_ID
   "description": "Descripting 2",
   "icon": "battery",
   "administrators": [
-    {"email": "user2@linagora.com"}
+    {
+      "email": "user2@linagora.com",
+      "davRight": "dav:administration"
+    }
   ]
 }
 ```
@@ -464,20 +571,178 @@ Would update the resource accordingly. Each field is optional; omitting a field 
 
 Status codes: 204 if updated, 400 if invalid (e.g. administrator not found), 404 if domain or resource not found.
 
-Please note that resource administrators:
- - are emailed upon events created that book the resource
- - have delegation write access to the calendar of the resource. Removing an administrator revokes this delegation right.
+Both rights can update event participation; only `dav:administration` can manage the resource ACL.
 
-### Repositioning write rights for admins on resource calendar
+## Team calendar routes
+
+Team calendar routes manage team calendar metadata.
+Use the `id` as the stable identifier.
+
+All routes are scoped under a domain: `/domains/{domain}/team-calendars`.
+
+### Creating a team calendar
 
 ```
-POST /domains/linagora.com/resources?task=repositionWriteRights
+POST /domains/linagora.com/team-calendars
+{
+  "name": "sales",
+  "displayName": "Sales Team"
+}
 ```
 
-Will iterate on each resource and ensure current administrators have delegation write access to the resource calendar,
-allowing them to accept, reject and counter events in the name of the resource.
+Returns `201 Created` with a `Location` header and the created entity:
 
-Note that existing delegation write access granted to users no longer listed as administrators will not be revoked.
+```json
+{
+  "id": "64f1c2...",
+  "domainId": "6501a9...",
+  "domainName": "linagora.com",
+  "name": "sales",
+  "displayName": "Sales Team",
+  "creation": "2026-06-23T08:00:00Z",
+  "updated": "2026-06-23T08:00:00Z"
+}
+```
+
+Status codes:
+- `201` when created
+- `400` when the domain name or request body is invalid
+- `404` when the domain does not exist
+
+Creation is not idempotent.
+The `name` lookup can return several team calendars.
+
+### Listing team calendars
+
+```
+GET /domains/linagora.com/team-calendars
+```
+
+Returns all team calendars of the domain:
+
+```json
+[
+  {
+    "id": "64f1c2...",
+    "domainId": "6501a9...",
+    "domainName": "linagora.com",
+    "name": "sales",
+    "displayName": "Sales Team",
+    "creation": "2026-06-23T08:00:00Z",
+    "updated": "2026-06-23T08:00:00Z"
+  }
+]
+```
+
+Status codes:
+- `200` on success
+- `400` when the domain name is invalid
+- `404` when the domain does not exist
+
+### Getting a team calendar by id
+
+```
+GET /domains/linagora.com/team-calendars/64f1c2...
+```
+
+Returns the matching team calendar.
+
+Status codes:
+- `200` on success
+- `400` when the domain name is invalid
+- `404` when the domain or team calendar does not exist
+
+### Updating a team calendar display name
+
+```
+PATCH /domains/linagora.com/team-calendars/64f1c2...
+{
+  "displayName": "Global Sales"
+}
+```
+
+Only `displayName` is updated.
+
+Status codes:
+- `200` on success
+- `400` when the domain name or request body is invalid
+- `404` when the domain or team calendar does not exist
+
+### Deleting a team calendar
+
+```
+DELETE /domains/linagora.com/team-calendars/64f1c2...
+```
+
+Deletes the team calendar metadata.
+
+Status codes:
+- `204` on success
+- `400` when the domain name is invalid
+- `404` when the domain does not exist
+
+### Listing team calendar members
+
+```
+GET /domains/linagora.com/team-calendars/64f1c2.../members
+```
+
+Returns the Team Calendar members derived from DAV sharing rights:
+
+```json
+[
+  {
+    "username": "alice@linagora.com",
+    "role": "viewer",
+    "davRight": "dav:read"
+  },
+  {
+    "username": "bob@linagora.com",
+    "role": "manager",
+    "davRight": "dav:administration"
+  }
+]
+```
+
+Role mapping:
+- `viewer`: `dav:read`
+- `member`: `dav:read-write`
+- `manager`: `dav:administration`
+
+Status codes:
+- `200` on success
+- `400` when the domain name is invalid
+- `404` when the domain or team calendar does not exist
+- `500` when the DAV server cannot be reached or rejects the read operation
+
+### Adding / removing team calendar members
+
+```
+POST /domains/linagora.com/team-calendars/64f1c2.../members/invitee
+{
+  "share": {
+    "set": [
+      {"dav:href": "mailto:alice@linagora.com", "dav:read": true},
+      {"dav:href": "mailto:bob@linagora.com", "dav:read-write": true},
+      {"dav:href": "mailto:cedric@linagora.com", "dav:administration": true}
+    ],
+    "remove": [
+      {"dav:href": "mailto:david@linagora.com"}
+    ]
+  }
+}
+```
+
+Each set entry grants or updates the right for the given user; each remove entry revokes
+the sharing for the given user.
+This is a partial update: `set` grants or updates member rights, while `remove` revokes them. Omitted members are left
+unchanged.
+
+Status codes:
+- `204`: the sharees were updated
+- `400`: invalid domain name, malformed request body,candidate member is invalid or unknown...
+- `404`: the domain or team calendar does not exist
+- `500`: the DAV server cannot be reached or rejects the update operation
 
 ## Domain registered users routes
 
@@ -646,6 +911,596 @@ Revokes administrator rights of user `user1@linagora.com` for domain `linagora.c
 - `404` if the domain or user does not exist.
 - `400` if `domainName` or `username` has an invalid format.
 
+## Domain settings routes
+
+Manage per-domain configuration settings.
+
+### Retrieving domain settings
+
+```
+GET /domains/{domain}/settings
+```
+
+Example:
+
+```
+GET /domains/linagora.com/settings
+```
+
+Returns the explicitly configured settings for the domain alongside the effective resolved values. Fields at the top level set to `null` are not configured for this domain. The `resolved` object always contains the effective value after applying configuration file and system defaults as fallback.
+
+```json
+{
+  "userSearchMode": "limited",
+  "resourceSearchEnabled": null,
+  "defaultCalendarPublicVisibility": null,
+  "calendarPublicVisibilitySettingEnabled": null,
+  "resolved": {
+    "userSearchMode": "limited",
+    "resourceSearchEnabled": true,
+    "defaultCalendarPublicVisibility": "read",
+    "calendarPublicVisibilitySettingEnabled": true
+  }
+}
+```
+
+**Field values** (top-level and `resolved`):
+- `userSearchMode`: `"enabled"` | `"limited"` | `"disabled"` (top-level also allows `null`)
+- `resourceSearchEnabled`: `true` | `false` (top-level also allows `null`)
+- `defaultCalendarPublicVisibility`: `"read"` | `"private"` (top-level also allows `null`)
+- `calendarPublicVisibilitySettingEnabled`: `true` | `false` (top-level also allows `null`)
+
+**Status codes**:
+- `200`: settings returned (all fields `null` when nothing has been configured)
+- `400`: domain name has an invalid format
+- `404`: domain does not exist
+
+---
+
+### Updating domain settings
+
+```
+PUT /domains/{domain}/settings
+{
+  "userSearchMode": "limited",
+  "resourceSearchEnabled": false,
+  "defaultCalendarPublicVisibility": null,
+  "calendarPublicVisibilitySettingEnabled": true
+}
+```
+
+All fields are required. A `null` value clears the setting for that field, causing it to fall back to the system default.
+
+**Status codes**:
+- `204`: settings saved
+- `400`: a required field is missing, an unknown field is present, or a field value is invalid
+- `404`: domain does not exist
+
+---
+
+### Partially updating domain settings
+
+```
+PATCH /domains/{domain}/settings
+{
+  "userSearchMode": "limited",
+  "resourceSearchEnabled": null,
+  "calendarPublicVisibilitySettingEnabled": false
+}
+```
+
+All fields are optional. Only the fields present in the body are updated:
+- A non-null value updates that field to the given value
+- A `null` value clears that field (reverts to system default at resolution time)
+- An absent field is left unchanged
+
+**Status codes**:
+- `204`: patch applied
+- `400`: a field value is invalid
+- `404`: domain does not exist
+
+---
+
+## User calendar management routes
+
+Administrative management of user calendars. These routes proxy the esn-sabre JSON API:
+each call is translated into the corresponding DAV server call, authenticated by impersonating
+the targeted user. The user is identified by his email address; the associated technical user
+id is resolved automatically.
+
+All routes return:
+- `400`: the username is invalid or the request body is malformed
+- `404`: the user is not registered (`User does not exist`)
+
+### Listing the calendars of a user
+
+```
+GET /users/{usernameToBeUsed}/calendars
+```
+
+Example:
+
+```
+GET /users/btellier@linagora.com/calendars
+```
+
+Proxies `GET /calendars/{userId}.json?personal=true&sharedDelegationStatus=accepted&sharedPublicSubscription=true&withRights=true`
+on the DAV server and returns the DAV server response verbatim. This includes personal calendars,
+accepted delegations and public subscriptions, with their rights (`acl` and `invite` fields).
+
+```json
+{
+  "_links": {"self": {"href": "/calendars/5f50a663bdaffe002629099c.json"}},
+  "_embedded": {
+    "dav:calendar": [
+      {
+        "_links": {"self": {"href": "/calendars/5f50a663bdaffe002629099c/5f50a663bdaffe002629099c.json"}},
+        "dav:name": "#default",
+        "apple:color": "#006400",
+        "caldav:description": "",
+        "acl": ["..."],
+        "invite": ["..."]
+      }
+    ]
+  }
+}
+```
+
+**Status codes**:
+- `200`: the calendar list is returned
+
+### Creating a calendar
+
+```
+POST /users/{usernameToBeUsed}/calendars
+{
+  "id": "0e26ee47-cc4b-4aaa-8447-12588fdb11f1",
+  "dav:name": "My calendar",
+  "apple:color": "#F5CFD0",
+  "caldav:description": "Some description"
+}
+```
+
+Supported fields:
+- `id` (optional): the collection identifier of the calendar to create. Generated (random UUID) when absent.
+- `dav:name` (required): display name of the calendar
+- `apple:color` (optional): color of the calendar
+- `caldav:description` (optional): description of the calendar
+
+Returns the identifier of the created calendar:
+
+```json
+{"id": "0e26ee47-cc4b-4aaa-8447-12588fdb11f1"}
+```
+
+**Status codes**:
+- `201`: the calendar was created
+- `400`: `dav:name` is missing or an unknown field is present
+
+### Deleting a calendar
+
+```
+DELETE /users/{usernameToBeUsed}/calendars/{calendarId}
+```
+
+Example:
+
+```
+DELETE /users/btellier@linagora.com/calendars/0c5413b9-2ca3-4669-ae44-0d8083344ca8
+```
+
+Where `{calendarId}` is the collection identifier of the calendar, as returned by the listing route.
+
+Also works for calendars obtained through delegation and subscriptions to public calendars:
+deleting them removes the delegated copy / the subscription of this user, not the source calendar.
+
+**Status codes**:
+- `204`: the calendar was deleted
+- `404`: the user or the calendar does not exist
+
+### Updating details of a calendar
+
+```
+PATCH /users/{usernameToBeUsed}/calendars/{calendarId}
+{
+  "dav:name": "B test 2",
+  "caldav:description": "sample desc",
+  "apple:color": "#F5CFD0"
+}
+```
+
+Proxies a `PROPPATCH` on the calendar. All fields are optional but at least one must be present.
+Unknown fields are rejected.
+
+**Status codes**:
+- `204`: the calendar was updated
+- `400`: empty body or unknown field
+- `404`: the user or the calendar does not exist
+
+### Changing the public visibility of a calendar
+
+```
+POST /users/{usernameToBeUsed}/calendars/{calendarId}/publicRight
+{
+  "public_right": "{DAV:}read"
+}
+```
+
+Supported `public_right` values:
+- `"{DAV:}read"`: anyone authenticated can read the calendar (public calendar)
+- `""`: removes public rights (private calendar)
+
+**Status codes**:
+- `204`: the public visibility was updated
+- `400`: missing or unsupported `public_right` value
+- `404`: the user or the calendar does not exist
+
+### Adding / removing invitees (delegation)
+
+```
+POST /users/{usernameToBeUsed}/calendars/{calendarId}/invitee
+{
+  "share": {
+    "set": [
+      {"dav:href": "mailto:twake-calendar-dev@linagora.com", "dav:administration": true},
+      {"dav:href": "mailto:cmoussu@linagora.com", "dav:read": true},
+      {"dav:href": "mailto:xguimard@linagora.com", "dav:read-write": true}
+    ],
+    "remove": [
+      {"dav:href": "mailto:xxx@linagora.com"}
+    ]
+  }
+}
+```
+
+The body is proxied verbatim to the DAV server. Each `set` entry grants a right to the given
+user (`dav:read`, `dav:read-write` or `dav:administration`), each `remove` entry revokes
+the sharing for the given user.
+
+**Status codes**:
+- `204`: the sharees were updated
+- `400`: missing `share` field, `dav:href` is not a `mailto:` URI, or a `set` entry carries no right
+- `404`: the user or the calendar does not exist
+
+## User address book management routes
+
+Administrative management of user address books. These routes proxy the Sabre DAV server,
+impersonating the targeted user. The user is identified by their email address; the associated
+technical user id is resolved automatically.
+
+All routes return:
+- `400`: the username is invalid or the request body is malformed
+- `404`: the user is not registered (`User does not exist`)
+
+### Listing the address books of a user
+
+```
+GET /users/{username}/addressbooks
+```
+
+Example:
+
+```
+GET /users/btellier@linagora.com/addressbooks
+```
+
+Returns the DAV server response verbatim, including the default `contacts` address book and any custom ones.
+
+```json
+{
+  "_links": {"self": {"href": "/addressbooks/5f50a663bdaffe002629099c.json"}},
+  "_embedded": {
+    "dav:addressbook": [
+      {
+        "_links": {"self": {"href": "/addressbooks/5f50a663bdaffe002629099c/contacts.json"}},
+        "dav:name": "My contacts",
+        "carddav:description": ""
+      }
+    ]
+  }
+}
+```
+
+**Status codes**:
+- `200`: the address book list is returned
+
+### Creating an address book
+
+```
+POST /users/{username}/addressbooks
+{
+  "id": "0e26ee47-cc4b-4aaa-8447-12588fdb11f1",
+  "dav:name": "My Contacts",
+  "carddav:description": "Personal contacts"
+}
+```
+
+Supported fields:
+- `id` (optional): the collection identifier of the address book to create. Generated (random UUID) when absent.
+- `dav:name` (required): display name of the address book
+- `carddav:description` (optional): description of the address book
+
+Returns the identifier of the created address book:
+
+```json
+{"id": "0e26ee47-cc4b-4aaa-8447-12588fdb11f1"}
+```
+
+**Status codes**:
+- `201`: the address book was created
+- `400`: `dav:name` is missing or the request body is malformed
+- `404`: the user does not exist
+
+### Deleting an address book
+
+```
+DELETE /users/{username}/addressbooks/{addressBookId}
+```
+
+Example:
+
+```
+DELETE /users/btellier@linagora.com/addressbooks/0e26ee47-cc4b-4aaa-8447-12588fdb11f1
+```
+
+**Status codes**:
+- `204`: the address book was deleted
+- `400`: attempting to delete a system address book (e.g. `contacts`)
+- `404`: the user or the address book does not exist
+
+### Changing the public visibility of an address book
+
+```
+POST /users/{username}/addressbooks/{addressBookId}/publicRight
+{
+  "public_right": "{DAV:}read"
+}
+```
+
+Supported `public_right` values:
+- `"{DAV:}read"`: anyone authenticated can read the address book (public)
+- `""`: removes public rights (private)
+
+**Status codes**:
+- `204`: the public visibility was updated
+- `400`: missing or unsupported `public_right` value
+- `404`: the user or the address book does not exist
+
+### Adding / removing invitees (sharing)
+
+```
+POST /users/{username}/addressbooks/{addressBookId}/invitee
+{
+  "dav:sharee": [
+    {"dav:href": "mailto:alice@linagora.com", "dav:share-access": 3},
+    {"dav:href": "mailto:bob@linagora.com", "dav:share-access": 5}
+  ]
+}
+```
+
+Each entry in `dav:sharee` sets the access level for the given user. The `dav:share-access` field
+accepts integer values between 2 and 5 matching the WebDAV sharing spec:
+- `2`: read access
+- `3`: read-write access
+- `4`: administration access
+- `5`: no access (revokes sharing)
+
+**Status codes**:
+- `204`: the sharees were updated
+- `400`: missing or malformed `dav:sharee` array, or an invalid `dav:share-access` value
+- `404`: the user or the address book does not exist
+
+## User booking link routes
+
+These routes let an administrator manage the [booking links](bookingLink.md) of a given user.
+They mirror the end-user `/api/booking-links` API but are scoped to an explicit `{username}`
+path parameter.
+
+Differences with the end-user API:
+
+- No per-user settings resolution happens here. Availability rules without an explicit
+  `timeZone` are interpreted in **UTC**, and an omitted `availabilityRules` on creation stores
+  no rule (instead of defaulting to the user's business hours).
+- Authentication is the standard WebAdmin one (not the end-user token).
+
+The booking link object and the availability rule object share the same shape as the
+[Booking Link API](bookingLink.md#data-model).
+
+### Listing the booking links of a user
+
+```
+GET /users/{username}/booking-links
+```
+
+Returns the booking links of the user, sorted by update time (most recent first).
+
+```
+HTTP/1.1 200 OK
+Content-Type: application/json
+
+[
+  {
+    "publicId": "550e8400-e29b-41d4-a716-446655440000",
+    "calendarUrl": "/calendars/67c3a792e4b0884b05ef8aef/67c3a792e4b0884b05ef8aef",
+    "durationMinutes": 30,
+    "active": true,
+    "autoAccept": false,
+    "name": "Intro call",
+    "description": "Book a 30-minute introduction call",
+    "color": "#6B4ECC",
+    "location": "Room 3, Building A",
+    "visibility": "PRIVATE",
+    "transparency": "TRANSPARENT",
+    "resources": ["68a1b2c3d4e5f60718293a4b"],
+    "alarm": [ { "period": "-PT10M", "action": "EMAIL" } ],
+    "availabilityRules": [
+      { "type": "weekly", "dayOfWeek": "MON", "start": "09:00", "end": "17:00", "timeZone": "UTC" }
+    ]
+  }
+]
+```
+
+`availabilityRules`, `extraAttendees`, `name`, `description`, `location`, `visibility`, `transparency`,
+`resources` and `alarm` are omitted from an entry when not set. The `color` field is always present, defaulting
+to `#6B4ECC` when not set.
+
+**Status codes**:
+- `200`: the list is returned (possibly empty)
+- `400`: invalid `username`
+- `404`: the user does not exist
+
+### Getting a booking link
+
+```
+GET /users/{username}/booking-links/{publicId}
+```
+
+**Status codes**:
+- `200`: the booking link is returned
+- `400`: invalid `username` or `publicId` (not a UUID)
+- `404`: the user does not exist, or the booking link does not exist for that user
+
+### Creating a booking link
+
+```
+POST /users/{username}/booking-links
+{
+  "calendarUrl": "/calendars/67c3a792e4b0884b05ef8aef/67c3a792e4b0884b05ef8aef",
+  "durationMinutes": 30,
+  "active": true,
+  "autoAccept": false,
+  "name": "Intro call",
+  "description": "Book a 30-minute introduction call",
+  "color": "#6B4ECC",
+  "location": "Room 3, Building A",
+  "visibility": "PRIVATE",
+  "transparency": "TRANSPARENT",
+  "resources": ["68a1b2c3d4e5f60718293a4b"],
+  "alarm": [ { "period": "-PT10M", "action": "EMAIL" } ],
+  "extraAttendees": { "and": [{ "participant": "67c3a792e4b0884b05ef8af0" }] },
+  "availabilityRules": [
+    { "type": "weekly", "dayOfWeek": "MON", "start": "09:00", "end": "12:00", "timeZone": "Europe/Paris" }
+  ]
+}
+```
+
+`calendarUrl`, `durationMinutes` and `active` are required. `autoAccept` (default `false`), `availabilityRules`, `extraAttendees` (empty by default), `name`, `description`, `color` (default `#6B4ECC`), `location`, `visibility` (`PUBLIC`/`PRIVATE`), `transparency` (`OPAQUE`/`TRANSPARENT`), `resources` and `alarm` are optional.
+
+`extraAttendees` holds a tree of the registered users invited on every booked event, and whose availability
+narrows down the offered slots. Only a single `and` of `participant` leaves is supported today. See the 
+[booking link API](bookingLink.md#extra-attendees) for details.
+
+`resources` are resource ids of the owner's domain added as attendees, and `alarm` is an array of `{period, action}` alarms added to the booked events.
+
+```
+HTTP/1.1 201 Created
+Location: /users/{username}/booking-links/550e8400-e29b-41d4-a716-446655440000
+Content-Type: application/json
+
+{
+  "bookingLinkPublicId": "550e8400-e29b-41d4-a716-446655440000"
+}
+```
+
+**Status codes**:
+- `201`: the booking link was created
+- `400`: invalid `username`, missing/invalid field, unknown rule type, invalid `timeZone`, the calendar does not exist for that user, an extra attendee is unknown or is the owner, invalid `visibility`/`transparency`/`alarm`, or a resource is unknown or in another domain
+- `404`: the user does not exist
+
+### Updating a booking link
+
+```
+PATCH /users/{username}/booking-links/{publicId}
+{
+  "durationMinutes": 60,
+  "active": false
+}
+```
+
+Only the fields present in the body are updated. At least one field must be provided.
+Set `availabilityRules` to `null` to remove all rules. Set `extraAttendees` to `null` or `{"and": []}` to
+remove them all. Set `resources` to `null` or `[]` to remove them all. Set `name`, `description`, `location`,
+`visibility`, `transparency` or `alarm` to `null` or a blank value to remove them.
+
+**Status codes**:
+- `204`: the booking link was updated
+- `400`: invalid `username` or `publicId`, no field provided, invalid value, invalid `timeZone`, the calendar does not exist for that user, invalid `visibility`/`transparency`/`alarm`, or a resource is unknown or in another domain
+- `404`: the user does not exist, or the booking link does not exist for that user
+
+### Deleting a booking link
+
+```
+DELETE /users/{username}/booking-links/{publicId}
+```
+
+**Status codes**:
+- `204`: the booking link was deleted
+- `400`: invalid `username` or `publicId`
+- `404`: the user does not exist, or the booking link does not exist for that user
+
+### Resetting the public id of a booking link
+
+```
+POST /users/{username}/booking-links/{publicId}/reset
+```
+
+Generates a new public id for the booking link, invalidating the old one.
+
+```
+HTTP/1.1 200 OK
+Content-Type: application/json
+
+{
+  "bookingLinkPublicId": "9f4f2166-95c4-4d3e-b421-23dc5e8a1fbb"
+}
+```
+
+**Status codes**:
+- `200`: a new public id was generated and returned
+- `400`: invalid `username` or `publicId`
+- `404`: the user does not exist, or the booking link does not exist for that user
+
+### Deleting all events created by a booking link
+
+```
+POST /users/{username}/booking-links/{publicId}?action=deleteEvents
+```
+
+Schedules an asynchronous task that deletes all events that were created through the given booking
+link (matched on the `X-OPENPAAS-BOOKING-LINK` property indexed for the booking link calendar).
+This is convenient for a mass clean up, for example after a booking link has been compromised.
+
+**Query parameters**
+
+| Parameter | Required | Description |
+|-----------|----------|-------------|
+| `action`  | yes      | Must be `deleteEvents` |
+| `since`   | no       | ISO-8601 instant (e.g. `2026-01-26T00:00:00Z`). When provided, only events created (or last modified) at or after this instant are deleted. Defaults to no filtering, i.e. all events of the booking link are deleted. |
+
+```
+HTTP/1.1 201 Created
+Content-Type: application/json
+
+{
+  "taskId": "6d2b6c0c-9c6a-4f4f-9c2e-1b7d2b0b0a1a"
+}
+```
+
+The scheduled task has the following `additionalInformation`:
+
+| Field                  | Description                                       |
+|------------------------|---------------------------------------------------|
+| `username`             | The owner of the booking link                     |
+| `bookingLinkPublicId`  | The public id of the booking link                 |
+| `since`                | The `since` instant when provided                 |
+| `deletedEventCount`    | Number of events successfully deleted             |
+| `failedEventCount`     | Number of events that could not be deleted        |
+
+**Status codes**:
+- `201`: the task was created, the response holds its `taskId`
+- `400`: invalid `username` or `publicId`, unsupported `action`, or invalid `since`
+- `404`: the user does not exist, or the booking link does not exist for that user
+
 ## Domain-scoped task routes
 
 These routes provide domain-filtered access to the standard webadmin task management endpoints. They are intended for WebAdmin proxies that enforce multi-tenancy based on the domain in the URL. A task is only accessible if it belongs to the specified domain; otherwise a `404` is returned (to avoid leaking task IDs across domains).
@@ -657,6 +1512,7 @@ The following task types are domain-scoped:
 | `calendar-archival` (single-user) | domain extracted from `targetUser` |
 | `DeleteUserDataTask` | domain extracted from `username` |
 | `sync-domain-members-contacts-ldap-to-dav` (single-domain) | `domain` field in additional information |
+| `clear-domain-members-contacts-dav` (single-domain) | `domain` field in additional information |
 
 Multi-domain tasks (e.g. archive all users, sync all domains) are not attributed to any specific domain and are therefore not accessible through these routes.
 

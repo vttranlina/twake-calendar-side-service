@@ -52,7 +52,7 @@ import com.mongodb.reactivestreams.client.MongoDatabase;
 public class CardDavClientTest {
 
     @RegisterExtension
-    static SabreDavExtension sabreDavExtension = new SabreDavExtension(DockerSabreDavSetup.SINGLETON);
+    static SabreDavExtension sabreDavExtension = SabreDavExtension.shared();
 
     private static DavTestHelper davTestHelper;
 
@@ -73,7 +73,7 @@ public class CardDavClientTest {
     }
 
     @Test
-    void createContactShouldSucceed() {
+    void upsertContactShouldSucceed() {
         String addressBook = "collected";
         String vcardUid = UUID.randomUUID().toString();
         String vcard = """
@@ -87,7 +87,7 @@ public class CardDavClientTest {
             """.formatted(vcardUid);
         AddressBookURL addressBookURL = new AddressBookURL(user.id(), addressBook);
 
-        testee.createContact(user.username(), addressBookURL, vcardUid, vcard.getBytes(StandardCharsets.UTF_8)).block();
+        testee.upsertContact(user.username(), addressBookURL, vcardUid, vcard.getBytes(StandardCharsets.UTF_8)).block();
 
         String actual = new String(testee.exportContact(user.username(), addressBookURL).block(), StandardCharsets.UTF_8);
 
@@ -95,7 +95,7 @@ public class CardDavClientTest {
     }
 
     @Test
-    void createContactShouldThrowWhenInvalidAddressBook() {
+    void upsertContactShouldThrowWhenInvalidAddressBook() {
         String addressBook = "invalid";
         String vcardUid = UUID.randomUUID().toString();
         String vcard = """
@@ -109,8 +109,35 @@ public class CardDavClientTest {
             """.formatted(vcardUid);
 
         assertThatThrownBy(() ->
-            testee.createContact(user.username(), new AddressBookURL(user.id(), addressBook), vcardUid, vcard.getBytes(StandardCharsets.UTF_8)).block()
+            testee.upsertContact(user.username(), new AddressBookURL(user.id(), addressBook), vcardUid, vcard.getBytes(StandardCharsets.UTF_8)).block()
         ).isInstanceOf(DavClientException.class);
+    }
+
+    @Test
+    void retrieveContactShouldReturnExistingContact() {
+        ContactUid contactUid = new ContactUid(UUID.randomUUID().toString());
+        String vcard = """
+            BEGIN:VCARD
+            VERSION:4.0
+            UID:{uid}
+            FN:John Doe
+            EMAIL:john.doe@example.com
+            END:VCARD
+            """.replace("{uid}", contactUid.value());
+        AddressBookURL addressBookURL = new AddressBookURL(user.id(), "collected");
+        testee.upsertContact(user.username(), addressBookURL, contactUid.value(), vcard.getBytes(StandardCharsets.UTF_8)).block();
+
+        assertThat(testee.retrieveContact(user.username(), addressBookURL, contactUid).blockOptional())
+            .hasValueSatisfying(actual -> assertThat(new String(actual, StandardCharsets.UTF_8))
+                .contains("UID:" + contactUid.value(), "EMAIL:john.doe@example.com"));
+    }
+
+    @Test
+    void retrieveContactShouldReturnEmptyWhenContactDoesNotExist() {
+        AddressBookURL addressBookURL = new AddressBookURL(user.id(), "collected");
+
+        assertThat(testee.retrieveContact(user.username(), addressBookURL, new ContactUid(UUID.randomUUID().toString())).blockOptional())
+            .isEmpty();
     }
 
     @Test
@@ -139,8 +166,8 @@ public class CardDavClientTest {
 
         AddressBookURL addressBookURL = new AddressBookURL(user.id(), addressBook);
 
-        testee.createContact(user.username(), addressBookURL, vcardUid, vcard.getBytes(StandardCharsets.UTF_8)).block();
-        testee.createContact(user.username(), addressBookURL, vcardUid2, vcard2.getBytes(StandardCharsets.UTF_8)).block();
+        testee.upsertContact(user.username(), addressBookURL, vcardUid, vcard.getBytes(StandardCharsets.UTF_8)).block();
+        testee.upsertContact(user.username(), addressBookURL, vcardUid2, vcard2.getBytes(StandardCharsets.UTF_8)).block();
 
         String actual = new String(testee.exportContact(user.username(), addressBookURL).block(), StandardCharsets.UTF_8);
 
@@ -164,6 +191,28 @@ public class CardDavClientTest {
         assertThatThrownBy(() ->
             testee.exportContact(user.username(), new AddressBookURL(user.id(), addressBook)).block()
         ).isInstanceOf(DavClientException.class);
+    }
+
+    @Test
+    void retrieveSyncTokenShouldReturnCurrentAddressBookToken() {
+        AddressBookURL addressBookURL = new AddressBookURL(user.id(), "contacts");
+
+        SyncToken initialToken = testee.retrieveSyncToken(user.username(), addressBookURL).block();
+
+        String vcardUid = UUID.randomUUID().toString();
+        String vcard = """
+            BEGIN:VCARD
+            VERSION:3.0
+            UID:%s
+            FN:John Doe
+            END:VCARD
+            """.formatted(vcardUid);
+        testee.upsertContact(user.username(), addressBookURL, vcardUid, vcard.getBytes(StandardCharsets.UTF_8)).block();
+
+        SyncToken updatedToken = testee.retrieveSyncToken(user.username(), addressBookURL).block();
+
+        assertThat(initialToken.value()).isNotBlank();
+        assertThat(updatedToken).isNotEqualTo(initialToken);
     }
 
     @Test
@@ -642,8 +691,8 @@ public class CardDavClientTest {
             END:VCARD
             """.formatted(vcardUid2);
         AddressBookURL addressBookURL = new AddressBookURL(user.id(), addressBook);
-        testee.createContact(user.username(), addressBookURL, vcardUid, vcard.getBytes(StandardCharsets.UTF_8)).block();
-        testee.createContact(user.username(), addressBookURL, vcardUid2, vcard2.getBytes(StandardCharsets.UTF_8)).block();
+        testee.upsertContact(user.username(), addressBookURL, vcardUid, vcard.getBytes(StandardCharsets.UTF_8)).block();
+        testee.upsertContact(user.username(), addressBookURL, vcardUid2, vcard2.getBytes(StandardCharsets.UTF_8)).block();
         testee.deleteContact(user.username(), addressBookURL, vcardUid).block();
 
         String actual = new String(testee.exportContact(user.username(), addressBookURL).block(), StandardCharsets.UTF_8);
@@ -672,8 +721,8 @@ public class CardDavClientTest {
             END:VCARD
             """.formatted(vcardUid2);
         AddressBookURL addressBookURL = new AddressBookURL(user.id(), addressBook);
-        testee.createContact(user.username(), addressBookURL, vcardUid1, vcard1.getBytes(StandardCharsets.UTF_8)).block();
-        testee.createContact(user.username(), addressBookURL, vcardUid2, vcard2.getBytes(StandardCharsets.UTF_8)).block();
+        testee.upsertContact(user.username(), addressBookURL, vcardUid1, vcard1.getBytes(StandardCharsets.UTF_8)).block();
+        testee.upsertContact(user.username(), addressBookURL, vcardUid2, vcard2.getBytes(StandardCharsets.UTF_8)).block();
         testee.deleteContact(user.username(), addressBookURL, vcardUid1).block();
         String actual = new String(testee.exportContact(user.username(), addressBookURL).block(), StandardCharsets.UTF_8);
 
@@ -710,7 +759,7 @@ public class CardDavClientTest {
             END:VCARD
             """.formatted(vcardUid);
 
-        testee.createContact(user.username(), new AddressBookURL(user.id(), addressBook), vcardUid,
+        testee.upsertContact(user.username(), new AddressBookURL(user.id(), addressBook), vcardUid,
             vcard.getBytes(StandardCharsets.UTF_8)).block();
 
         AddressBookURL url = new AddressBookURL(user.id(), addressBook);
@@ -756,7 +805,7 @@ public class CardDavClientTest {
             END:VCARD
             """.formatted(vcardUid);
 
-        testee.createContact(owner.username(), new AddressBookURL(owner.id(), addressBook), vcardUid,
+        testee.upsertContact(owner.username(), new AddressBookURL(owner.id(), addressBook), vcardUid,
             vcard.getBytes(StandardCharsets.UTF_8)).block();
 
         AddressBookURL ownerAddressBookUrl = new AddressBookURL(owner.id(), addressBook);
@@ -786,4 +835,3 @@ public class CardDavClientTest {
         return new MongoDBOpenPaaSDomainDAO(database);
     }
 }
-

@@ -43,7 +43,6 @@ import org.apache.james.task.TaskExecutionDetails;
 import org.apache.james.task.TaskManager;
 import org.apache.james.utils.UpdatableTickingClock;
 import org.apache.james.webadmin.WebAdminServer;
-import org.apache.james.webadmin.WebAdminUtils;
 import org.apache.james.webadmin.routes.TasksRoutes;
 import org.apache.james.webadmin.utils.JsonTransformer;
 import org.junit.jupiter.api.AfterEach;
@@ -53,7 +52,6 @@ import org.junit.jupiter.api.extension.RegisterExtension;
 
 import com.google.common.collect.ImmutableSet;
 import com.linagora.calendar.dav.CalDavClient;
-import com.linagora.calendar.dav.DockerSabreDavSetup;
 import com.linagora.calendar.dav.SabreDavExtension;
 import com.linagora.calendar.storage.CalendarURL;
 import com.linagora.calendar.storage.OpenPaaSUser;
@@ -71,7 +69,7 @@ import reactor.core.publisher.Mono;
 public class CalendarArchivalTest {
 
     @RegisterExtension
-    static SabreDavExtension sabreDavExtension = new SabreDavExtension(DockerSabreDavSetup.SINGLETON);
+    static SabreDavExtension sabreDavExtension = SabreDavExtension.shared();
 
     private WebAdminServer webAdminServer;
     private OpenPaaSUserDAO userDAO;
@@ -737,6 +735,7 @@ public class CalendarArchivalTest {
             .queryParam("masterDtStartBefore", "5d")
             .queryParam("isRejected", "true")
             .queryParam("isNotRecurring", "true")
+            .queryParam("eventsPerSecond", 12)
         .when()
             .post()
         .then()
@@ -756,7 +755,8 @@ public class CalendarArchivalTest {
             .body("additionalInformation.criteria.lastModifiedBefore", is("2025-12-25T00:00:00Z"))
             .body("additionalInformation.criteria.masterDtStartBefore", is("2025-12-27T00:00:00Z"))
             .body("additionalInformation.criteria.rejectedOnly", is(true))
-            .body("additionalInformation.criteria.isNotRecurring", is(true));
+            .body("additionalInformation.criteria.isNotRecurring", is(true))
+            .body("additionalInformation.runningOptions.eventsPerSecond", is(12));
     }
 
     @Test

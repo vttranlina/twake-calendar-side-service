@@ -62,12 +62,17 @@ import org.junit.jupiter.api.Order;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.RegisterExtension;
 import org.mockito.Mockito;
+import org.awaitility.Awaitility;
+import org.awaitility.core.ConditionFactory;
 
 import com.github.fge.lambdas.Throwing;
 import com.linagora.calendar.dav.CalDavClient;
 import com.linagora.calendar.dav.CalDavClient.NewCalendar;
 import com.linagora.calendar.dav.DavTestHelper;
 import com.linagora.calendar.dav.DockerSabreDavSetup;
+import com.linagora.calendar.dav.ResourceService;
+import com.linagora.calendar.dav.DavRight;
+import com.linagora.calendar.dav.ResourceService.ResourceAdministrator;
 import com.linagora.calendar.dav.SabreDavExtension;
 import com.linagora.calendar.dav.dto.SubscribedCalendarRequest;
 import com.linagora.calendar.smtp.EventEmailFilter;
@@ -84,8 +89,6 @@ import com.linagora.calendar.storage.OpenPaaSUserDAO;
 import com.linagora.calendar.storage.ResourceDAO;
 import com.linagora.calendar.storage.ResourceInsertRequest;
 import com.linagora.calendar.storage.configuration.resolver.SettingsBasedResolver;
-import com.linagora.calendar.storage.model.ResourceAdministrator;
-import com.linagora.calendar.storage.model.ResourceId;
 import com.linagora.calendar.storage.mongodb.MongoDBOpenPaaSDomainDAO;
 import com.linagora.calendar.storage.mongodb.MongoDBOpenPaaSUserDAO;
 import com.linagora.calendar.storage.mongodb.MongoDBResourceDAO;
@@ -98,10 +101,15 @@ import io.restassured.specification.RequestSpecification;
 import reactor.core.publisher.Mono;
 
 public class CalendarDelegatedNotificationConsumerTest {
+    private static final ConditionFactory negativeAwait = Awaitility.with()
+        .pollInterval(Duration.ofMillis(200))
+        .pollDelay(Duration.ZERO)
+        .await()
+        .during(Duration.ofSeconds(1));
 
     @RegisterExtension
     @Order(1)
-    static SabreDavExtension sabreDavExtension = new SabreDavExtension(DockerSabreDavSetup.SINGLETON);
+    static SabreDavExtension sabreDavExtension = SabreDavExtension.shared();
 
     @RegisterExtension
     @Order(2)
@@ -117,6 +125,7 @@ public class CalendarDelegatedNotificationConsumerTest {
     private CalDavClient calDavClient;
     private CalendarDelegatedNotificationConsumer consumer;
     private ResourceDAO resourceDAO;
+    private ResourceService resourceService;
 
     private OpenPaaSUser bob;
     private OpenPaaSUser alice;
@@ -156,8 +165,11 @@ public class CalendarDelegatedNotificationConsumerTest {
         bob = sabreDavExtension.newTestUser(Optional.of("Bob"));
         alice = sabreDavExtension.newTestUser(Optional.of("Alice"));
         MongoDatabase mongoDB = sabreDavExtension.dockerSabreDavSetup().getMongoDB();
-        domain = new MongoDBOpenPaaSDomainDAO(mongoDB).retrieve(bob.username().getDomainPart().get()).block();
+        MongoDBOpenPaaSDomainDAO domainDAO = new MongoDBOpenPaaSDomainDAO(mongoDB);
+        domain = domainDAO.retrieve(bob.username().getDomainPart().get()).block();
         resourceDAO = new MongoDBResourceDAO(mongoDB, Clock.systemUTC());
+        OpenPaaSUserDAO userDAO = new MongoDBOpenPaaSUserDAO(mongoDB, domainDAO);
+        resourceService = new ResourceService(userDAO, resourceDAO, calDavClient);
 
         when(settingsResolver.resolveOrDefault(any(Username.class)))
             .thenReturn(Mono.just(new SettingsBasedResolver.ResolvedSettings(
@@ -298,7 +310,7 @@ public class CalendarDelegatedNotificationConsumerTest {
     }
 
     @Test
-    void shouldNotSendMailWhenEventEmailFilterRejects() throws InterruptedException {
+    void shouldNotSendMailWhenEventEmailFilterRejects() {
         when(eventEmailFilter.shouldProcess(any())).thenReturn(false);
 
         String calendarName = "Bob Private FilterTest";
@@ -312,16 +324,15 @@ public class CalendarDelegatedNotificationConsumerTest {
         calDavClient.patchReadWriteDelegations(domain.id(), new CalendarURL(bob.id(), new OpenPaaSId(bobCalendar.id())),
             List.of(alice.username()), List.of()).block();
 
-        Thread.sleep(1000);
         // Then: no mail should be sent
-        awaitAtMost.untilAsserted(() ->
+        negativeAwait.untilAsserted(() ->
             assertThat(smtpMailsResponseSupplier.get().getList("")).isEmpty());
     }
 
     @Test
     void shouldSendMailWhenResourceCalendarIsDelegatedToUser() {
         String resourceName = "TV";
-        createResourceViaWebAdmin(resourceName, List.of(bob));
+        createResource(resourceName, List.of(bob));
 
         awaitAtMost.untilAsserted(() -> assertThat(smtpMailsResponseSupplier.get().getList("")).hasSize(1));
         JsonPath smtpMailsResponse = smtpMailsResponseSupplier.get();
@@ -335,26 +346,20 @@ public class CalendarDelegatedNotificationConsumerTest {
         }));
     }
 
-    private void createResourceViaWebAdmin(String resourceName, List<OpenPaaSUser> administrators) {
-        ResourceInsertRequest resourceInsertRequest = new ResourceInsertRequest(administrators.stream()
-                .map(admin -> new ResourceAdministrator(admin.id(), "user"))
-                .toList(),
+    private void createResource(String resourceName, List<OpenPaaSUser> administrators) {
+        ResourceInsertRequest resourceInsertRequest = new ResourceInsertRequest(
             administrators.isEmpty() ? bob.id() : administrators.getFirst().id(),
             "resource description",
             domain.id(),
             "tv",
             resourceName);
-        ResourceId resourceId = resourceDAO.insert(resourceInsertRequest).block();
-
-        if (!administrators.isEmpty()) {
-            calDavClient.grantReadWriteRights(domain.id(), resourceId, administrators.stream()
-                .map(OpenPaaSUser::username)
-                .toList()).block();
-        }
+        resourceService.create(resourceInsertRequest, administrators.stream()
+            .map(user -> new ResourceAdministrator(user.username(), DavRight.ADMINISTRATION))
+            .toList()).block();
     }
 
     @Test
-    void shouldNotSendMailWhenSelfSubscribedToSharedCalendar() throws InterruptedException {
+    void shouldNotSendMailWhenSelfSubscribedToSharedCalendar() {
         // Given: Bob shares calendar with read access
         davTestHelper.updateCalendarAcl(bob, CalendarURL.from(bob.id()).asUri(), "{DAV:}read");
 
@@ -369,9 +374,8 @@ public class CalendarDelegatedNotificationConsumerTest {
         // When: Alice subscribes to the shared calendar herself
         davTestHelper.subscribeToSharedCalendar(alice, subscribedCalendarRequest);
 
-        Thread.sleep(1000);
         // Then: No notification email is sent
-        awaitAtMost.untilAsserted(() ->
+        negativeAwait.untilAsserted(() ->
             assertThat(smtpMailsResponseSupplier.get().getList("")).isEmpty());
     }
 }

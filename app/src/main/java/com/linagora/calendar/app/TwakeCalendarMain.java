@@ -19,6 +19,7 @@
 package com.linagora.calendar.app;
 
 import static com.linagora.calendar.saas.TWPCalendarSettingsModule.TWP_CALENDAR_SETTINGS_AGGREGATE_MODULE;
+import static com.linagora.calendar.saas.TWPCalendarSubscriptionModule.TWP_CALENDAR_SUBSCRIPTION_AGGREGATE_MODULE;
 
 import java.util.Optional;
 
@@ -63,6 +64,7 @@ import com.google.inject.name.Names;
 import com.google.inject.util.Modules;
 import com.linagora.calendar.amqp.CalendarAmqpModule;
 import com.linagora.calendar.app.modules.AlarmEventModule;
+import com.linagora.calendar.app.modules.CommonContactsModule;
 import com.linagora.calendar.app.modules.DeleteUserDataRoutesModule;
 import com.linagora.calendar.app.modules.MemoryAutoCompleteModule;
 import com.linagora.calendar.app.modules.MemoryUserModule;
@@ -70,7 +72,6 @@ import com.linagora.calendar.app.modules.OpenSearchClientModule;
 import com.linagora.calendar.app.modules.TwakeCalendarRabbitMQModule;
 import com.linagora.calendar.dav.DavModule;
 import com.linagora.calendar.restapi.RestApiModule;
-import com.linagora.calendar.saas.TWPCalendarSubscriptionModule;
 import com.linagora.calendar.smtp.SmtpModule;
 import com.linagora.calendar.storage.CaffeineOIDCTokenCache;
 import com.linagora.calendar.storage.FileUploadConfigurationModule;
@@ -143,6 +144,7 @@ public class TwakeCalendarMain {
                 chooseUsersModule(configuration.userChoice()),
                 chooseCacheAndPubSub(configuration.redisEnabled()),
                 chooseTWPCalendarSetting(configuration.twpSettingEnabled()),
+                chooseCommonContacts(configuration.commonContactsEnabled()),
                 chooseSaaSSubscription(configuration.saasSubscriptionEnabled()),
                 new FileUploadConfigurationModule(),
                 new RestApiModule(),
@@ -243,9 +245,16 @@ public class TwakeCalendarMain {
         return ReadOnlyPropertyProviderModule.EMPTY;
     }
 
+    public static Module chooseCommonContacts(boolean enabled) {
+        if (enabled) {
+            return new CommonContactsModule();
+        }
+        return Modules.EMPTY_MODULE;
+    }
+
     public static Module chooseSaaSSubscription(boolean enabled) {
         if (enabled) {
-            return new TWPCalendarSubscriptionModule();
+            return TWP_CALENDAR_SUBSCRIPTION_AGGREGATE_MODULE;
         }
         return Modules.EMPTY_MODULE;
     }

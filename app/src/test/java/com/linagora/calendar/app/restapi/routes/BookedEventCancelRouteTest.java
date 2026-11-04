@@ -1,0 +1,404 @@
+/********************************************************************
+ *  As a subpart of Twake Mail, this file is edited by Linagora.    *
+ *                                                                  *
+ *  https://twake-mail.com/                                         *
+ *  https://linagora.com                                            *
+ *                                                                  *
+ *  This file is subject to The Affero Gnu Public License           *
+ *  version 3.                                                      *
+ *                                                                  *
+ *  https://www.gnu.org/licenses/agpl-3.0.en.html                   *
+ *                                                                  *
+ *  This program is distributed in the hope that it will be         *
+ *  useful, but WITHOUT ANY WARRANTY; without even the implied      *
+ *  warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR         *
+ *  PURPOSE. See the GNU Affero General Public License for          *
+ *  more details.                                                   *
+ ********************************************************************/
+
+package com.linagora.calendar.app.restapi.routes;
+
+import static com.linagora.calendar.app.restapi.routes.ImportRouteTest.mailSenderConfigurationFunction;
+import static com.linagora.calendar.storage.TestFixture.TECHNICAL_TOKEN_SERVICE_TESTING;
+import static io.restassured.RestAssured.given;
+import static io.restassured.config.EncoderConfig.encoderConfig;
+import static io.restassured.config.RestAssuredConfig.newConfig;
+import static io.restassured.http.ContentType.JSON;
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.SoftAssertions.assertSoftly;
+import static org.awaitility.Durations.ONE_HUNDRED_MILLISECONDS;
+
+import java.net.URI;
+import java.nio.charset.StandardCharsets;
+import java.time.Duration;
+import java.time.ZonedDateTime;
+import java.util.Base64;
+import java.util.List;
+import java.util.UUID;
+import java.util.concurrent.TimeUnit;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+import java.util.stream.IntStream;
+
+import jakarta.inject.Inject;
+
+import org.apache.http.HttpStatus;
+import org.apache.james.core.Domain;
+import org.apache.james.core.MaybeSender;
+import org.apache.james.core.Username;
+import org.apache.james.utils.GuiceProbe;
+import org.awaitility.Awaitility;
+import org.awaitility.core.ConditionFactory;
+import org.junit.jupiter.api.AfterAll;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Order;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.extension.RegisterExtension;
+
+import com.google.inject.multibindings.Multibinder;
+import com.linagora.calendar.api.booking.AvailabilityRule.FixedAvailabilityRule;
+import com.linagora.calendar.api.booking.AvailabilityRules;
+import com.linagora.calendar.app.AppTestHelper;
+import com.linagora.calendar.app.TwakeCalendarConfiguration;
+import com.linagora.calendar.app.TwakeCalendarExtension;
+import com.linagora.calendar.app.TwakeCalendarGuiceServer;
+import com.linagora.calendar.app.modules.CalendarDataProbe;
+import com.linagora.calendar.dav.CalDavClient;
+import com.linagora.calendar.dav.CalendarEventModifier;
+import com.linagora.calendar.dav.CalendarEventUpdatePatch.AttendeePartStatusUpdatePatch;
+import com.linagora.calendar.dav.DavModuleTestHelper;
+import com.linagora.calendar.dav.DavCalendarObject;
+import com.linagora.calendar.dav.SabreDavExtension;
+import com.linagora.calendar.restapi.RestApiServerProbe;
+import com.linagora.calendar.smtp.MailSenderConfiguration;
+import com.linagora.calendar.smtp.MockSmtpServerExtension;
+import com.linagora.calendar.smtp.template.MailTemplateConfiguration;
+import com.linagora.calendar.storage.CalendarURL;
+import com.linagora.calendar.storage.OpenPaaSUser;
+import com.linagora.calendar.storage.booking.BookingLink;
+import com.linagora.calendar.storage.booking.BookingLinkDAO;
+import com.linagora.calendar.storage.booking.BookingLinkInsertRequest;
+import com.linagora.calendar.storage.booking.BookingLinkPublicId;
+import com.linagora.calendar.storage.event.EventParseUtils;
+
+import io.restassured.RestAssured;
+import io.restassured.builder.RequestSpecBuilder;
+import io.restassured.http.ContentType;
+import io.restassured.path.json.JsonPath;
+import io.restassured.specification.RequestSpecification;
+import net.fortuna.ical4j.model.Property;
+import net.fortuna.ical4j.model.component.VEvent;
+import net.fortuna.ical4j.model.parameter.PartStat;
+
+class BookedEventCancelRouteTest {
+
+    private static final String PASSWORD = "secret";
+    private static final String CREATOR_EMAIL = "creator@example.com";
+    private static final String CEDRIC_EXTERNAL_EMAIL = "cedric@example.com";
+    private static final String X_PUBLICLY_CANCELLED_BY = "X-PUBLICLY-CANCELLED-BY";
+    private static final Duration DURATION_30_MINUTES = Duration.ofMinutes(30);
+    private static final AvailabilityRules AVAILABILITY_RULE = AvailabilityRules.of(new FixedAvailabilityRule(
+        ZonedDateTime.parse("2036-01-26T09:00:00Z"),
+        ZonedDateTime.parse("2036-01-26T12:00:00Z")));
+    private static final ConditionFactory CALMLY_AWAIT = Awaitility
+        .with().pollInterval(ONE_HUNDRED_MILLISECONDS)
+        .and().pollDelay(ONE_HUNDRED_MILLISECONDS)
+        .await();
+
+    static class BookingLinkProbe implements GuiceProbe {
+        private final BookingLinkDAO bookingLinkDAO;
+
+        @Inject
+        BookingLinkProbe(BookingLinkDAO bookingLinkDAO) {
+            this.bookingLinkDAO = bookingLinkDAO;
+        }
+
+        BookingLink insert(Username username, BookingLinkInsertRequest request) {
+            return bookingLinkDAO.insert(username, request).block();
+        }
+    }
+
+    @RegisterExtension
+    @Order(1)
+    static SabreDavExtension sabreDavExtension = SabreDavExtension.shared();
+
+    @RegisterExtension
+    @Order(2)
+    static final MockSmtpServerExtension mockSmtpExtension = new MockSmtpServerExtension();
+
+    @RegisterExtension
+    @Order(3)
+    static TwakeCalendarExtension twakeCalendarExtension = new TwakeCalendarExtension(
+        TwakeCalendarConfiguration.builder()
+            .configurationFromClasspath()
+            .userChoice(TwakeCalendarConfiguration.UserChoice.MEMORY)
+            .dbChoice(TwakeCalendarConfiguration.DbChoice.MONGODB),
+        AppTestHelper.OIDC_BY_PASS_MODULE,
+        DavModuleTestHelper.FROM_SABRE_EXTENSION.apply(sabreDavExtension),
+        binder -> binder.bind(MailTemplateConfiguration.class)
+            .toInstance(new MailTemplateConfiguration("classpath://templates/",
+                MaybeSender.getMailSender("no-reply@openpaas.org"))),
+        binder -> binder.bind(MailSenderConfiguration.class)
+            .toInstance(mailSenderConfigurationFunction.apply(mockSmtpExtension)),
+        binder -> {
+            Multibinder.newSetBinder(binder, GuiceProbe.class)
+                .addBinding()
+                .to(BookingLinkProbe.class);
+        });
+
+    @AfterAll
+    static void afterAll() {
+        RestAssured.reset();
+    }
+
+    private OpenPaaSUser openPaaSUser;
+    private CalDavClient calDavClient;
+
+    @BeforeEach
+    void setUp(TwakeCalendarGuiceServer server) throws Exception {
+        CalendarDataProbe calendarDataProbe = server.getProbe(CalendarDataProbe.class);
+        Username ownerUsername = Username.fromLocalPartWithDomain("owner-" + UUID.randomUUID(), Domain.of("open-paas.org"));
+        calendarDataProbe.addDomain(ownerUsername.getDomainPart().orElseThrow());
+        calendarDataProbe.addUser(ownerUsername, PASSWORD, "Owner", "User");
+        openPaaSUser = calendarDataProbe.getUser(ownerUsername);
+
+        RestAssured.requestSpecification = new RequestSpecBuilder()
+            .setContentType(ContentType.JSON)
+            .setAccept(ContentType.JSON)
+            .setConfig(newConfig().encoderConfig(encoderConfig().defaultContentCharset(StandardCharsets.UTF_8)))
+            .setPort(server.getProbe(RestApiServerProbe.class).getPort().getValue())
+            .setBasePath("")
+            .build();
+
+        calDavClient = new CalDavClient(sabreDavExtension.dockerSabreDavSetup().davConfiguration(), TECHNICAL_TOKEN_SERVICE_TESTING);
+
+        given(mockSMTPRequestSpecification())
+            .delete("/smtpMails")
+            .then();
+
+        given(mockSMTPRequestSpecification())
+            .delete("/smtpBehaviors")
+            .then();
+    }
+
+    static RequestSpecification mockSMTPRequestSpecification() {
+        return new RequestSpecBuilder()
+            .setPort(mockSmtpExtension.getMockSmtp().getRestApiPort())
+            .setBasePath("")
+            .build();
+    }
+
+    @Test
+    void shouldMarkBookedEventAsCancelledAndReturn204(TwakeCalendarGuiceServer server) {
+        String jwt = bookAndGetJwt(server);
+
+        given()
+            .auth().none()
+            .queryParam("bookingConfirmationToken", jwt)
+        .when()
+            .delete("/api/booked-event")
+        .then()
+            .statusCode(HttpStatus.SC_NO_CONTENT);
+
+        List<String> eventIds = calDavClient.findUserCalendarEventIds(openPaaSUser.username(), CalendarURL.from(openPaaSUser.id()))
+            .collectList()
+            .block();
+        assertThat(eventIds).hasSize(1);
+        VEvent event = fetchOwnerEvent(eventIds.getFirst());
+        assertSoftly(softly -> {
+            softly.assertThat(event.getProperty(Property.STATUS).map(Property::getValue)).contains("CANCELLED");
+            softly.assertThat(event.getProperty(X_PUBLICLY_CANCELLED_BY).map(Property::getValue)).contains(CREATOR_EMAIL);
+        });
+    }
+
+    @Test
+    void cancelShouldBeIdempotent(TwakeCalendarGuiceServer server) {
+        String jwt = bookAndGetJwt(server);
+
+        given()
+            .auth().none()
+            .queryParam("bookingConfirmationToken", jwt)
+        .when()
+            .delete("/api/booked-event")
+        .then()
+            .statusCode(HttpStatus.SC_NO_CONTENT);
+
+        List<String> eventIds = calDavClient.findUserCalendarEventIds(openPaaSUser.username(), CalendarURL.from(openPaaSUser.id()))
+            .collectList()
+            .block();
+        assertThat(eventIds).hasSize(1);
+        assertThat(fetchOwnerEvent(eventIds.getFirst()).getProperty(Property.STATUS).map(Property::getValue))
+            .contains("CANCELLED");
+
+        given()
+            .auth().none()
+            .queryParam("bookingConfirmationToken", jwt)
+        .when()
+            .delete("/api/booked-event")
+        .then()
+            .statusCode(HttpStatus.SC_NO_CONTENT);
+
+        List<String> eventIdsAfterSecondCancellation = calDavClient.findUserCalendarEventIds(openPaaSUser.username(), CalendarURL.from(openPaaSUser.id()))
+            .collectList()
+            .block();
+        assertThat(eventIdsAfterSecondCancellation).containsExactlyElementsOf(eventIds);
+        assertThat(fetchOwnerEvent(eventIdsAfterSecondCancellation.getFirst()).getProperty(Property.STATUS).map(Property::getValue))
+            .contains("CANCELLED");
+    }
+
+    @Test
+    void shouldReturn400WhenTokenIsMissing() {
+        given()
+            .auth().none()
+        .when()
+            .delete("/api/booked-event")
+        .then()
+            .statusCode(HttpStatus.SC_BAD_REQUEST)
+            .contentType(JSON);
+    }
+
+    @Test
+    void shouldReturn401WhenTokenIsInvalid() {
+        given()
+            .auth().none()
+            .queryParam("bookingConfirmationToken", "not.a.valid.jwt")
+        .when()
+            .delete("/api/booked-event")
+        .then()
+            .statusCode(HttpStatus.SC_UNAUTHORIZED)
+            .contentType(JSON);
+    }
+
+    @Test
+    void bookerCancellationShouldNotifyOrganizerAndCreatorWhenBookerCancelEvent(TwakeCalendarGuiceServer server) {
+        String jwt = bookAndGetJwt(server);
+
+        // Drop the acknowledgement / proposal emails sent at booking time.
+        given(mockSMTPRequestSpecification())
+            .delete("/smtpMails")
+            .then();
+
+        given()
+            .auth().none()
+            .queryParam("bookingConfirmationToken", jwt)
+        .when()
+            .delete("/api/booked-event")
+        .then()
+            .statusCode(HttpStatus.SC_NO_CONTENT);
+
+        CALMLY_AWAIT.atMost(Duration.ofSeconds(10))
+            .untilAsserted(() -> {
+                JsonPath mails = smtpMails();
+                List<String> creatorMessages = messagesTo(mails, "creator@example.com");
+                List<String> ownerMessages = messagesTo(mails, openPaaSUser.username().asString());
+                assertThat(creatorMessages).hasSize(1);
+                assertThat(ownerMessages).hasSize(1);
+
+                String creatorMessage = creatorMessages.getFirst();
+                String ownerMessage = ownerMessages.getFirst();
+                String creatorHtml = getHtml(creatorMessage);
+                String ownerHtml = getHtml(ownerMessage);
+
+                assertSoftly(softly -> {
+                    softly.assertThat(creatorMessage)
+                        .contains("Subject: Booking 30-min intro call canceled")
+                        .doesNotContain("text/calendar")
+                        .doesNotContain("application/ics");
+
+                    softly.assertThat(ownerMessage)
+                        .contains("Subject: Booking 30-min intro call canceled")
+                        .doesNotContain("text/calendar")
+                        .doesNotContain("application/ics");
+
+                    softly.assertThat(creatorHtml)
+                        .contains("Your booking has been canceled")
+                        .doesNotContain("Forwarding this invitation");
+
+                    softly.assertThat(ownerHtml)
+                        .contains("has canceled a booking")
+                        .doesNotContain("Forwarding this invitation");
+                });
+            });
+    }
+
+    private VEvent fetchOwnerEvent(String eventId) {
+        return EventParseUtils.getFirstEvent(fetchOwnerDavCalendarObject(eventId).calendarData());
+    }
+
+    private DavCalendarObject fetchOwnerDavCalendarObject(String eventId) {
+        URI eventHref = URI.create(CalendarURL.from(openPaaSUser.id()).asUri() + "/" + eventId + CalDavClient.ICS_EXTENSION);
+        return calDavClient.fetchCalendarEvent(openPaaSUser.username(), eventHref).block();
+    }
+
+    private JsonPath smtpMails() {
+        return given(mockSMTPRequestSpecification())
+            .get("/smtpMails")
+        .then()
+            .statusCode(HttpStatus.SC_OK)
+            .extract()
+            .jsonPath();
+    }
+
+    private List<String> messagesTo(JsonPath smtpMailsResponse, String recipient) {
+        return IntStream.range(0, smtpMailsResponse.getList("").size())
+            .filter(index -> recipient.equals(smtpMailsResponse.getString("[%d].recipients[0].address".formatted(index))))
+            .mapToObj(index -> smtpMailsResponse.getString("[%d].message".formatted(index)))
+            .toList();
+    }
+
+    private String bookAndGetJwt(TwakeCalendarGuiceServer server) {
+        BookingLink inserted = insertActiveBookingLink(server);
+        String slotStartUtc = getAvailableSlots(inserted.publicId()).getFirst();
+
+        return given()
+            .auth().none()
+            .pathParam("bookingLinkPublicId", inserted.publicId().value())
+            .body("""
+                {
+                  "startUtc": "%s",
+                  "creator": { "name": "BOB", "email": "creator@example.com" },
+                  "eventTitle": "30-min intro call"
+                }
+                """.formatted(slotStartUtc))
+        .when()
+            .post("/api/booking-links/{bookingLinkPublicId}/book")
+        .then()
+            .statusCode(HttpStatus.SC_CREATED)
+            .extract()
+            .jsonPath()
+            .getString("bookingConfirmationToken");
+    }
+
+    private BookingLink insertActiveBookingLink(TwakeCalendarGuiceServer server) {
+        return server.getProbe(BookingLinkProbe.class)
+            .insert(openPaaSUser.username(), BookingLinkInsertRequest.builder()
+                .calendarUrl(CalendarURL.from(openPaaSUser.id()))
+                .eventDuration(DURATION_30_MINUTES)
+                .availabilityRules(AVAILABILITY_RULE)
+                .build());
+    }
+
+    private List<String> getAvailableSlots(BookingLinkPublicId bookingLinkPublicId) {
+        return given()
+            .pathParam("bookingLinkPublicId", bookingLinkPublicId.value())
+            .queryParam("from", "2036-01-26T00:00:00Z")
+            .queryParam("to", "2036-01-27T00:00:00Z")
+        .when()
+            .get("/api/booking-links/{bookingLinkPublicId}/slots")
+        .then()
+            .statusCode(HttpStatus.SC_OK)
+            .extract()
+            .jsonPath()
+            .getList("slots.start", String.class);
+    }
+
+    private String getHtml(String rawMessage) {
+        Pattern htmlPattern = Pattern.compile(
+            "Content-Transfer-Encoding: base64\r?\nContent-Type: text/html; charset=UTF-8\r?\nContent-Language: [^\r\n]+\r?\n\r?\n([A-Za-z0-9+/=\r\n]+)\r?\n---=Part",
+            java.util.regex.Pattern.DOTALL);
+        Matcher matcher = htmlPattern.matcher(rawMessage);
+        matcher.find();
+        String base64Html = matcher.group(1).replaceAll("\\s+", "");
+        return new String(Base64.getDecoder().decode(base64Html), StandardCharsets.UTF_8);
+    }
+}

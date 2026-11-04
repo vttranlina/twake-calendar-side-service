@@ -18,12 +18,13 @@
 
 package com.linagora.calendar.restapi.routes;
 
+import static com.linagora.calendar.dav.ResourceService.ONLY_ACTIVE;
+
 import java.time.Instant;
 import java.util.List;
 
 import jakarta.inject.Inject;
 
-import org.apache.commons.collections4.CollectionUtils;
 import org.apache.james.jmap.Endpoint;
 import org.apache.james.jmap.http.Authenticator;
 import org.apache.james.mailbox.MailboxSession;
@@ -36,14 +37,15 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.SerializationFeature;
 import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
 import com.github.fge.lambdas.Throwing;
+import com.linagora.calendar.dav.ResourceService;
+import com.linagora.calendar.dav.ResourceService.ResourceWithAdministration;
+import com.linagora.calendar.dav.ResourceService.ResourceWithAdministration.ResolvedAdministrator;
 import com.linagora.calendar.restapi.NotFoundException;
 import com.linagora.calendar.storage.OpenPaaSDomain;
 import com.linagora.calendar.storage.OpenPaaSDomainAdminDAO;
 import com.linagora.calendar.storage.OpenPaaSDomainDAO;
 import com.linagora.calendar.storage.OpenPaaSId;
-import com.linagora.calendar.storage.ResourceDAO;
 import com.linagora.calendar.storage.model.Resource;
-import com.linagora.calendar.storage.model.ResourceAdministrator;
 import com.linagora.calendar.storage.model.ResourceId;
 
 import io.netty.handler.codec.http.HttpMethod;
@@ -84,32 +86,52 @@ public class ResourceRoute extends CalendarRoute {
         }
 
         record AdministratorDTO(@JsonProperty("id") String idRef,
-                                @JsonProperty("objectType") String objectType) {
+                                String davRight,
+                                int access) {
 
-            static AdministratorDTO from(ResourceAdministrator entity) {
-                return new AdministratorDTO(entity.refId().value(), entity.objectType());
+            static AdministratorDTO from(ResolvedAdministrator administrator) {
+                return new AdministratorDTO(administrator.user().id().value(), administrator.davRight().value(), administrator.davRight().access());
             }
 
             @JsonProperty("_id")
             public String getId() {
                 return idRef;
             }
+
+            @JsonProperty("objectType")
+            public String getObjectType() {
+                return "user";
+            }
+        }
+
+        static ResourceResponseDTO from(ResourceWithAdministration resourceWithAdministration, DomainRoute.ResponseDTO domain) {
+            Resource resource = resourceWithAdministration.resource();
+            List<AdministratorDTO> administrators = resourceWithAdministration.administratorsWithRight().stream()
+                .map(AdministratorDTO::from)
+                .toList();
+
+            return new ResourceResponseDTO(new TimestampsDTO(resource.creation(), resource.updated()),
+                resource.deleted(), resource.id().value(), resource.name(), resource.description(),
+                resource.type(), resource.icon(), administrators, resource.creator().value(), domain);
         }
     }
 
-    private final ResourceDAO resourceDAO;
+    private final ResourceService resourceService;
     private final OpenPaaSDomainDAO openPaaSDomainDAO;
     private final OpenPaaSDomainAdminDAO domainAdminDAO;
+    private final CrossDomainAccessControl crossDomainAccessControl;
 
     @Inject
     public ResourceRoute(Authenticator authenticator,
-                         MetricFactory metricFactory, ResourceDAO resourceDAO,
+                         MetricFactory metricFactory, ResourceService resourceService,
                          OpenPaaSDomainDAO openPaaSDomainDAO,
-                         OpenPaaSDomainAdminDAO domainAdminDAO) {
+                         OpenPaaSDomainAdminDAO domainAdminDAO,
+                         CrossDomainAccessControl crossDomainAccessControl) {
         super(authenticator, metricFactory);
-        this.resourceDAO = resourceDAO;
+        this.resourceService = resourceService;
         this.openPaaSDomainDAO = openPaaSDomainDAO;
         this.domainAdminDAO = domainAdminDAO;
+        this.crossDomainAccessControl = crossDomainAccessControl;
     }
 
     @Override
@@ -120,10 +142,10 @@ public class ResourceRoute extends CalendarRoute {
     @Override
     Mono<Void> handleRequest(HttpServerRequest req, HttpServerResponse res, MailboxSession session) {
         ResourceId resourceId = new ResourceId(req.param(RESOURCE_ID_PATH_PARAM));
-        return resourceDAO.findById(resourceId)
+        return resourceService.retrieveWithAdministration(resourceId, !ONLY_ACTIVE)
             .switchIfEmpty(Mono.error(NotFoundException::new))
-            .flatMap(resource -> retrieveAuthorizedDomainResponse(resource.domain(), session)
-                .map(domainResponse -> buildResponseDTO(resource, domainResponse)))
+            .flatMap(resourceWithAdministration -> retrieveAuthorizedDomainResponse(resourceWithAdministration.resource().domain(), session)
+                .map(domainResponse -> ResourceResponseDTO.from(resourceWithAdministration, domainResponse)))
             .map(Throwing.function(OBJECT_MAPPER::writeValueAsBytes))
             .flatMap(bytes -> res.status(200)
                 .header("Content-Type", "application/json;charset=utf-8")
@@ -133,7 +155,7 @@ public class ResourceRoute extends CalendarRoute {
 
     private Mono<DomainRoute.ResponseDTO> retrieveAuthorizedDomainResponse(OpenPaaSId domainId, MailboxSession session) {
         return openPaaSDomainDAO.retrieve(domainId)
-            .filter(resource -> !crossDomainAccess(session, resource.domain()))
+            .filter(resource -> !crossDomainAccessControl.denies(session, resource.domain()))
             .switchIfEmpty(Mono.error(NotFoundException::new))
             .flatMap(domain -> buildDomainResponse(domainId, domain));
     }
@@ -142,19 +164,5 @@ public class ResourceRoute extends CalendarRoute {
         return domainAdminDAO.listAdmins(domainId)
             .collectList()
             .map(adminList -> new DomainRoute.ResponseDTO(domain, adminList));
-    }
-
-    private ResourceResponseDTO buildResponseDTO(Resource resource,  DomainRoute.ResponseDTO domainResponseDTO) {
-        List<ResourceResponseDTO.AdministratorDTO> administrators = CollectionUtils.emptyIfNull(resource.administrators())
-            .stream()
-            .map(ResourceResponseDTO.AdministratorDTO::from)
-            .toList();
-
-        ResourceResponseDTO.TimestampsDTO timestampsDTO = new ResourceResponseDTO.TimestampsDTO(resource.creation(), resource.updated());
-
-        return new ResourceResponseDTO(timestampsDTO, resource.deleted(), resource.id().value(),
-            resource.name(), resource.description(), resource.type(), resource.icon(),
-            administrators, resource.creator().value(),
-            domainResponseDTO);
     }
 }

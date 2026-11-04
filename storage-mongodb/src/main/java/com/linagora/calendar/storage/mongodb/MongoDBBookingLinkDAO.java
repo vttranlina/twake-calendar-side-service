@@ -42,11 +42,18 @@ import com.linagora.calendar.api.booking.AvailabilityRules;
 import com.linagora.calendar.storage.CalendarURL;
 import com.linagora.calendar.storage.OpenPaaSId;
 import com.linagora.calendar.storage.booking.BookingLink;
+import com.linagora.calendar.storage.booking.BookingLinkAlarm;
+import com.linagora.calendar.storage.booking.BookingLinkAlarmAction;
 import com.linagora.calendar.storage.booking.BookingLinkDAO;
 import com.linagora.calendar.storage.booking.BookingLinkInsertRequest;
 import com.linagora.calendar.storage.booking.BookingLinkNotFoundException;
 import com.linagora.calendar.storage.booking.BookingLinkPatchRequest;
 import com.linagora.calendar.storage.booking.BookingLinkPublicId;
+import com.linagora.calendar.storage.booking.EventTransparency;
+import com.linagora.calendar.storage.booking.EventVisibility;
+import com.linagora.calendar.storage.booking.ExtraAttendeeNode;
+import com.linagora.calendar.storage.booking.ExtraAttendees;
+import com.linagora.calendar.storage.model.ResourceId;
 import com.mongodb.client.model.Filters;
 import com.mongodb.client.model.FindOneAndUpdateOptions;
 import com.mongodb.client.model.IndexOptions;
@@ -69,9 +76,24 @@ public class MongoDBBookingLinkDAO implements BookingLinkDAO {
     private static final String FIELD_CALENDAR_ID = "calendarId";
     private static final String FIELD_DURATION_SECONDS = "durationSeconds";
     private static final String FIELD_ACTIVE = "active";
+    private static final String FIELD_AUTO_ACCEPT = "autoAccept";
     private static final String FIELD_AVAILABILITY_RULES = "availabilityRules";
+    private static final String FIELD_EXTRA_ATTENDEES = "extraAttendees";
+    private static final String FIELD_NAME = "name";
+    private static final String FIELD_DESCRIPTION = "description";
+    private static final String FIELD_COLOR = "color";
+    private static final String FIELD_LOCATION = "location";
+    private static final String FIELD_VISIBILITY = "visibility";
+    private static final String FIELD_TRANSPARENCY = "transparency";
+    private static final String FIELD_RESOURCES = "resources";
+    private static final String FIELD_ALARM = "alarm";
+    private static final String FIELD_ALARM_PERIOD = "period";
+    private static final String FIELD_ALARM_ACTION = "action";
     private static final String FIELD_CREATED_AT = "createdAt";
     private static final String FIELD_UPDATED_AT = "updatedAt";
+
+    private static final String ATTENDEE_AND = "and";
+    private static final String ATTENDEE_PARTICIPANT = "participant";
 
     private static final String RULE_TYPE = "type";
     private static final String RULE_TYPE_WEEKLY = "weekly";
@@ -108,7 +130,17 @@ public class MongoDBBookingLinkDAO implements BookingLinkDAO {
                 .calendarUrl(request.calendarUrl())
                 .duration(request.eventDuration())
                 .active(request.active())
+                .autoAccept(request.autoAccept())
                 .availabilityRules(request.availabilityRules())
+                .extraAttendees(request.extraAttendees())
+                .name(request.name())
+                .description(request.description())
+                .color(request.color())
+                .location(request.location())
+                .visibility(request.visibility())
+                .transparency(request.transparency())
+                .resources(request.resources())
+                .alarm(request.alarm())
                 .createdAt(now)
                 .updatedAt(now)
                 .build();
@@ -198,10 +230,58 @@ public class MongoDBBookingLinkDAO implements BookingLinkDAO {
         if (request.active().isModified()) {
             setFields.append(FIELD_ACTIVE, request.active().get());
         }
+        if (request.autoAccept().isModified()) {
+            setFields.append(FIELD_AUTO_ACCEPT, request.autoAccept().get());
+        }
         if (request.availabilityRules().isModified()) {
             setFields.append(FIELD_AVAILABILITY_RULES, serializeRules(request.availabilityRules().get()));
         } else if (request.availabilityRules().isRemoved()) {
             unsetFields.append(FIELD_AVAILABILITY_RULES, "");
+        }
+        if (request.extraAttendees().isModified()) {
+            setFields.append(FIELD_EXTRA_ATTENDEES, serializeExtraAttendees(request.extraAttendees().get()));
+        } else if (request.extraAttendees().isRemoved()) {
+            unsetFields.append(FIELD_EXTRA_ATTENDEES, "");
+        }
+        if (request.name().isModified()) {
+            setFields.append(FIELD_NAME, request.name().get());
+        } else if (request.name().isRemoved()) {
+            unsetFields.append(FIELD_NAME, "");
+        }
+        if (request.description().isModified()) {
+            setFields.append(FIELD_DESCRIPTION, request.description().get());
+        } else if (request.description().isRemoved()) {
+            unsetFields.append(FIELD_DESCRIPTION, "");
+        }
+        if (request.color().isModified()) {
+            setFields.append(FIELD_COLOR, request.color().get());
+        } else if (request.color().isRemoved()) {
+            unsetFields.append(FIELD_COLOR, "");
+        }
+        if (request.location().isModified()) {
+            setFields.append(FIELD_LOCATION, request.location().get());
+        } else if (request.location().isRemoved()) {
+            unsetFields.append(FIELD_LOCATION, "");
+        }
+        if (request.visibility().isModified()) {
+            setFields.append(FIELD_VISIBILITY, request.visibility().get().value());
+        } else if (request.visibility().isRemoved()) {
+            unsetFields.append(FIELD_VISIBILITY, "");
+        }
+        if (request.transparency().isModified()) {
+            setFields.append(FIELD_TRANSPARENCY, request.transparency().get().value());
+        } else if (request.transparency().isRemoved()) {
+            unsetFields.append(FIELD_TRANSPARENCY, "");
+        }
+        if (request.resources().isModified()) {
+            setFields.append(FIELD_RESOURCES, serializeResources(request.resources().get()));
+        } else if (request.resources().isRemoved()) {
+            unsetFields.append(FIELD_RESOURCES, "");
+        }
+        if (request.alarm().isModified()) {
+            setFields.append(FIELD_ALARM, serializeAlarms(request.alarm().get()));
+        } else if (request.alarm().isRemoved()) {
+            unsetFields.append(FIELD_ALARM, "");
         }
 
         Document updateBson = new Document("$set", setFields);
@@ -219,13 +299,77 @@ public class MongoDBBookingLinkDAO implements BookingLinkDAO {
             .append(FIELD_CALENDAR_ID, bookingLink.calendarUrl().calendarId().value())
             .append(FIELD_DURATION_SECONDS, bookingLink.duration().getSeconds())
             .append(FIELD_ACTIVE, bookingLink.active())
+            .append(FIELD_AUTO_ACCEPT, bookingLink.autoAccept())
             .append(FIELD_CREATED_AT, Date.from(bookingLink.createdAt()))
             .append(FIELD_UPDATED_AT, Date.from(bookingLink.updatedAt()));
 
         bookingLink.availabilityRules().ifPresent(rules ->
             doc.append(FIELD_AVAILABILITY_RULES, serializeRules(rules)));
+        if (!bookingLink.extraAttendees().isEmpty()) {
+            doc.append(FIELD_EXTRA_ATTENDEES, serializeExtraAttendees(bookingLink.extraAttendees()));
+        }
+        bookingLink.name().ifPresent(name -> doc.append(FIELD_NAME, name));
+        bookingLink.description().ifPresent(description -> doc.append(FIELD_DESCRIPTION, description));
+        bookingLink.color().ifPresent(color -> doc.append(FIELD_COLOR, color));
+        bookingLink.location().ifPresent(location -> doc.append(FIELD_LOCATION, location));
+        bookingLink.visibility().ifPresent(visibility -> doc.append(FIELD_VISIBILITY, visibility.value()));
+        bookingLink.transparency().ifPresent(transparency -> doc.append(FIELD_TRANSPARENCY, transparency.value()));
+        if (!bookingLink.resources().isEmpty()) {
+            doc.append(FIELD_RESOURCES, serializeResources(bookingLink.resources()));
+        }
+        if (!bookingLink.alarm().isEmpty()) {
+            doc.append(FIELD_ALARM, serializeAlarms(bookingLink.alarm()));
+        }
 
         return doc;
+    }
+
+    private List<String> serializeResources(List<ResourceId> resources) {
+        return resources.stream()
+            .map(ResourceId::value)
+            .toList();
+    }
+
+    private List<Document> serializeAlarms(List<BookingLinkAlarm> alarms) {
+        return alarms.stream()
+            .map(alarm -> new Document(FIELD_ALARM_PERIOD, alarm.period()).append(FIELD_ALARM_ACTION, alarm.action().value()))
+            .toList();
+    }
+
+    private List<BookingLinkAlarm> deserializeAlarms(List<Document> alarms) {
+        return alarms.stream()
+            .map(alarm -> new BookingLinkAlarm(alarm.getString(FIELD_ALARM_PERIOD),
+                BookingLinkAlarmAction.fromString(alarm.getString(FIELD_ALARM_ACTION))))
+            .toList();
+    }
+
+    private Document serializeExtraAttendees(ExtraAttendees extraAttendees) {
+        return serializeExtraAttendeeNode(extraAttendees.root());
+    }
+
+    private Document serializeExtraAttendeeNode(ExtraAttendeeNode node) {
+        return switch (node) {
+            case ExtraAttendeeNode.Participant participant -> new Document(ATTENDEE_PARTICIPANT, participant.id().value());
+            case ExtraAttendeeNode.And and -> new Document(ATTENDEE_AND, and.children().stream()
+                .map(this::serializeExtraAttendeeNode)
+                .toList());
+        };
+    }
+
+    private ExtraAttendees deserializeExtraAttendees(Document doc) {
+        return new ExtraAttendees(deserializeExtraAttendeeNode(doc));
+    }
+
+    private ExtraAttendeeNode deserializeExtraAttendeeNode(Document doc) {
+        if (doc.containsKey(ATTENDEE_PARTICIPANT)) {
+            return new ExtraAttendeeNode.Participant(new OpenPaaSId(doc.getString(ATTENDEE_PARTICIPANT)));
+        }
+        if (doc.containsKey(ATTENDEE_AND)) {
+            return new ExtraAttendeeNode.And(doc.getList(ATTENDEE_AND, Document.class).stream()
+                .map(this::deserializeExtraAttendeeNode)
+                .toList());
+        }
+        throw new IllegalArgumentException("Unknown extra attendee node: " + doc.toJson());
     }
 
     private List<Document> serializeRules(AvailabilityRules rules) {
@@ -256,11 +400,27 @@ public class MongoDBBookingLinkDAO implements BookingLinkDAO {
         CalendarURL calendarURL = new CalendarURL(new OpenPaaSId(doc.getString(FIELD_PRINCIPAL_ID)), new OpenPaaSId(doc.getString(FIELD_CALENDAR_ID)));
         Duration duration = Duration.ofSeconds(doc.getLong(FIELD_DURATION_SECONDS));
         boolean active = doc.getBoolean(FIELD_ACTIVE);
+        boolean autoAccept = doc.getBoolean(FIELD_AUTO_ACCEPT, false);
         Instant createdAt = doc.getDate(FIELD_CREATED_AT).toInstant();
         Instant updatedAt = doc.getDate(FIELD_UPDATED_AT).toInstant();
         Optional<AvailabilityRules> availabilityRules = Optional.ofNullable(doc.getList(FIELD_AVAILABILITY_RULES, Document.class))
             .filter(rules -> !rules.isEmpty())
             .map(rules -> new AvailabilityRules(rules.stream().map(this::deserializeRule).toList()));
+        ExtraAttendees extraAttendees = Optional.ofNullable(doc.get(FIELD_EXTRA_ATTENDEES, Document.class))
+            .map(this::deserializeExtraAttendees)
+            .orElse(ExtraAttendees.NONE);
+        Optional<String> name = Optional.ofNullable(doc.getString(FIELD_NAME));
+        Optional<String> description = Optional.ofNullable(doc.getString(FIELD_DESCRIPTION));
+        Optional<String> color = Optional.ofNullable(doc.getString(FIELD_COLOR));
+        Optional<String> location = Optional.ofNullable(doc.getString(FIELD_LOCATION));
+        Optional<EventVisibility> visibility = Optional.ofNullable(doc.getString(FIELD_VISIBILITY)).map(EventVisibility::fromString);
+        Optional<EventTransparency> transparency = Optional.ofNullable(doc.getString(FIELD_TRANSPARENCY)).map(EventTransparency::fromString);
+        List<ResourceId> resources = Optional.ofNullable(doc.getList(FIELD_RESOURCES, String.class))
+            .map(ids -> ids.stream().map(ResourceId::new).toList())
+            .orElse(List.of());
+        List<BookingLinkAlarm> alarm = Optional.ofNullable(doc.getList(FIELD_ALARM, Document.class))
+            .map(this::deserializeAlarms)
+            .orElse(List.of());
 
         return BookingLink.builder()
             .username(username)
@@ -268,7 +428,17 @@ public class MongoDBBookingLinkDAO implements BookingLinkDAO {
             .calendarUrl(calendarURL)
             .duration(duration)
             .active(active)
+            .autoAccept(autoAccept)
             .availabilityRules(availabilityRules)
+            .extraAttendees(extraAttendees)
+            .name(name)
+            .description(description)
+            .color(color)
+            .location(location)
+            .visibility(visibility)
+            .transparency(transparency)
+            .resources(resources)
+            .alarm(alarm)
             .createdAt(createdAt)
             .updatedAt(updatedAt)
             .build();

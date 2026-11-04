@@ -168,6 +168,244 @@ public class AlarmInstantFactoryTest {
     }
 
     @Test
+    void shouldSkipInvalidEmailAlarmRecipient() {
+        String ics = """
+            BEGIN:VCALENDAR
+            VERSION:2.0
+            BEGIN:VEVENT
+            UID:invalid-email-alarm-recipient
+            DTSTART:20250829T100000Z
+            SUMMARY:Meeting
+            ATTENDEE;PARTSTAT=ACCEPTED:mailto:jane@example.com
+            BEGIN:VALARM
+            ACTION:EMAIL
+            ATTENDEE:urn:uuid:not-a-mail-address
+            ATTENDEE:mailto:jane@example.com
+            TRIGGER:-PT15M
+            END:VALARM
+            END:VEVENT
+            END:VCALENDAR
+            """;
+
+        Calendar calendar = CalendarUtil.parseIcs(ics);
+        AlarmInstantFactory testee = testee(Instant.parse("2025-07-28T00:00:00Z"));
+
+        // When an email VALARM mixes an invalid recipient with a valid one
+        Optional<AlarmInstant> result = testee.computeNextAlarmInstant(calendar, Username.of("jane@example.com"));
+
+        // Then the invalid recipient is skipped without preventing the valid alarm recipient
+        assertThat(result)
+            .describedAs("Invalid email VALARM recipients should be ignored")
+            .isPresent()
+            .contains(new AlarmInstant(Instant.parse("2025-08-29T09:45:00Z"),
+                Instant.parse("2025-08-29T10:00:00Z"),
+                Optional.empty(),
+                List.of(asMailAddress("jane@example.com")),
+                AlarmAction.EMAIL));
+    }
+
+    @Test
+    void shouldPickCurrentUserSpecificEmailVALARMAmongMultipleVALARMs() {
+        String ics = """
+            BEGIN:VCALENDAR
+            VERSION:2.0
+            BEGIN:VEVENT
+            UID:organizer-specific-email-alarm
+            DTSTART:20250829T100000Z
+            SUMMARY:Meeting
+            ORGANIZER:mailto:organizer@example.com
+            ATTENDEE;ROLE=CHAIR;PARTSTAT=ACCEPTED:mailto:organizer@example.com
+            ATTENDEE;PARTSTAT=ACCEPTED:mailto:attendee@example.com
+            ATTENDEE;PARTSTAT=ACCEPTED:mailto:other-attendee@example.com
+            BEGIN:VALARM
+            ACTION:EMAIL
+            DESCRIPTION:This is an event reminder
+            SUMMARY:Alarm notification
+            ATTENDEE:mailto:attendee@example.com
+            ATTENDEE:mailto:other-attendee@example.com
+            TRIGGER:-P0DT0H10M0S
+            END:VALARM
+            BEGIN:VALARM
+            ACTION:EMAIL
+            DESCRIPTION:This is an event reminder
+            SUMMARY:Alarm notification
+            ATTENDEE:mailto:organizer@example.com
+            TRIGGER:-P0DT0H05M0S
+            END:VALARM
+            END:VEVENT
+            END:VCALENDAR
+            """;
+
+        Calendar calendar = CalendarUtil.parseIcs(ics);
+        AlarmInstantFactory testee = testee(Instant.parse("2025-07-28T00:00:00Z"));
+
+        // When current user and other attendees are targeted by different email VALARM components
+        Optional<AlarmInstant> result = testee.computeNextAlarmInstant(calendar, Username.of("organizer@example.com"));
+
+        // Then the current user calendar keeps only the email VALARM component targeting current user
+        assertThat(result)
+            .describedAs("Current user should keep only the email VALARM component targeting current user")
+            .isPresent()
+            .get()
+            .satisfies(alarmInstant -> {
+                assertThat(alarmInstant.alarmTime()).isEqualTo(Instant.parse("2025-08-29T09:55:00Z"));
+                assertThat(alarmInstant.recipients()).isEqualTo(List.of(asMailAddress("organizer@example.com")));
+            });
+    }
+
+    @Test
+    void shouldKeepOnlyCurrentUserWhenSingleEmailVALARMTargetsMultipleAttendees() {
+        String ics = """
+            BEGIN:VCALENDAR
+            VERSION:2.0
+            BEGIN:VEVENT
+            UID:single-email-alarm-multiple-attendees
+            DTSTART:20250829T100000Z
+            SUMMARY:Meeting
+            ORGANIZER:mailto:organizer@example.com
+            ATTENDEE;ROLE=CHAIR;PARTSTAT=ACCEPTED:mailto:organizer@example.com
+            ATTENDEE;PARTSTAT=ACCEPTED:mailto:attendee@example.com
+            ATTENDEE;PARTSTAT=ACCEPTED:mailto:other-attendee@example.com
+            BEGIN:VALARM
+            ACTION:EMAIL
+            DESCRIPTION:This is an event reminder
+            SUMMARY:Alarm notification
+            ATTENDEE:mailto:organizer@example.com
+            ATTENDEE:mailto:attendee@example.com
+            ATTENDEE:mailto:other-attendee@example.com
+            TRIGGER:-P0DT0H10M0S
+            END:VALARM
+            END:VEVENT
+            END:VCALENDAR
+            """;
+
+        Calendar calendar = CalendarUtil.parseIcs(ics);
+        AlarmInstantFactory testee = testee(Instant.parse("2025-07-28T00:00:00Z"));
+
+        // When a single email VALARM targets current user and other event attendees
+        Optional<AlarmInstant> result = testee.computeNextAlarmInstant(calendar, Username.of("organizer@example.com"));
+
+        // Then the current user calendar keeps only the recipient matching current user
+        assertThat(result)
+            .describedAs("Current user should keep only their own recipient from a multi-attendee email VALARM")
+            .isPresent()
+            .get()
+            .satisfies(alarmInstant -> {
+                assertThat(alarmInstant.alarmTime()).isEqualTo(Instant.parse("2025-08-29T09:50:00Z"));
+                assertThat(alarmInstant.recipients()).isEqualTo(List.of(asMailAddress("organizer@example.com")));
+            });
+    }
+
+    @Test
+    void shouldNotComputeAlarmWhenEmailAlarmTargetsOnlyOtherEventAttendee() {
+        String ics = """
+            BEGIN:VCALENDAR
+            VERSION:2.0
+            BEGIN:VEVENT
+            UID:organizer-attendee-alarm
+            DTSTART:20250829T100000Z
+            SUMMARY:Meeting
+            ORGANIZER:mailto:organizer@example.com
+            ATTENDEE;ROLE=CHAIR;PARTSTAT=ACCEPTED:mailto:organizer@example.com
+            ATTENDEE;PARTSTAT=ACCEPTED:mailto:attendee@example.com
+            BEGIN:VALARM
+            ACTION:EMAIL
+            ATTENDEE:mailto:attendee@example.com
+            TRIGGER:-PT15M
+            END:VALARM
+            END:VEVENT
+            END:VCALENDAR
+            """;
+
+        Calendar calendar = CalendarUtil.parseIcs(ics);
+        AlarmInstantFactory testee = testee(Instant.parse("2025-07-28T00:00:00Z"));
+
+        // When email VALARM targets only another event attendee
+        Optional<AlarmInstant> result = testee.computeNextAlarmInstant(calendar, Username.of("organizer@example.com"));
+
+        // Then recipient filtering removes this alarm from the current user calendar
+        assertThat(result)
+            .describedAs("Current user alarm should not keep email VALARM recipients targeting only another event attendee")
+            .isEmpty();
+    }
+
+    @Test
+    void shouldComputeAlarmForAliasRecipient() {
+        // Given email VALARM targets alias@example.com, which is not an event attendee but another personal email of the organizer
+        String ics = """
+            BEGIN:VCALENDAR
+            VERSION:2.0
+            BEGIN:VEVENT
+            UID:organizer-alias-alarm
+            DTSTART:20250829T100000Z
+            SUMMARY:Meeting
+            ORGANIZER:mailto:organizer@example.com
+            ATTENDEE;ROLE=CHAIR;PARTSTAT=ACCEPTED:mailto:organizer@example.com
+            ATTENDEE;PARTSTAT=ACCEPTED:mailto:attendee@example.com
+            BEGIN:VALARM
+            ACTION:EMAIL
+            ATTENDEE:mailto:alias@example.com
+            TRIGGER:-PT15M
+            END:VALARM
+            END:VEVENT
+            END:VCALENDAR
+            """;
+
+        Calendar calendar = CalendarUtil.parseIcs(ics);
+        AlarmInstantFactory testee = testee(Instant.parse("2025-07-28T00:00:00Z"));
+
+        // When
+        Optional<AlarmInstant> result = testee.computeNextAlarmInstant(calendar, Username.of("organizer@example.com"));
+
+        // Then the current user calendar computes the alias recipient alarm
+        assertThat(result)
+            .describedAs("Current user calendar must schedule VALARM recipients that are not event attendees, such as an alias")
+            .isPresent()
+            .get()
+            .extracting(AlarmInstant::recipients)
+            .isEqualTo(List.of(asMailAddress("alias@example.com")));
+    }
+
+    @Test
+    void shouldKeepAliasAndCurrentUserWhenFilteringMixedEmailAlarmRecipients() {
+        String ics = """
+            BEGIN:VCALENDAR
+            VERSION:2.0
+            BEGIN:VEVENT
+            UID:organizer-attendee-alias-alarm
+            DTSTART:20250829T100000Z
+            SUMMARY:Meeting
+            ORGANIZER:mailto:organizer@example.com
+            ATTENDEE;ROLE=CHAIR;PARTSTAT=ACCEPTED:mailto:organizer@example.com
+            ATTENDEE;PARTSTAT=ACCEPTED:mailto:attendee@example.com
+            BEGIN:VALARM
+            ACTION:EMAIL
+            ATTENDEE:mailto:organizer@example.com
+            ATTENDEE:mailto:attendee@example.com
+            ATTENDEE:mailto:alias@example.com
+            TRIGGER:-PT15M
+            END:VALARM
+            END:VEVENT
+            END:VCALENDAR
+            """;
+
+        Calendar calendar = CalendarUtil.parseIcs(ics);
+        AlarmInstantFactory testee = testee(Instant.parse("2025-07-28T00:00:00Z"));
+
+        // Given current user, another event attendee, and alias are listed in the same email VALARM
+        Optional<AlarmInstant> result = testee.computeNextAlarmInstant(calendar, Username.of("organizer@example.com"));
+
+        // Then AlarmInstantFactory filters out the other event attendee and keeps current user plus alias
+        assertThat(result)
+            .describedAs("Current user alarm should keep current user and alias recipients only")
+            .isPresent()
+            .get()
+            .extracting(AlarmInstant::recipients)
+            .isEqualTo(List.of(asMailAddress("organizer@example.com"),
+                asMailAddress("alias@example.com")));
+    }
+
+    @Test
     void shouldPickEarliestValidAlarmAmongMultiple() {
         String ics = """
             BEGIN:VCALENDAR
@@ -597,6 +835,38 @@ public class AlarmInstantFactoryTest {
 
         Optional<AlarmInstant> result = testee.computeNextAlarmInstant(calendar, Username.of("jane@example.com"));
         assertThat(result)
+            .isEmpty();
+    }
+
+    @Test
+    void shouldReturnEmptyWhenCalendarMethodIsCancel() {
+        // A cancellation sent by the organizer carries METHOD:CANCEL, without necessarily setting STATUS:CANCELLED
+        String ics = """
+            BEGIN:VCALENDAR
+            VERSION:2.0
+            METHOD:CANCEL
+            BEGIN:VEVENT
+            UID:789012
+            DTSTAMP:20250728T000000Z
+            SEQUENCE:2
+            DTSTART:20250829T100000Z
+            DTEND:20250829T110000Z
+            SUMMARY:Meeting
+            ORGANIZER:mailto:john@example.com
+            ATTENDEE;CN=Jane Doe;PARTSTAT=ACCEPTED:mailto:jane@example.com
+            BEGIN:VALARM
+            ACTION:EMAIL
+            ATTENDEE:mailto:jane@example.com
+            TRIGGER:-PT30M
+            END:VALARM
+            END:VEVENT
+            END:VCALENDAR
+            """;
+
+        Calendar calendar = CalendarUtil.parseIcs(ics);
+        AlarmInstantFactory testee = testee(Instant.parse("2025-07-28T00:00:00Z"));
+
+        assertThat(testee.computeNextAlarmInstant(calendar, Username.of("jane@example.com")))
             .isEmpty();
     }
 
@@ -1334,6 +1604,32 @@ public class AlarmInstantFactoryTest {
             assertThat(current)
                 .describedAs("No more alarms after all occurrences processed")
                 .isEmpty();
+        }
+
+        @Test
+        void shouldSupportRecurringEventWithTzidUtcDTSTARTFormat() {
+            String ics = """
+                BEGIN:VCALENDAR
+                VERSION:2.0
+                BEGIN:VEVENT
+                UID:recurring-tzid-utc
+                DTSTART;TZID=UTC:20260608T083000
+                DTEND;TZID=UTC:20260608T093000
+                RRULE:FREQ=WEEKLY
+                SUMMARY:Weekly Meeting
+                ATTENDEE;CN=John Doe;PARTSTAT=ACCEPTED:mailto:john@example.com
+                BEGIN:VALARM
+                ACTION:EMAIL
+                TRIGGER:-PT15M
+                DESCRIPTION:Reminder
+                END:VALARM
+                END:VEVENT
+                END:VCALENDAR
+                """;
+
+            Optional<Instant> result = computeNextAlarmTime(ics, Instant.parse("2026-06-08T09:00:00Z"), Username.of("john@example.com"));
+
+            assertThat(result).contains(Instant.parse("2026-06-15T08:15:00Z"));
         }
     }
 

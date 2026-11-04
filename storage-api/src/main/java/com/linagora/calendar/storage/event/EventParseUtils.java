@@ -76,6 +76,7 @@ import net.fortuna.ical4j.model.property.RecurrenceId;
 import net.fortuna.ical4j.model.property.Sequence;
 import net.fortuna.ical4j.model.property.Summary;
 import net.fortuna.ical4j.model.property.Uid;
+import net.fortuna.ical4j.model.property.immutable.ImmutableMethod;
 
 public class EventParseUtils {
     public enum DuplicateAttendeePolicy {
@@ -195,10 +196,9 @@ public class EventParseUtils {
         return resources;
     }
 
-    public static EventFields.Person getOrganizer(VEvent vEvent) {
+    public static Optional<EventFields.Person> getOrganizer(VEvent vEvent) {
         return vEvent.getProperty(Property.ORGANIZER)
-            .flatMap(EventParseUtils::toPerson)
-            .orElse(null);
+            .flatMap(EventParseUtils::toPerson);
     }
 
     private static Predicate<Property> attendeeFilter(boolean getResource) {
@@ -375,6 +375,13 @@ public class EventParseUtils {
         return event.getStatus() != null && "CANCELLED".equalsIgnoreCase(event.getStatus().getValue());
     }
 
+    public static boolean isCancelled(Calendar calendar) {
+        return calendar.getProperty(Property.METHOD)
+            .map(Content::getValue)
+            .filter(ImmutableMethod.CANCEL.getValue()::equalsIgnoreCase)
+            .isPresent();
+    }
+
     public static Map<String, List<VEvent>> groupByUid(Calendar calendar) {
         return calendar.getComponents(Component.VEVENT).stream()
             .map(VEvent.class::cast)
@@ -438,12 +445,7 @@ public class EventParseUtils {
     public static Period calculateRecurrenceSet(VEvent master, Temporal recurrenceDate) {
         try {
             Period period = switch (recurrenceDate) {
-                case Instant instant -> {
-                    ZonedDateTime startOfDay = instant.atZone(ZoneOffset.UTC)
-                        .toLocalDate()
-                        .atStartOfDay(ZoneOffset.UTC);
-                    yield new Period(startOfDay, startOfDay.plusDays(1));
-                }
+                case Instant instant -> datetimePeriod(master, instant);
                 case LocalDate localDate -> {
                     LocalDate nextDay = localDate.plusDays(1);
                     yield new Period(nextDay, nextDay);
@@ -458,6 +460,22 @@ public class EventParseUtils {
             throw new IllegalArgumentException("Cannot calculateRecurrenceSet for recurrenceDate: " + recurrenceDate
                 + " of event: " + master, exception);
         }
+    }
+
+    private static Period datetimePeriod(VEvent master, Instant recurrenceDate) {
+        // When DTSTART is a floating LocalDateTime (e.g. TZID=UTC stripped by relaxed parsing),
+        // ical4j's TemporalComparator cannot compare LocalDateTime with ZonedDateTime.
+        // Use a LocalDateTime period so all temporals stay the same type.
+        if (master.getDateTimeStart().getDate() instanceof LocalDateTime) {
+            LocalDateTime ldt = recurrenceDate.atZone(ZoneOffset.UTC)
+                .toLocalDate()
+                .atStartOfDay();
+            return new Period(ldt, ldt.plusDays(1));
+        }
+        ZonedDateTime startOfDay = recurrenceDate.atZone(ZoneOffset.UTC)
+            .toLocalDate()
+            .atStartOfDay(ZoneOffset.UTC);
+        return new Period(startOfDay, startOfDay.plusDays(1));
     }
 
     public static void addProperties(VEvent vEvent, Property... properties) {

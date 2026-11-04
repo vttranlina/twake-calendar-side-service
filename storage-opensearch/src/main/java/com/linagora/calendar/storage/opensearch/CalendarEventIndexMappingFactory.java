@@ -55,7 +55,7 @@ public class CalendarEventIndexMappingFactory {
 
     interface CalendarFields {
 
-        String ACCOUNT_ID = "accountId";
+        String BASE_CALENDAR_ID = "baseCalendarId";
         String EVENT_UID = "eventUid";
         String OPENPAAS_USER_ID = "userId";
         String CALENDAR_URL = "calendarURL";
@@ -77,8 +77,13 @@ public class CalendarEventIndexMappingFactory {
         String IS_RECURRENT_MASTER = "isRecurrentMaster";
         String CLAZZ = "clazz";
         String VIDEOCONFERENCE_URL = "videoconferenceUrl";
+        String BOOKING_LINK_ID = "bookingLinkId";
         String SEQUENCE = "sequence";
         String RESOURCE_NAME = "resourceName";
+        String RECURRENCE_ID = "recurrenceId";
+        // Sort rank used to keep the recurrence master (or a standalone event) as the representative
+        // document when collapsing search results on the event uid. Lower rank wins.
+        String COLLAPSE_RANK = "collapseRank";
     }
 
     interface MultiField {
@@ -90,6 +95,7 @@ public class CalendarEventIndexMappingFactory {
         String KEYWORD = "keyword";
         String PREFIX_KEY = "calendar_event_";
         String CN_NAME_ANALYZER = PREFIX_KEY + "cn_name_analyzer";
+        String CN_NAME_SEARCH_ANALYZER = PREFIX_KEY + "cn_name_search_analyzer";
         String KEEP_MAIL_AND_URL_ANALYZER = PREFIX_KEY + "keep_mail_and_url_analyzer";
         String SUMMARY_PREFIX_ANALYZER = PREFIX_KEY + "summary_prefix_analyzer";
         String SUMMARY_SEARCH_PREFIX_ANALYZER = PREFIX_KEY + "summary_search_prefix_analyzer";
@@ -102,6 +108,13 @@ public class CalendarEventIndexMappingFactory {
             .put(CN_NAME_ANALYZER, new Analyzer(new CustomAnalyzer.Builder()
                 .tokenizer(STANDARD)
                 .filter(EDGE_NGRAM_FILTER, "lowercase", PRESERVED_ASCII_FOLDING_FILTER)
+                .build()))
+            // Search side must not edge-ngram the query: otherwise "Point" produces the gram "poi" which
+            // matches unrelated names such as "Poizat" (issue #996). Keeping the standard tokenizer makes
+            // each query word a prefix match against the indexed name grams.
+            .put(CN_NAME_SEARCH_ANALYZER, new Analyzer(new CustomAnalyzer.Builder()
+                .tokenizer(STANDARD)
+                .filter("lowercase", PRESERVED_ASCII_FOLDING_FILTER)
                 .build()))
             .put(SUMMARY_PREFIX_ANALYZER, new Analyzer(new CustomAnalyzer.Builder()
                 .tokenizer(STANDARD)
@@ -164,6 +177,7 @@ public class CalendarEventIndexMappingFactory {
         Property nonIndexedKeywordProperty = new Property(new KeywordProperty.Builder().index(false).build());
         Property nonIndexedBooleanProperty = new Property(new BooleanProperty.Builder().index(false).build());
         Property nonIndexedIntegerProperty = new Property(new IntegerNumberProperty.Builder().index(false).build());
+        Property indexedIntegerProperty = new Property(new IntegerNumberProperty.Builder().index(true).build());
         Property indexedKeywordProperty = new Property(new KeywordProperty.Builder().index(true).build());
 
         Property emailTextProperty = new TextProperty.Builder()
@@ -175,6 +189,7 @@ public class CalendarEventIndexMappingFactory {
 
         Property cnNameTextProperty = new TextProperty.Builder()
             .analyzer(CalendarAnalyzers.CN_NAME_ANALYZER)
+            .searchAnalyzer(CalendarAnalyzers.CN_NAME_SEARCH_ANALYZER)
             .build()._toProperty();
 
         Property emailCNObjectProperty = new ObjectProperty.Builder()
@@ -187,9 +202,10 @@ public class CalendarEventIndexMappingFactory {
 
         return new TypeMapping.Builder()
             .properties(new ImmutableMap.Builder<String, Property>()
-                .put(CalendarFields.ACCOUNT_ID, indexedKeywordProperty)
+                .put(CalendarFields.BASE_CALENDAR_ID, indexedKeywordProperty)
                 .put(CalendarFields.EVENT_UID, indexedKeywordProperty)
                 .put(CalendarFields.CALENDAR_URL, indexedKeywordProperty)
+                .put(CalendarFields.BOOKING_LINK_ID, indexedKeywordProperty)
                 .put(CalendarFields.SUMMARY, summaryProperty(configuration.searchSummaryPrefix()))
                 .put(CalendarFields.LOCATION,  new Property(new TextProperty.Builder().analyzer(CalendarAnalyzers.LOCATION_ANALYZER).build()))
                 .put(CalendarFields.DESCRIPTION,  new Property(new TextProperty.Builder().analyzer(CalendarAnalyzers.STANDARD).build()))
@@ -205,8 +221,13 @@ public class CalendarEventIndexMappingFactory {
                 .put(CalendarFields.ALL_DAY, nonIndexedBooleanProperty)
                 .put(CalendarFields.IS_RECURRENT_MASTER, nonIndexedBooleanProperty)
                 .put(CalendarFields.VIDEOCONFERENCE_URL, nonIndexedKeywordProperty)
-                .put(CalendarFields.SEQUENCE, nonIndexedIntegerProperty)
+                // Indexed so removed occurrences can be pruned with a sequence-bounded delete-by-query (issue #895).
+                .put(CalendarFields.SEQUENCE, indexedIntegerProperty)
                 .put(CalendarFields.RESOURCE_NAME, nonIndexedKeywordProperty)
+                // Not indexed but stored so an overridden occurrence surfaced by search keeps its recurrenceId (issue #895).
+                .put(CalendarFields.RECURRENCE_ID, nonIndexedKeywordProperty)
+                // Not indexed but keeps doc_values so it can be used as a sort key when collapsing on the uid.
+                .put(CalendarFields.COLLAPSE_RANK, nonIndexedIntegerProperty)
                 .build())
             .build();
     }

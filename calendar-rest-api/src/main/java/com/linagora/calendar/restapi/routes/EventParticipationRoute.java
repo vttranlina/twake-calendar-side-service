@@ -23,7 +23,6 @@ import static com.linagora.calendar.restapi.RestApiConstants.JSON_HEADER;
 import java.util.List;
 import java.util.Locale;
 import java.util.Optional;
-import java.util.stream.Stream;
 
 import jakarta.inject.Inject;
 import jakarta.inject.Named;
@@ -32,8 +31,6 @@ import org.apache.commons.lang3.StringUtils;
 import org.apache.commons.lang3.tuple.Pair;
 import org.apache.james.core.Username;
 import org.apache.james.jmap.Endpoint;
-import org.apache.james.jmap.JMAPRoute;
-import org.apache.james.jmap.JMAPRoutes;
 import org.apache.james.metrics.api.MetricFactory;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -48,6 +45,7 @@ import com.linagora.calendar.dav.CalendarEventNotFoundException;
 import com.linagora.calendar.dav.CalendarEventUpdatePatch.AttendeePartStatusUpdatePatch;
 import com.linagora.calendar.dav.dto.VCalendarDto;
 import com.linagora.calendar.restapi.ErrorResponse;
+import com.linagora.calendar.restapi.ErrorType;
 import com.linagora.calendar.restapi.routes.response.EventParticipationResponse;
 import com.linagora.calendar.storage.OpenPaaSId;
 import com.linagora.calendar.storage.OpenPaaSUserDAO;
@@ -62,11 +60,10 @@ import reactor.core.publisher.Mono;
 import reactor.netty.http.server.HttpServerRequest;
 import reactor.netty.http.server.HttpServerResponse;
 
-public class EventParticipationRoute implements JMAPRoutes {
+public class EventParticipationRoute extends PublicRoute {
 
     private static final Logger LOGGER = LoggerFactory.getLogger(EventParticipationRoute.class);
     private static final String JWT_PARAM = "jwt";
-    private final MetricFactory metricFactory;
     private final ParticipationTokenSigner participationTokenSigner;
     private final CalDavEventRepository calDavEventRepository;
     private final SettingsBasedResolver settingsResolver;
@@ -80,7 +77,7 @@ public class EventParticipationRoute implements JMAPRoutes {
                                    @Named("language") SettingsBasedResolver settingsResolver,
                                    EventParticipationActionLinkFactory actionLinkFactory,
                                    OpenPaaSUserDAO openPaaSUserDAO) {
-        this.metricFactory = metricFactory;
+        super(metricFactory);
         this.participationTokenSigner = participationTokenSigner;
         this.calDavEventRepository = calDavEventRepository;
         this.settingsResolver = settingsResolver;
@@ -89,20 +86,11 @@ public class EventParticipationRoute implements JMAPRoutes {
         this.openPaaSUserDAO = openPaaSUserDAO;
     }
 
-    private Endpoint endpoint() {
+    protected Endpoint endpoint() {
         return new Endpoint(HttpMethod.GET, "/calendar/api/calendars/event/participation");
     }
 
-    @Override
-    public Stream<JMAPRoute> routes() {
-        return Stream.of(
-            JMAPRoute.builder()
-                .endpoint(endpoint())
-                .action((req, res) -> Mono.from(metricFactory.decoratePublisherWithTimerMetric(this.getClass().getSimpleName(), handleRequest(req, res))))
-                .corsHeaders());
-    }
-
-    private Mono<Void> handleRequest(HttpServerRequest request, HttpServerResponse response) {
+    protected Mono<Void> handleRequest(HttpServerRequest request, HttpServerResponse response) {
         return validateAndExtractParticipation(request)
             .flatMap(participation -> handleValidParticipation(response, participation))
             .onErrorResume(Exception.class, exception -> {
@@ -195,6 +183,7 @@ public class EventParticipationRoute implements JMAPRoutes {
             .headers(JSON_HEADER)
             .sendByteArray(Mono.fromCallable(() -> ErrorResponse.of(
                 401,
+                ErrorType.UNAUTHORIZED,
                 "Unauthorized",
                 "JWT is missing or invalid").serializeAsBytes()))
             .then();
@@ -203,7 +192,7 @@ public class EventParticipationRoute implements JMAPRoutes {
     private Mono<Void> doNotFound(HttpServerResponse response, CalendarEventNotFoundException exception) {
         return response.status(HttpResponseStatus.NOT_FOUND)
             .headers(JSON_HEADER)
-            .sendByteArray(Mono.fromCallable(() -> ErrorResponse.of(404, "Not found", exception.getMessage())
+            .sendByteArray(Mono.fromCallable(() -> ErrorResponse.of(404, ErrorType.NOT_FOUND, "Not found", exception.getMessage())
                 .serializeAsBytes()))
             .then();
     }
@@ -211,7 +200,7 @@ public class EventParticipationRoute implements JMAPRoutes {
     private Mono<Void> doOnError(HttpServerResponse response, Exception exception) {
         return response.status(HttpResponseStatus.BAD_REQUEST)
             .headers(JSON_HEADER)
-            .sendByteArray(Mono.fromCallable(() -> ErrorResponse.of(500, "Server Error", exception.getMessage())
+            .sendByteArray(Mono.fromCallable(() -> ErrorResponse.of(500, ErrorType.SERVER_ERROR, "Server Error", exception.getMessage())
                 .serializeAsBytes()))
             .then();
     }

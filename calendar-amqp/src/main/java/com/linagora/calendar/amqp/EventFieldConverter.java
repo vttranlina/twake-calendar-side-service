@@ -128,6 +128,7 @@ public class EventFieldConverter {
                 case EventProperty.RRULE_PROPERTY -> builder.isRecurrentMaster(true);
                 case EventProperty.SEQUENCE_PROPERTY -> builder.sequence(((SequenceProperty) property).getSequence());
                 case EventProperty.VIDEOCONFERENCE -> builder.videoconferenceUrl(property.value);
+                case EventProperty.BOOKING_LINK -> builder.bookingLinkId(property.value);
                 default -> {
                 }
             }
@@ -176,6 +177,10 @@ public class EventFieldConverter {
         try {
             return Optional.of(MAPPER.treeToValue(node, EventProperty.class));
         } catch (JsonProcessingException | RuntimeException e) {
+            if (isEventProperty(node, EventProperty.ORGANIZER_PROPERTY)) {
+                LOGGER.warn("Skipping invalid organizer event property: {}", node, e);
+                return Optional.empty();
+            }
             if (isEventProperty(node, EventProperty.ATTENDEE_PROPERTY)) {
                 LOGGER.warn("Skipping invalid attendee event property: {}", node, e);
                 return Optional.empty();

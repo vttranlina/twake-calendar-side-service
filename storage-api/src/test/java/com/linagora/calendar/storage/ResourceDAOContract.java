@@ -29,7 +29,6 @@ import java.util.Optional;
 import org.junit.jupiter.api.Test;
 
 import com.linagora.calendar.storage.model.Resource;
-import com.linagora.calendar.storage.model.ResourceAdministrator;
 import com.linagora.calendar.storage.model.ResourceId;
 
 public interface ResourceDAOContract {
@@ -45,7 +44,6 @@ public interface ResourceDAOContract {
     @Test
     default void insertShouldAddNewResource() {
         ResourceInsertRequest request = new ResourceInsertRequest(
-            List.of(new ResourceAdministrator(new OpenPaaSId("admin1"), "user")),
             CREATOR1,
             "Test resource description",
             DOMAIN1,
@@ -65,7 +63,6 @@ public interface ResourceDAOContract {
     @Test
     default void findByIdShouldReturnDeletedResource() {
         ResourceInsertRequest request = new ResourceInsertRequest(
-            List.of(new ResourceAdministrator(new OpenPaaSId("admin1"), "user")),
             CREATOR1,
             "Test resource description",
             DOMAIN1,
@@ -87,14 +84,12 @@ public interface ResourceDAOContract {
     @Test
     default void findAllShouldReturnAllResources() {
         ResourceInsertRequest req1 = new ResourceInsertRequest(
-            List.of(new ResourceAdministrator(new OpenPaaSId("admin1"), "user")),
             CREATOR1,
             "desc1",
             DOMAIN1,
             "icon1.png",
             "Resource1");
         ResourceInsertRequest req2 = new ResourceInsertRequest(
-            List.of(new ResourceAdministrator(new OpenPaaSId("admin2"), "user")),
             CREATOR2,
             "desc2",
             DOMAIN2,
@@ -112,14 +107,12 @@ public interface ResourceDAOContract {
     @Test
     default void findAllShouldReturnDeletedResources() {
         ResourceInsertRequest req1 = new ResourceInsertRequest(
-            List.of(new ResourceAdministrator(new OpenPaaSId("admin1"), "user")),
             CREATOR1,
             "desc1",
             DOMAIN1,
             "icon1.png",
             "Resource1");
         ResourceInsertRequest req2 = new ResourceInsertRequest(
-            List.of(new ResourceAdministrator(new OpenPaaSId("admin2"), "user")),
             CREATOR2,
             "desc2",
             DOMAIN2,
@@ -136,14 +129,12 @@ public interface ResourceDAOContract {
     @Test
     default void findByDomainShouldReturnResourcesWithCorrespondingDomain() {
         ResourceInsertRequest req1 = new ResourceInsertRequest(
-            List.of(new ResourceAdministrator(new OpenPaaSId("admin1"), "user")),
             CREATOR1,
             "desc1",
             DOMAIN1,
             "icon1.png",
             "Resource1");
         ResourceInsertRequest req2 = new ResourceInsertRequest(
-            List.of(new ResourceAdministrator(new OpenPaaSId("admin2"), "user")),
             CREATOR2,
             "desc2",
             DOMAIN2,
@@ -161,14 +152,12 @@ public interface ResourceDAOContract {
     @Test
     default void findByDomainShouldReturnDeletedResources() {
         ResourceInsertRequest req1 = new ResourceInsertRequest(
-            List.of(new ResourceAdministrator(new OpenPaaSId("admin1"), "user")),
             CREATOR1,
             "desc1",
             DOMAIN1,
             "icon1.png",
             "Resource1");
         ResourceInsertRequest req2 = new ResourceInsertRequest(
-            List.of(new ResourceAdministrator(new OpenPaaSId("admin2"), "user")),
             CREATOR2,
             "desc2",
             DOMAIN1,
@@ -185,7 +174,6 @@ public interface ResourceDAOContract {
     @Test
     default void updateShouldUpdateCurrentResource() {
         ResourceInsertRequest request = new ResourceInsertRequest(
-            List.of(new ResourceAdministrator(new OpenPaaSId("admin1"), "user")),
             CREATOR1,
             "desc",
             DOMAIN1,
@@ -195,13 +183,11 @@ public interface ResourceDAOContract {
         ResourceUpdateRequest updateRequest = new ResourceUpdateRequest(
             Optional.of("UpdatedName"),
             Optional.of("UpdatedDesc"),
-            Optional.of("updatedIcon.png"),
-            Optional.of(List.of(new ResourceAdministrator(new OpenPaaSId("admin2"), "user"))));
+            Optional.of("updatedIcon.png"));
         Resource updated = dao().update(resourceId, updateRequest).block();
 
         Resource expected = new Resource(
             resourceId,
-            List.of(new ResourceAdministrator(new OpenPaaSId("admin2"), "user")),
             CREATOR1,
             !DELETED,
             "UpdatedDesc",
@@ -219,7 +205,6 @@ public interface ResourceDAOContract {
     @Test
     default void softDeleteShouldMarkResourceAsDeleted() {
         ResourceInsertRequest request = new ResourceInsertRequest(
-            List.of(new ResourceAdministrator(new OpenPaaSId("admin1"), "user")),
             CREATOR1,
             "desc",
             DOMAIN1,
@@ -234,14 +219,12 @@ public interface ResourceDAOContract {
     @Test
     default void searchShouldReturnMatchingResources() {
         ResourceInsertRequest req1 = new ResourceInsertRequest(
-            List.of(new ResourceAdministrator(new OpenPaaSId("admin1"), "user")),
             CREATOR1,
             "desc1",
             DOMAIN1,
             "icon1.png",
             "AlphaResource");
         ResourceInsertRequest req2 = new ResourceInsertRequest(
-            List.of(new ResourceAdministrator(new OpenPaaSId("admin2"), "user")),
             CREATOR2,
             "desc2",
             DOMAIN1,
@@ -259,7 +242,6 @@ public interface ResourceDAOContract {
     @Test
     default void searchShouldBeCaseInsensitive() {
         ResourceInsertRequest req1 = new ResourceInsertRequest(
-            List.of(new ResourceAdministrator(new OpenPaaSId("admin1"), "user")),
             CREATOR1,
             "desc1",
             DOMAIN1,
@@ -276,14 +258,12 @@ public interface ResourceDAOContract {
     @Test
     default void searchShouldNotReturnResourcesWithWrongDomain() {
         ResourceInsertRequest req1 = new ResourceInsertRequest(
-            List.of(new ResourceAdministrator(new OpenPaaSId("admin1"), "user")),
             CREATOR1,
             "desc1",
             DOMAIN1,
             "icon1.png",
             "AlphaResource");
         ResourceInsertRequest req2 = new ResourceInsertRequest(
-            List.of(new ResourceAdministrator(new OpenPaaSId("admin2"), "user")),
             CREATOR2,
             "desc2",
             new OpenPaaSId("659387b9d486dc0046aeff99"),
@@ -301,14 +281,12 @@ public interface ResourceDAOContract {
     @Test
     default void searchShouldReturnLimitedNumberOfResources() {
         ResourceInsertRequest req1 = new ResourceInsertRequest(
-            List.of(new ResourceAdministrator(new OpenPaaSId("admin1"), "user")),
             CREATOR1,
             "desc1",
             DOMAIN1,
             "icon1.png",
             "AlphaResource");
         ResourceInsertRequest req2 = new ResourceInsertRequest(
-            List.of(new ResourceAdministrator(new OpenPaaSId("admin2"), "user")),
             CREATOR2,
             "desc2",
             DOMAIN1,
@@ -324,14 +302,12 @@ public interface ResourceDAOContract {
     @Test
     default void searchShouldNotReturnDeletedResources() {
         ResourceInsertRequest req1 = new ResourceInsertRequest(
-            List.of(new ResourceAdministrator(new OpenPaaSId("admin1"), "user")),
             CREATOR1,
             "desc1",
             DOMAIN1,
             "icon1.png",
             "AlphaResource");
         ResourceInsertRequest req2 = new ResourceInsertRequest(
-            List.of(new ResourceAdministrator(new OpenPaaSId("admin2"), "user")),
             CREATOR2,
             "desc2",
             DOMAIN1,
@@ -348,7 +324,6 @@ public interface ResourceDAOContract {
     @Test
     default void existShouldReturnTrueWhenBothResourceIdAndDomainMatch() {
         ResourceInsertRequest request = new ResourceInsertRequest(
-            List.of(new ResourceAdministrator(new OpenPaaSId("admin1"), "user")),
             CREATOR1,
             "desc",
             DOMAIN1,
@@ -363,7 +338,6 @@ public interface ResourceDAOContract {
     @Test
     default void existShouldReturnFalseWhenDomainDoesNotMatch() {
         ResourceInsertRequest request = new ResourceInsertRequest(
-            List.of(new ResourceAdministrator(new OpenPaaSId("admin1"), "user")),
             CREATOR1,
             "desc",
             DOMAIN1,
@@ -378,7 +352,6 @@ public interface ResourceDAOContract {
     @Test
     default void existShouldReturnFalseWhenResourceIdDoesNotMatch() {
         ResourceInsertRequest request = new ResourceInsertRequest(
-            List.of(new ResourceAdministrator(new OpenPaaSId("admin1"), "user")),
             CREATOR1,
             "desc",
             DOMAIN1,
@@ -393,7 +366,6 @@ public interface ResourceDAOContract {
     @Test
     default void existShouldReturnFalseWhenResourceIsDeleted() {
         ResourceInsertRequest request = new ResourceInsertRequest(
-            List.of(new ResourceAdministrator(new OpenPaaSId("admin1"), "user")),
             CREATOR1,
             "desc",
             DOMAIN1,
@@ -411,8 +383,7 @@ public interface ResourceDAOContract {
         ResourceUpdateRequest updateRequest = new ResourceUpdateRequest(
             Optional.of("Name"),
             Optional.of("Desc"),
-            Optional.of("icon.png"),
-            Optional.of(List.of(new ResourceAdministrator(new OpenPaaSId("admin1"), "user"))));
+            Optional.of("icon.png"));
 
         assertThatThrownBy(() -> dao().update(new ResourceId("659387b9d486dc0046aeff29"), updateRequest).block())
             .isInstanceOf(ResourceNotFoundException.class);
@@ -421,7 +392,6 @@ public interface ResourceDAOContract {
     @Test
     default void updateShouldThrowWhenResourceIsDeleted() {
         ResourceInsertRequest request = new ResourceInsertRequest(
-            List.of(new ResourceAdministrator(new OpenPaaSId("admin1"), "user")),
             CREATOR1,
             "desc",
             DOMAIN1,
@@ -432,8 +402,7 @@ public interface ResourceDAOContract {
         ResourceUpdateRequest updateRequest = new ResourceUpdateRequest(
             Optional.of("UpdatedName"),
             Optional.of("UpdatedDesc"),
-            Optional.of("updatedIcon.png"),
-            Optional.of(List.of(new ResourceAdministrator(new OpenPaaSId("admin2"), "user"))));
+            Optional.of("updatedIcon.png"));
 
         assertThatThrownBy(() -> dao().update(resourceId, updateRequest).block())
             .isInstanceOf(ResourceNotFoundException.class);
@@ -450,7 +419,6 @@ public interface ResourceDAOContract {
     @Test
     default void softDeleteShouldThrowWhenResourceIsDeleted() {
         ResourceInsertRequest request = new ResourceInsertRequest(
-            List.of(new ResourceAdministrator(new OpenPaaSId("admin1"), "user")),
             CREATOR1,
             "desc",
             DOMAIN1,

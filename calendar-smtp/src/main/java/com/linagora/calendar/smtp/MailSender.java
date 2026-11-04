@@ -22,6 +22,7 @@ import java.io.IOException;
 import java.io.Writer;
 import java.nio.charset.StandardCharsets;
 import java.security.cert.X509Certificate;
+import java.time.Duration;
 import java.util.Collection;
 import java.util.List;
 
@@ -41,6 +42,8 @@ import com.github.fge.lambdas.Throwing;
 import com.google.common.collect.ImmutableList;
 
 import reactor.core.publisher.Mono;
+import reactor.core.scheduler.Schedulers;
+import reactor.util.retry.Retry;
 
 public interface MailSender {
     Logger LOGGER = LoggerFactory.getLogger(MailSender.class);
@@ -52,9 +55,20 @@ public interface MailSender {
     interface Factory {
         Mono<MailSender> create();
 
+        Mono<Void> send(Mail mail);
+
         class Default implements Factory {
             private static final String DEFAULT_PROTOCOL = "TLS";
             private static final String UTF_8_ENCODING = "UTF-8";
+            static final String SMTP_SEND_MAX_RETRIES_PROPERTY = "twake.calendar.smtp.max-retries";
+            private static final int MAX_SMTP_SEND_RETRIES = maxSmtpSendRetries();
+            private static final Duration SMTP_SEND_RETRY_BACKOFF = Duration.ofMillis(100);
+            private static final Retry RETRY_SEND =
+                Retry.backoff(MAX_SMTP_SEND_RETRIES, SMTP_SEND_RETRY_BACKOFF)
+                    .maxBackoff(Duration.ofSeconds(5))
+                    .doBeforeRetry(retrySignal -> LOGGER.warn("Retrying SMTP mail send after failure (attempt {}/{})",
+                        retrySignal.totalRetries() + 1, MAX_SMTP_SEND_RETRIES, retrySignal.failure()))
+                    .onRetryExhaustedThrow((spec, signal) -> signal.failure());
             public static final X509TrustManager TRUST_ALL = new X509TrustManager() {
                 public X509Certificate[] getAcceptedIssuers() {
                     return null;
@@ -79,7 +93,7 @@ public interface MailSender {
             }
 
             public Mono<MailSender> create() {
-                return Mono.fromCallable(() -> {
+                return Mono.<MailSender>fromCallable(() -> {
                     AuthenticatingSMTPClient authClient = new AuthenticatingSMTPClient(DEFAULT_PROTOCOL,
                         configuration.sslEnabled(),
                         UTF_8_ENCODING);
@@ -107,7 +121,19 @@ public interface MailSender {
                         }
                     }));
                     return new MailSender.Default(authClient, configuration, eventEmailFilter);
-                });
+                })
+                .subscribeOn(Schedulers.boundedElastic());
+            }
+
+            @Override
+            public Mono<Void> send(Mail mail) {
+                return Mono.defer(() -> create()
+                        .flatMap(mailSender -> mailSender.send(mail)))
+                    .retryWhen(RETRY_SEND);
+            }
+
+            static int maxSmtpSendRetries() {
+                return Integer.getInteger(SMTP_SEND_MAX_RETRIES_PROPERTY, 3);
             }
         }
     }
@@ -125,18 +151,18 @@ public interface MailSender {
 
         @Override
         public Mono<Void> send(Mail mail) {
-            return Mono.fromRunnable(Throwing.runnable(() -> {
+            return Mono.<Void>fromRunnable(Throwing.runnable(() -> {
                 try {
                     eventEmailFilter.filterRecipients(mail).ifPresent(Throwing.consumer(this::sendMailTransaction));
                 } finally {
                     disconnect();
                 }
-            }));
+            })).subscribeOn(Schedulers.boundedElastic());
         }
 
         @Override
         public Mono<Void> send(Collection<Mail> mails) {
-            return Mono.fromRunnable(Throwing.runnable(() -> {
+            return Mono.<Void>fromRunnable(Throwing.runnable(() -> {
                 ImmutableList.Builder<Exception> exceptionBuilder = new ImmutableList.Builder<>();
                 mails.forEach(mail -> eventEmailFilter.filterRecipients(mail).ifPresent(Throwing.consumer(updatedMail -> {
                     try {
@@ -156,7 +182,7 @@ public interface MailSender {
                 if (exceptions.size() == mails.size()) {
                     throw exceptions.getFirst();
                 }
-            }));
+            })).subscribeOn(Schedulers.boundedElastic());
         }
 
         private void disconnect() throws IOException {

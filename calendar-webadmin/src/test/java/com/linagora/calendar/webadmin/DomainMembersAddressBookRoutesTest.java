@@ -44,7 +44,6 @@ import org.apache.james.task.MemoryTaskManager;
 import org.apache.james.task.TaskExecutionDetails;
 import org.apache.james.task.TaskManager;
 import org.apache.james.webadmin.WebAdminServer;
-import org.apache.james.webadmin.WebAdminUtils;
 import org.apache.james.webadmin.routes.TasksRoutes;
 import org.apache.james.webadmin.utils.JsonTransformer;
 import org.junit.jupiter.api.AfterEach;
@@ -55,7 +54,6 @@ import org.junit.jupiter.api.extension.RegisterExtension;
 import com.github.fge.lambdas.Throwing;
 import com.google.common.collect.ImmutableSet;
 import com.linagora.calendar.dav.CardDavClient;
-import com.linagora.calendar.dav.DockerSabreDavSetup;
 import com.linagora.calendar.dav.SabreDavExtension;
 import com.linagora.calendar.storage.OpenPaaSDomain;
 import com.linagora.calendar.storage.OpenPaaSId;
@@ -63,7 +61,9 @@ import com.linagora.calendar.storage.ldap.LdapDomainMemberProvider;
 import com.linagora.calendar.storage.ldap.LdapUser;
 import com.linagora.calendar.storage.mongodb.MongoDBOpenPaaSDomainDAO;
 import com.linagora.calendar.webadmin.DomainMembersAddressBookRoutes.LdapToDavDomainMembersSyncTaskRegistration;
+import com.linagora.calendar.webadmin.service.DavDomainMembersClearService;
 import com.linagora.calendar.webadmin.service.LdapToDavDomainMembersSyncService;
+import com.linagora.calendar.webadmin.task.DomainMembersClearTaskAdditionalInformationDTO;
 import com.linagora.calendar.webadmin.task.DomainMembersSyncTaskAdditionalInformationDTO;
 import com.mongodb.reactivestreams.client.MongoDatabase;
 
@@ -74,7 +74,7 @@ import reactor.core.publisher.Flux;
 public class DomainMembersAddressBookRoutesTest {
 
     @RegisterExtension
-    static SabreDavExtension sabreDavExtension = new SabreDavExtension(DockerSabreDavSetup.SINGLETON);
+    static SabreDavExtension sabreDavExtension = SabreDavExtension.shared();
 
     private WebAdminServer webAdminServer;
     private LdapDomainMemberProvider ldapDomainMemberProvider;
@@ -97,12 +97,16 @@ public class DomainMembersAddressBookRoutesTest {
         LdapToDavDomainMembersSyncTaskRegistration ldapToDavDomainMembersSyncTaskRegistration = new LdapToDavDomainMembersSyncTaskRegistration(
             syncService, domainDAO);
 
+        DavDomainMembersClearService clearService = new DavDomainMembersClearService(cardDavClient);
+
         webAdminServer = WebAdminUtils.createWebAdminServer(new DomainMembersAddressBookRoutes(
                     new JsonTransformer(), taskManager,
-                    ImmutableSet.of(ldapToDavDomainMembersSyncTaskRegistration)),
+                    ImmutableSet.of(ldapToDavDomainMembersSyncTaskRegistration),
+                    domainDAO, clearService),
                 new TasksRoutes(taskManager, new JsonTransformer(),
                     new DTOConverter<>(ImmutableSet.<AdditionalInformationDTOModule<? extends TaskExecutionDetails.AdditionalInformation, ? extends AdditionalInformationDTO>>builder()
                         .add(DomainMembersSyncTaskAdditionalInformationDTO.module())
+                        .add(DomainMembersClearTaskAdditionalInformationDTO.module())
                         .build())))
             .start();
 
@@ -360,7 +364,7 @@ public class DomainMembersAddressBookRoutesTest {
         // When: sync all domains but ignore domain2 and domain3 (comma URL-encoded)
         String ignoredDomainsParam = domain2.asString() + "%2C" + domain3.asString();
 
-        String taskId = given().log().all()
+        String taskId = given()
             .urlEncodingEnabled(false)
             .queryParam("task", "sync")
             .queryParam("ignoredDomains", ignoredDomainsParam)
@@ -374,7 +378,7 @@ public class DomainMembersAddressBookRoutesTest {
         given()
             .basePath(TasksRoutes.BASE)
         .when()
-            .get(taskId + "/await").prettyPeek()
+            .get(taskId + "/await")
         .then()
             .statusCode(200)
             .body("status", is("completed"))
@@ -553,6 +557,302 @@ public class DomainMembersAddressBookRoutesTest {
             .body("additionalInformation.addedCount", is(1))
             .body("additionalInformation.updatedCount", is(1))
             .body("additionalInformation.deletedCount", is(1));
+    }
+
+    @Test
+    void singleDomainSyncShouldApplyLdapFilterAndReportItInAdditionalInformation() {
+        LdapUser ldap = ldapMember("uid123", "user1@example.com", "Nguyen", "Van A", "Nguyen Van A", "123");
+        when(ldapDomainMemberProvider.domainMembers(any(), any()))
+            .thenReturn(Flux.just(ldap));
+
+        String taskId = given()
+            .queryParam("task", "sync")
+            .queryParam("ldapFilter", "(!(departmentNumber=SECRET))")
+            .post(DomainMembersAddressBookRoutes.BASE_PATH + "/" + openPaaSDomain.domain().asString())
+        .then()
+            .statusCode(201)
+            .extract()
+            .jsonPath()
+            .getString("taskId");
+
+        given()
+            .basePath(TasksRoutes.BASE)
+        .when()
+            .get(taskId + "/await")
+        .then()
+            .statusCode(200)
+            .body("status", is("completed"))
+            .body("additionalInformation.addedCount", is(1))
+            .body("additionalInformation.ldapFilter", is("(!(departmentNumber=SECRET))"));
+    }
+
+    @Test
+    void allDomainsSyncShouldReportLdapFilterInAdditionalInformation() {
+        when(ldapDomainMemberProvider.domainMembers(any(), any()))
+            .thenReturn(Flux.empty());
+
+        String taskId = given()
+            .queryParam("task", "sync")
+            .queryParam("ldapFilter", "(!(departmentNumber=SECRET))")
+            .post(DomainMembersAddressBookRoutes.BASE_PATH)
+        .then()
+            .statusCode(201)
+            .extract()
+            .jsonPath()
+            .getString("taskId");
+
+        given()
+            .basePath(TasksRoutes.BASE)
+        .when()
+            .get(taskId + "/await")
+        .then()
+            .statusCode(200)
+            .body("status", is("completed"))
+            .body("additionalInformation.ldapFilter", is("(!(departmentNumber=SECRET))"));
+    }
+
+    @Test
+    void syncShouldReturnBadRequestWhenLdapFilterIsInvalid() {
+        String response = given()
+            .queryParam("task", "sync")
+            .queryParam("ldapFilter", "(((")
+            .post(DomainMembersAddressBookRoutes.BASE_PATH)
+        .then()
+            .statusCode(400)
+            .extract()
+            .body()
+            .asString();
+
+        assertThatJson(response)
+            .withOptions(Option.IGNORING_EXTRA_FIELDS)
+            .isEqualTo("""
+                {
+                  "statusCode": 400,
+                  "type": "InvalidArgument",
+                  "message": "${json-unit.any-string}"
+                }
+                """);
+    }
+
+    @Test
+    void clearSingleDomainShouldReturnNotFoundWhenDomainDoesNotExist() {
+        String nonExistentDomain = "non-existent-" + UUID.randomUUID() + ".tld";
+
+        String response = given()
+            .delete(DomainMembersAddressBookRoutes.BASE_PATH + "/" + nonExistentDomain)
+        .then()
+            .statusCode(404)
+            .extract()
+            .body().asString();
+
+        assertThatJson(response)
+            .withOptions(Option.IGNORING_EXTRA_FIELDS)
+            .isEqualTo("""
+                {
+                    "statusCode": 404,
+                    "type": "notFound",
+                    "message": "domain not found: %s"
+                }""".formatted(nonExistentDomain));
+    }
+
+    @Test
+    void clearSingleDomainShouldReportExpectedAdditionalInformation() {
+        LdapUser ldap = ldapMember("uid123", "user1@example.com", "Nguyen", "Van A", "Nguyen Van A", "123");
+        mockLdapDomainMembersForDomain(openPaaSDomain.domain(), ldap);
+        syncDomain(openPaaSDomain.domain());
+
+        String taskId = given()
+            .delete(DomainMembersAddressBookRoutes.BASE_PATH + "/" + openPaaSDomain.domain().asString())
+        .then()
+            .statusCode(201)
+            .extract()
+            .jsonPath()
+            .getString("taskId");
+
+        String taskResponse = given()
+            .basePath(TasksRoutes.BASE)
+        .when()
+            .get(taskId + "/await")
+        .then()
+            .extract()
+            .body()
+            .asString();
+
+        assertThatJson(taskResponse)
+            .withOptions(Option.IGNORING_EXTRA_FIELDS)
+            .isEqualTo("""
+                {
+                    "additionalInformation": {
+                        "type": "clear-domain-members-contacts-dav",
+                        "domain": "{domain}",
+                        "timestamp": "${json-unit.any-string}",
+                        "deletedCount": 1,
+                        "deleteFailureContacts": []
+                    },
+                    "type": "clear-domain-members-contacts-dav",
+                    "taskId": "{taskId}",
+                    "status": "completed"
+                }""".replace("{taskId}", taskId)
+                .replace("{domain}", openPaaSDomain.domain().asString()));
+    }
+
+    @Test
+    void clearSingleDomainShouldRemoveContactsFromDavServer() {
+        LdapUser ldap = ldapMember("uid123", "charlie@example.net", "Charlie", "Pham", "Charlie Pham", "333");
+        Domain domain = Domain.of("domain1" + UUID.randomUUID() + ".tld");
+        OpenPaaSDomain openPaaSDomain1 = domainDAO.add(domain).block();
+        mockLdapDomainMembersForDomain(domain, ldap);
+        syncDomain(domain);
+
+        assertThat(listContactDomainMembersAsVcard(openPaaSDomain1.id()))
+            .contains("charlie@example.net");
+
+        String taskId = given()
+            .delete(DomainMembersAddressBookRoutes.BASE_PATH + "/" + domain.asString())
+        .then()
+            .statusCode(201)
+            .extract()
+            .jsonPath()
+            .getString("taskId");
+
+        given()
+            .basePath(TasksRoutes.BASE)
+        .when()
+            .get(taskId + "/await")
+        .then()
+            .statusCode(200)
+            .body("status", is("completed"))
+            .body("additionalInformation.deletedCount", is(1));
+
+        assertThat(listContactDomainMembersAsVcard(openPaaSDomain1.id()))
+            .doesNotContain("charlie@example.net");
+    }
+
+    @Test
+    void clearAllDomainsShouldRemoveContactsFromAllDomains() {
+        LdapUser ldap1 = ldapMember("uid001", "alice@example.com", "Alice", "Nguyen", "Alice Nguyen", "111");
+        LdapUser ldap2 = ldapMember("uid002", "bob@example.org", "Bob", "Tran", "Bob Tran", "222");
+
+        Domain domain1 = Domain.of("domain1" + UUID.randomUUID() + ".tld");
+        Domain domain2 = Domain.of("domain2" + UUID.randomUUID() + ".tld");
+        OpenPaaSDomain openPaaSDomain1 = domainDAO.add(domain1).block();
+        OpenPaaSDomain openPaaSDomain2 = domainDAO.add(domain2).block();
+
+        when(ldapDomainMemberProvider.domainMembers(any()))
+            .thenAnswer(inv -> {
+                Domain input = inv.getArgument(0);
+                if (input.equals(domain1)) {
+                    return Flux.just(ldap1);
+                } else if (input.equals(domain2)) {
+                    return Flux.just(ldap2);
+                }
+                return Flux.empty();
+            });
+        syncAllDomains();
+
+        assertThat(listContactDomainMembersAsVcard(openPaaSDomain1.id())).contains("alice@example.com");
+        assertThat(listContactDomainMembersAsVcard(openPaaSDomain2.id())).contains("bob@example.org");
+
+        String taskId = given()
+            .delete(DomainMembersAddressBookRoutes.BASE_PATH)
+        .then()
+            .statusCode(201)
+            .extract()
+            .jsonPath()
+            .getString("taskId");
+
+        given()
+            .basePath(TasksRoutes.BASE)
+        .when()
+            .get(taskId + "/await")
+        .then()
+            .statusCode(200)
+            .body("status", is("completed"));
+
+        assertThat(listContactDomainMembersAsVcard(openPaaSDomain1.id())).doesNotContain("alice@example.com");
+        assertThat(listContactDomainMembersAsVcard(openPaaSDomain2.id())).doesNotContain("bob@example.org");
+    }
+
+    @Test
+    void clearAllDomainsShouldIgnoreSpecifiedDomains() {
+        LdapUser ldap1 = ldapMember("uid001", "alice@example.com", "Alice", "Nguyen", "Alice Nguyen", "111");
+        LdapUser ldap2 = ldapMember("uid002", "bob@example.org", "Bob", "Tran", "Bob Tran", "222");
+
+        Domain domain1 = Domain.of("domain1" + UUID.randomUUID() + ".tld");
+        Domain domain2 = Domain.of("domain2" + UUID.randomUUID() + ".tld");
+        OpenPaaSDomain openPaaSDomain1 = domainDAO.add(domain1).block();
+        OpenPaaSDomain openPaaSDomain2 = domainDAO.add(domain2).block();
+
+        when(ldapDomainMemberProvider.domainMembers(any()))
+            .thenAnswer(inv -> {
+                Domain input = inv.getArgument(0);
+                if (input.equals(domain1)) {
+                    return Flux.just(ldap1);
+                } else if (input.equals(domain2)) {
+                    return Flux.just(ldap2);
+                }
+                return Flux.empty();
+            });
+        syncAllDomains();
+
+        String taskId = given()
+            .queryParam("ignoredDomains", domain2.asString())
+            .delete(DomainMembersAddressBookRoutes.BASE_PATH)
+        .then()
+            .statusCode(201)
+            .extract()
+            .jsonPath()
+            .getString("taskId");
+
+        given()
+            .basePath(TasksRoutes.BASE)
+        .when()
+            .get(taskId + "/await")
+        .then()
+            .statusCode(200)
+            .body("status", is("completed"))
+            .body("additionalInformation.ignoredDomains", hasItem(domain2.asString()));
+
+        assertThat(listContactDomainMembersAsVcard(openPaaSDomain1.id())).doesNotContain("alice@example.com");
+        assertThat(listContactDomainMembersAsVcard(openPaaSDomain2.id())).contains("bob@example.org");
+    }
+
+    private void syncDomain(Domain domain) {
+        String taskId = given()
+            .queryParam("task", "sync")
+            .post(DomainMembersAddressBookRoutes.BASE_PATH + "/" + domain.asString())
+        .then()
+            .statusCode(201)
+            .extract()
+            .jsonPath()
+            .getString("taskId");
+
+        given()
+            .basePath(TasksRoutes.BASE)
+        .when()
+            .get(taskId + "/await")
+        .then()
+            .statusCode(200)
+            .body("status", is("completed"));
+    }
+
+    private void syncAllDomains() {
+        String taskId = given()
+            .queryParam("task", "sync")
+            .post(DomainMembersAddressBookRoutes.BASE_PATH)
+        .then()
+            .statusCode(201)
+            .extract()
+            .jsonPath()
+            .getString("taskId");
+
+        given()
+            .basePath(TasksRoutes.BASE)
+        .when()
+            .get(taskId + "/await")
+        .then()
+            .statusCode(200)
+            .body("status", is("completed"));
     }
 
     private void mockLdapDomainMembersForDomain(Domain domain, LdapUser... members) {

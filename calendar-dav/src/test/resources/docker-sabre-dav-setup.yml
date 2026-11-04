@@ -23,9 +23,13 @@ services:
       RABBITMQ_DEFAULT_PASS: calendar
 
   mongo:
-    image: mongo
+    image: mongo:8.0.6
     networks:
       - tcalendar
+    ulimits:
+      nofile:
+        soft: 64000
+        hard: 64000
     command: ["mongod", "--bind_ip", "0.0.0.0"]
     healthcheck:
       test:
@@ -43,7 +47,7 @@ services:
 
   sabre_dav:
     hostname: esn_sabre
-    image: linagora/esn-sabre:2.2.1
+    image: linagora/esn-sabre:2.4.5.2
     environment:
       - SABRE_ENV=dev
       - SABRE_MONGO_HOST=mongo

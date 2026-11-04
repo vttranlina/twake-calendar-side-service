@@ -20,6 +20,7 @@ package com.linagora.calendar.app.restapi.routes;
 
 import static com.linagora.calendar.app.restapi.routes.ImportRouteTest.mailSenderConfigurationFunction;
 import static com.linagora.calendar.storage.TestFixture.TECHNICAL_TOKEN_SERVICE_TESTING;
+import static com.linagora.calendar.storage.TestFixture.awaitAtMost;
 import static io.restassured.RestAssured.given;
 import static io.restassured.config.RedirectConfig.redirectConfig;
 import static io.restassured.config.RestAssuredConfig.newConfig;
@@ -61,13 +62,11 @@ import com.linagora.calendar.app.TwakeCalendarConfiguration;
 import com.linagora.calendar.app.TwakeCalendarExtension;
 import com.linagora.calendar.app.TwakeCalendarGuiceServer;
 import com.linagora.calendar.app.modules.CalendarDataProbe;
-import com.linagora.calendar.app.restapi.routes.PeopleSearchRouteTest.ResourceProbe;
+import com.linagora.calendar.app.ResourceProbe;
 import com.linagora.calendar.dav.CalDavClient;
 import com.linagora.calendar.dav.DavCalendarObject;
 import com.linagora.calendar.dav.DavModuleTestHelper;
 import com.linagora.calendar.dav.DavTestHelper;
-import com.linagora.calendar.dav.DockerSabreDavSetup;
-import com.linagora.calendar.dav.Fixture;
 import com.linagora.calendar.dav.SabreDavExtension;
 import com.linagora.calendar.dav.SabreDavProvisioningService;
 import com.linagora.calendar.restapi.RestApiServerProbe;
@@ -102,7 +101,7 @@ public class ResourceParticipationRouteTest {
 
     @RegisterExtension
     @Order(1)
-    static SabreDavExtension SABRE_DAV_EXTENSION = new SabreDavExtension(DockerSabreDavSetup.SINGLETON);
+    static SabreDavExtension SABRE_DAV_EXTENSION = SabreDavExtension.shared();
 
     @RegisterExtension
     @Order(2)
@@ -194,7 +193,7 @@ public class ResourceParticipationRouteTest {
         .then()
             .statusCode(302);
 
-        Fixture.awaitAtMost.untilAsserted(() -> {
+        awaitAtMost.untilAsserted(() -> {
             VEvent vEvent = getCalendarEvent(organizer, eventUid);
             EventFields.Person resourceAttendee = EventParseUtils.getResources(vEvent).getFirst();
             assertThat(resourceAttendee)
@@ -273,7 +272,7 @@ public class ResourceParticipationRouteTest {
         String eventUidA = UUID.randomUUID().toString();
 
         davTestHelper.upsertCalendar(organizer, generateCalendarData(eventUidA, resourceEmailA), eventUidA);
-        Fixture.awaitAtMost.untilAsserted(() ->
+        awaitAtMost.untilAsserted(() ->
             assertThat(davTestHelper.findFirstEventId(resourceIdA, resource.domain())).isPresent());
 
         String eventPathIdA = davTestHelper.findFirstEventId(resourceIdA, resource.domain()).get();
@@ -314,7 +313,7 @@ public class ResourceParticipationRouteTest {
         .then()
             .statusCode(302);
 
-        Fixture.awaitAtMost.untilAsserted(() -> {
+        awaitAtMost.untilAsserted(() -> {
             VEvent vEvent = getCalendarEvent(organizer, eventUid);
             EventFields.Person resourceAttendee = EventParseUtils.getResources(vEvent).getFirst();
             assertThat(resourceAttendee)
@@ -349,7 +348,7 @@ public class ResourceParticipationRouteTest {
         .then()
             .statusCode(302);
 
-        Fixture.awaitAtMost.untilAsserted(() -> {
+        awaitAtMost.untilAsserted(() -> {
             VEvent vEvent = getCalendarEvent(organizer, eventUid);
             EventFields.Person resourceAttendee = EventParseUtils.getResources(vEvent).getFirst();
             assertThat(resourceAttendee)
@@ -365,7 +364,7 @@ public class ResourceParticipationRouteTest {
         .then()
             .statusCode(302);
 
-        Fixture.awaitAtMost.untilAsserted(() -> {
+        awaitAtMost.untilAsserted(() -> {
             VEvent vEvent = getCalendarEvent(organizer, eventUid);
             EventFields.Person resourceAttendee = EventParseUtils.getResources(vEvent).getFirst();
             assertThat(resourceAttendee)
@@ -531,7 +530,7 @@ public class ResourceParticipationRouteTest {
     private String createEventAndGetEventPathId(ResourceId resourceId, String eventUid) {
         String resourceEmail = Username.fromLocalPartWithDomain(resourceId.value(), TEST_DOMAIN).asString();
         davTestHelper.upsertCalendar(organizer, generateCalendarData(eventUid, resourceEmail), eventUid);
-        Fixture.awaitAtMost.untilAsserted(() -> assertThat(davTestHelper.findFirstEventId(resourceId, resource.domain())).isPresent());
+        awaitAtMost.untilAsserted(() -> assertThat(davTestHelper.findFirstEventId(resourceId, resource.domain())).isPresent());
         return davTestHelper.findFirstEventId(resourceId, resource.domain()).get();
     }
 }

@@ -27,17 +27,14 @@ import static net.javacrumbs.jsonunit.assertj.JsonAssertions.assertThatJson;
 import static org.assertj.core.api.AssertionsForInterfaceTypes.assertThat;
 
 import java.time.Clock;
+import java.util.List;
 import java.util.UUID;
 
 import javax.net.ssl.SSLException;
 
 import org.apache.james.core.Domain;
 import org.apache.james.core.Username;
-import org.apache.james.task.Hostname;
-import org.apache.james.task.MemoryTaskManager;
-import org.apache.james.task.TaskManager;
 import org.apache.james.webadmin.WebAdminServer;
-import org.apache.james.webadmin.WebAdminUtils;
 import org.apache.james.webadmin.utils.JsonTransformer;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
@@ -45,17 +42,17 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.RegisterExtension;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
-import org.testcontainers.shaded.com.google.common.collect.ImmutableList;
 
 import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.linagora.calendar.dav.CalDavClient;
-import com.linagora.calendar.dav.DockerSabreDavSetup;
+import com.linagora.calendar.dav.ResourceService;
+import com.linagora.calendar.dav.DavRight;
+import com.linagora.calendar.dav.ResourceService.ResourceAdministrator;
 import com.linagora.calendar.dav.SabreDavExtension;
 import com.linagora.calendar.storage.OpenPaaSDomain;
 import com.linagora.calendar.storage.OpenPaaSUser;
 import com.linagora.calendar.storage.OpenPaaSUserDAO;
 import com.linagora.calendar.storage.ResourceInsertRequest;
-import com.linagora.calendar.storage.model.ResourceAdministrator;
 import com.linagora.calendar.storage.model.ResourceId;
 import com.linagora.calendar.storage.mongodb.MongoDBOpenPaaSDomainDAO;
 import com.linagora.calendar.storage.mongodb.MongoDBOpenPaaSUserDAO;
@@ -69,12 +66,13 @@ import net.javacrumbs.jsonunit.core.Option;
 class ResourceRoutesTest {
 
     @RegisterExtension
-    static SabreDavExtension sabreDavExtension = new SabreDavExtension(DockerSabreDavSetup.SINGLETON);
+    static SabreDavExtension sabreDavExtension = SabreDavExtension.shared();
 
     private WebAdminServer webAdminServer;
     private OpenPaaSUserDAO userDAO;
     private MongoDBOpenPaaSDomainDAO domainDAO;
     private MongoDBResourceDAO resourceDAO;
+    private ResourceService resourceService;
 
     @BeforeEach
     void setUp() throws SSLException {
@@ -83,12 +81,11 @@ class ResourceRoutesTest {
         userDAO = new MongoDBOpenPaaSUserDAO(mongoDB, domainDAO);
         resourceDAO = new MongoDBResourceDAO(mongoDB, Clock.system(UTC));
         CalDavClient calDavClient = new CalDavClient(sabreDavExtension.dockerSabreDavSetup().davConfiguration(), TECHNICAL_TOKEN_SERVICE_TESTING);
-        TaskManager taskManager = new MemoryTaskManager(new Hostname("foo"));
+        resourceService = new ResourceService(userDAO, resourceDAO, calDavClient);
 
-        ResourceAdministratorService resourceAdministratorService = new ResourceAdministratorService(calDavClient, userDAO);
         webAdminServer = WebAdminUtils.createWebAdminServer(
-            new ResourceRoutes(resourceDAO, domainDAO, userDAO,
-                new JsonTransformer(), resourceAdministratorService, taskManager, calDavClient)).start();
+            new ResourceRoutes(domainDAO, userDAO,
+                new JsonTransformer(), resourceService)).start();
 
         RestAssured.requestSpecification = WebAdminUtils.buildRequestSpecification(webAdminServer)
             .build();
@@ -97,6 +94,14 @@ class ResourceRoutesTest {
     @AfterEach
     void tearDown() {
         webAdminServer.destroy();
+    }
+
+    private ResourceId createResource(OpenPaaSDomain domain, OpenPaaSUser creator, OpenPaaSUser... administrators) {
+        return resourceService.create(
+            new ResourceInsertRequest(creator.id(), "Descripting", domain.id(), "laptop", "Resource name"),
+            List.of(administrators).stream()
+                .map(user -> new ResourceAdministrator(user.username(), DavRight.ADMINISTRATION))
+                .toList()).block();
     }
 
     @Test
@@ -139,18 +144,12 @@ class ResourceRoutesTest {
         OpenPaaSDomain domain = domainDAO.add(Domain.of("linagora.com")).block();
         OpenPaaSUser user1 = userDAO.add(Username.of("user1@linagora.com")).block();
         OpenPaaSUser user2 = userDAO.add(Username.of("user2@linagora.com")).block();
-        ResourceAdministrator admin1 = new ResourceAdministrator(user1.id(), "user");
-        ResourceAdministrator admin2 = new ResourceAdministrator(user2.id(), "user");
-        ResourceId resourceId = resourceDAO.insert(new ResourceInsertRequest(ImmutableList.of(admin1, admin2),
-            user1.id(), "Descripting", domain.id(), "laptop", "Resource name")).block();
+        ResourceId resourceId = createResource(domain, user1, user1, user2);
 
         OpenPaaSDomain domain2 = domainDAO.add(Domain.of("twake.app")).block();
         OpenPaaSUser user3 = userDAO.add(Username.of("user3@twake.app")).block();
         OpenPaaSUser user4 = userDAO.add(Username.of("user4@twake.app")).block();
-        ResourceAdministrator admin3 = new ResourceAdministrator(user3.id(), "user");
-        ResourceAdministrator admin4 = new ResourceAdministrator(user4.id(), "user");
-        resourceDAO.insert(new ResourceInsertRequest(ImmutableList.of(admin3, admin4),
-            user3.id(), "Descripting", domain2.id(), "laptop", "Resource name")).block();
+        createResource(domain2, user3, user3, user4);
 
         String string = when()
             .get("/domains/linagora.com/resources")
@@ -162,7 +161,7 @@ class ResourceRoutesTest {
             .asString();
 
         assertThatJson(string)
-            .withOptions(Option.IGNORING_ARRAY_ORDER)
+            .withOptions(Option.IGNORING_ARRAY_ORDER, Option.IGNORING_EXTRA_FIELDS)
             .isEqualTo("""
                            [
                            {
@@ -191,10 +190,7 @@ class ResourceRoutesTest {
         OpenPaaSDomain domain = domainDAO.add(Domain.of("linagora.com")).block();
         OpenPaaSUser user1 = userDAO.add(Username.of("user1@linagora.com")).block();
         OpenPaaSUser user2 = userDAO.add(Username.of("user2@linagora.com")).block();
-        ResourceAdministrator admin1 = new ResourceAdministrator(user1.id(), "user");
-        ResourceAdministrator admin2 = new ResourceAdministrator(user2.id(), "user");
-        ResourceId resourceId = resourceDAO.insert(new ResourceInsertRequest(ImmutableList.of(admin1, admin2),
-            user1.id(), "Descripting", domain.id(), "laptop", "Resource name")).block();
+        ResourceId resourceId = createResource(domain, user1, user1, user2);
 
         String string = when()
             .get("/domains/linagora.com/resources/" + resourceId.value())
@@ -207,7 +203,7 @@ class ResourceRoutesTest {
 
 
         assertThatJson(string)
-            .withOptions(Option.IGNORING_ARRAY_ORDER)
+            .withOptions(Option.IGNORING_ARRAY_ORDER, Option.IGNORING_EXTRA_FIELDS)
             .isEqualTo("""
                            {
                                "name": "Resource name",
@@ -235,10 +231,7 @@ class ResourceRoutesTest {
         OpenPaaSDomain domain = domainDAO.add(Domain.of("linagora.com")).block();
         OpenPaaSUser user1 = userDAO.add(Username.of("user1@linagora.com")).block();
         OpenPaaSUser user2 = userDAO.add(Username.of("user2@linagora.com")).block();
-        ResourceAdministrator admin1 = new ResourceAdministrator(user1.id(), "user");
-        ResourceAdministrator admin2 = new ResourceAdministrator(user2.id(), "user");
-        ResourceId resourceId = resourceDAO.insert(new ResourceInsertRequest(ImmutableList.of(admin1, admin2),
-            user1.id(), "Descripting", domain.id(), "laptop", "Resource name")).block();
+        ResourceId resourceId = createResource(domain, user1, user1, user2);
 
         given()
             .body("""
@@ -267,6 +260,7 @@ class ResourceRoutesTest {
             .asString();
 
         assertThatJson(string)
+            .withOptions(Option.IGNORING_EXTRA_FIELDS)
             .isEqualTo("""
                            {
                                "name": "Resource name 2",
@@ -291,10 +285,7 @@ class ResourceRoutesTest {
         OpenPaaSDomain domain = domainDAO.add(Domain.of("linagora.com")).block();
         OpenPaaSUser user1 = userDAO.add(Username.of("user1@linagora.com")).block();
         OpenPaaSUser user2 = userDAO.add(Username.of("user2@linagora.com")).block();
-        ResourceAdministrator admin1 = new ResourceAdministrator(user1.id(), "user");
-        ResourceAdministrator admin2 = new ResourceAdministrator(user2.id(), "user");
-        ResourceId resourceId = resourceDAO.insert(new ResourceInsertRequest(ImmutableList.of(admin1, admin2),
-            user1.id(), "Descripting", domain.id(), "laptop", "Resource name")).block();
+        ResourceId resourceId = createResource(domain, user1, user1, user2);
 
         given()
             .body("""
@@ -314,7 +305,7 @@ class ResourceRoutesTest {
             .asString();
 
         assertThatJson(string)
-            .withOptions(Option.IGNORING_ARRAY_ORDER)
+            .withOptions(Option.IGNORING_ARRAY_ORDER, Option.IGNORING_EXTRA_FIELDS)
             .isEqualTo("""
                            {
                                "name": "Resource name 2",
@@ -342,10 +333,7 @@ class ResourceRoutesTest {
         OpenPaaSDomain domain = domainDAO.add(Domain.of("linagora.com")).block();
         OpenPaaSUser user1 = userDAO.add(Username.of("user1@linagora.com")).block();
         OpenPaaSUser user2 = userDAO.add(Username.of("user2@linagora.com")).block();
-        ResourceAdministrator admin1 = new ResourceAdministrator(user1.id(), "user");
-        ResourceAdministrator admin2 = new ResourceAdministrator(user2.id(), "user");
-        ResourceId resourceId = resourceDAO.insert(new ResourceInsertRequest(ImmutableList.of(admin1, admin2),
-            user1.id(), "Descripting", domain.id(), "laptop", "Resource name")).block();
+        ResourceId resourceId = resourceDAO.insert(new ResourceInsertRequest(user1.id(), "Descripting", domain.id(), "laptop", "Resource name")).block();
 
         given()
             .body("""
@@ -415,7 +403,7 @@ class ResourceRoutesTest {
 
         assertThatJson(string)
             .whenIgnoringPaths("[0].id")
-            .withOptions(Option.IGNORING_ARRAY_ORDER)
+            .withOptions(Option.IGNORING_ARRAY_ORDER, Option.IGNORING_EXTRA_FIELDS)
             .isEqualTo("""
                            [{
                                "name": "Resource name",
@@ -596,10 +584,7 @@ class ResourceRoutesTest {
         OpenPaaSDomain domain = domainDAO.add(Domain.of("linagora.com")).block();
         OpenPaaSUser user1 = userDAO.add(Username.of("user1@linagora.com")).block();
         OpenPaaSUser user2 = userDAO.add(Username.of("user2@linagora.com")).block();
-        ResourceAdministrator admin1 = new ResourceAdministrator(user1.id(), "user");
-        ResourceAdministrator admin2 = new ResourceAdministrator(user2.id(), "user");
-        ResourceId resourceId = resourceDAO.insert(new ResourceInsertRequest(ImmutableList.of(admin1, admin2),
-            user1.id(), "Descripting", domain.id(), "laptop", "Resource name")).block();
+        ResourceId resourceId = resourceDAO.insert(new ResourceInsertRequest(user1.id(), "Descripting", domain.id(), "laptop", "Resource name")).block();
 
         when()
             .delete("/domains/linagora.com/resources/" + resourceId.value())
@@ -628,14 +613,7 @@ class ResourceRoutesTest {
                                "id": "RESOURCE_ID_1",
                                "icon": "laptop",
                                "domain": "linagora.com",
-                               "administrators": [
-                                   {
-                                       "email": "user1@linagora.com"
-                                   },
-                                   {
-                                       "email": "user2@linagora.com"
-                                   }
-                               ]
+                               "administrators": []
                            }
                            """
             .replace("RESOURCE_ID_1", resourceId.value()));
@@ -702,7 +680,145 @@ class ResourceRoutesTest {
             .as("DAV invite list should contain admin delegation entry")
             .isNotEmpty()
             .anySatisfy(invite ->
-                assertThat(invite.get("href").asText()).contains(admin.username().asString()));
+                assertThat(invite.get("href").asText()).contains(admin.username().asString())
+                    .satisfies(_ -> assertThat(invite.get("access").asInt()).isEqualTo(3)));
+
+        String resource = when()
+            .get("/domains/" + DOMAIN + "/resources/" + resourceId)
+            .then()
+            .statusCode(200)
+            .extract()
+            .asString();
+
+        assertThatJson(resource)
+            .inPath("$.administrators[0].davRight")
+            .isEqualTo("dav:read-write");
+    }
+
+    @Test
+    void createResourceShouldSupportAdministrationRight() {
+        OpenPaaSUser creator = sabreDavExtension.newTestUser();
+        OpenPaaSUser admin = sabreDavExtension.newTestUser();
+
+        String location = given()
+            .body("""
+                {
+                    "name": "Managed Room",
+                    "description": "Room with ACL administrator",
+                    "creator": "%s",
+                    "icon": "door",
+                    "administrators": [
+                        {
+                            "email": "%s",
+                            "davRight": "dav:administration"
+                        }
+                    ]
+                }
+                """.formatted(creator.username().asString(), admin.username().asString()))
+            .post("/domains/" + DOMAIN + "/resources")
+            .then()
+            .statusCode(201)
+            .extract()
+            .header("Location");
+
+        String resourceId = location.substring(location.lastIndexOf('/') + 1);
+        OpenPaaSDomain openPaaSDomain = domainDAO.retrieve(creator.username().getDomainPart().get()).block();
+        ArrayNode invites = sabreDavExtension.davTestHelper()
+            .getCalendarDelegateInvites(openPaaSDomain.id(), new ResourceId(resourceId))
+            .block();
+
+        assertThat(invites)
+            .anySatisfy(invite -> {
+                assertThat(invite.get("href").asText()).contains(admin.username().asString());
+                assertThat(invite.get("access").asInt()).isEqualTo(5);
+            });
+
+        String resource = when()
+            .get("/domains/" + DOMAIN + "/resources/" + resourceId)
+            .then()
+            .statusCode(200)
+            .extract()
+            .asString();
+
+        assertThatJson(resource)
+            .inPath("$.administrators[0].davRight")
+            .isEqualTo("dav:administration");
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"abcxyz", "dav:unsupported"})
+    void createResourceShouldRejectUnsupportedAdministratorRight(String davRight) {
+        OpenPaaSUser creator = sabreDavExtension.newTestUser();
+        OpenPaaSUser administrator = sabreDavExtension.newTestUser();
+
+        String response = given()
+            .body("""
+                {
+                    "name": "Invalid right room",
+                    "description": "Room with invalid administrator right",
+                    "creator": "%s",
+                    "icon": "door",
+                    "administrators": [{ "email": "%s", "davRight": "%s" }]
+                }
+                """.formatted(creator.username().asString(), administrator.username().asString(), davRight))
+            .post("/domains/" + DOMAIN + "/resources")
+            .then()
+            .statusCode(400)
+            .extract()
+            .asString();
+
+        assertThatJson(response)
+            .inPath("$.message")
+            .isEqualTo("Unsupported DAV right: " + davRight);
+    }
+
+    @Test
+    void updateResourceShouldSupportUpdateAdministratorDavRight() {
+        OpenPaaSUser creator = sabreDavExtension.newTestUser();
+        OpenPaaSUser admin = sabreDavExtension.newTestUser();
+
+        String location = given()
+            .body("""
+                {
+                    "name": "Upgradeable Room",
+                    "description": "Room with upgradeable administrator",
+                    "creator": "%s",
+                    "icon": "door",
+                    "administrators": [{ "email": "%s" }]
+                }
+                """.formatted(creator.username().asString(), admin.username().asString()))
+            .post("/domains/" + DOMAIN + "/resources")
+            .then()
+            .statusCode(201)
+            .extract()
+            .header("Location");
+
+        String resourceId = location.substring(location.lastIndexOf('/') + 1);
+        given()
+            .body("""
+                {
+                    "administrators": [
+                        {
+                            "email": "%s",
+                            "davRight": "dav:administration"
+                        }
+                    ]
+                }
+                """.formatted(admin.username().asString()))
+            .patch("/domains/" + DOMAIN + "/resources/" + resourceId)
+            .then()
+            .statusCode(204);
+
+        OpenPaaSDomain openPaaSDomain = domainDAO.retrieve(creator.username().getDomainPart().get()).block();
+        ArrayNode invites = sabreDavExtension.davTestHelper()
+            .getCalendarDelegateInvites(openPaaSDomain.id(), new ResourceId(resourceId))
+            .block();
+
+        assertThat(invites)
+            .anySatisfy(invite -> {
+                assertThat(invite.get("href").asText()).contains(admin.username().asString());
+                assertThat(invite.get("access").asInt()).isEqualTo(5);
+            });
     }
 
     @Test

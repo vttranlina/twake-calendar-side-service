@@ -49,6 +49,7 @@ import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.fasterxml.jackson.datatype.jdk8.Jdk8Module;
 import com.google.common.base.Preconditions;
 import com.linagora.calendar.api.CalendarUtil;
+import com.linagora.calendar.dav.dto.CalendarDetailsResponse;
 import com.linagora.calendar.dav.dto.CalendarListResponse;
 import com.linagora.calendar.dav.dto.CalendarReportJsonResponse;
 import com.linagora.calendar.dav.dto.CalendarReportXmlResponse;
@@ -98,7 +99,21 @@ public class CalDavClient extends DavClient {
                               @JsonProperty("caldav:description") String caldavDescription) {
     }
 
-    private static final Map<String, String> DEFAULT_FIND_USER_CALENDARS_PARAMS = Map.of(
+    @JsonInclude(JsonInclude.Include.NON_ABSENT)
+    public record CalendarPropertiesUpdate(@JsonProperty("dav:name") Optional<String> name,
+                                           @JsonProperty("apple:color") Optional<String> color,
+                                           @JsonProperty("caldav:description") Optional<String> description) {
+        public CalendarPropertiesUpdate {
+            Preconditions.checkArgument(name.isPresent() || color.isPresent() || description.isPresent(),
+                "At least one of 'dav:name', 'apple:color', 'caldav:description' must be provided");
+        }
+
+        public static CalendarPropertiesUpdate withName(String name) {
+            return new CalendarPropertiesUpdate(Optional.of(name), Optional.empty(), Optional.empty());
+        }
+    }
+
+    public static final Map<String, String> DEFAULT_FIND_USER_CALENDARS_PARAMS = Map.of(
         "personal", "true",
         "sharedDelegationStatus", "accepted",
         "sharedPublicSubscription", "true",
@@ -187,7 +202,16 @@ public class CalDavClient extends DavClient {
             .flatMapIterable(response -> response.calendars().keySet());
     }
 
+    public Mono<CalendarListResponse> findUserCalendarList(OpenPaaSUser user) {
+        return findUserCalendars(user.username(), user.id(), DEFAULT_FIND_USER_CALENDARS_PARAMS);
+    }
+
     public Mono<CalendarListResponse> findUserCalendars(Username userRequest, OpenPaaSId userId, Map<String, String> queryParams) {
+        return findUserCalendarsAsBytes(userRequest, userId, queryParams)
+            .map(CalendarListResponse::parse);
+    }
+
+    public Mono<byte[]> findUserCalendarsAsBytes(Username userRequest, OpenPaaSId userId, Map<String, String> queryParams) {
         Preconditions.checkArgument(userRequest != null, "userRequest must not be null");
         Preconditions.checkArgument(userId != null, "userId must not be null");
         Preconditions.checkArgument(queryParams != null, "queryParams must not be null");
@@ -205,8 +229,7 @@ public class CalDavClient extends DavClient {
             .uri(uriRequest)
             .responseSingle((response, responseContent) -> {
                 if (response.status().code() == HttpStatus.SC_OK) {
-                    return responseContent.asByteArray()
-                        .map(CalendarListResponse::parse);
+                    return responseContent.asByteArray();
                 }
 
                 return responseBodyAsString(responseContent)
@@ -216,6 +239,39 @@ public class CalDavClient extends DavClient {
                         %s
                         """.formatted(response.status().code(), userId.value(), errorBody))));
             });
+    }
+
+    public Mono<CalendarDetailsResponse> fetchCalendarDetails(Mono<HttpClient> httpClientPublisher,
+                                                              CalendarURL calendarURL,
+                                                              Map<String, String> queryParams) {
+        Preconditions.checkArgument(httpClientPublisher != null, "httpClientPublisher must not be null");
+        Preconditions.checkArgument(calendarURL != null, "calendarURL must not be null");
+        Preconditions.checkArgument(queryParams != null, "queryParams must not be null");
+
+        URIBuilder uriBuilder = new URIBuilder().setPath(calendarURL.asUri().getPath());
+        queryParams.forEach(uriBuilder::addParameter);
+
+        return httpClientPublisher.flatMap(client -> client
+            .headers(headers -> headers.add(HttpHeaderNames.ACCEPT, CONTENT_TYPE_JSON))
+            .request(HttpMethod.GET)
+            .uri(uriBuilder.toString())
+            .responseSingle((response, responseContent) -> switch (response.status().code()) {
+                case HttpStatus.SC_OK -> responseContent.asByteArray()
+                    .map(CalendarDetailsResponse::parse);
+                case HttpStatus.SC_NOT_FOUND -> Mono.error(new CalendarNotFoundException(calendarURL));
+                default -> responseBodyAsString(responseContent)
+                    .flatMap(errorBody -> Mono.error(new DavClientException("""
+                        Unexpected status code: %d while retrieving calendar '%s'
+                        Response body:
+                        %s
+                        """.formatted(response.status().code(), calendarURL.asUri(), errorBody))));
+            }));
+    }
+
+    public Mono<CalendarDetailsResponse> fetchCalendarDetails(OpenPaaSId domainId,
+                                                              CalendarURL calendarURL,
+                                                              Map<String, String> queryParams) {
+        return fetchCalendarDetails(httpClientWithTechnicalToken(domainId), calendarURL, queryParams);
     }
 
     public Flux<String> findUserCalendarEventIds(Username username, CalendarURL calendarURL) {
@@ -290,6 +346,37 @@ public class CalDavClient extends DavClient {
                                 """.formatted(response.status().code(), uri, responseBody))));
                 }
             });
+    }
+
+    public Mono<Void> deleteCalendarHome(OpenPaaSId domainId, OpenPaaSId calendarHomeId) {
+        return deleteCalendarHome(httpClientWithTechnicalToken(domainId), calendarHomeId);
+    }
+
+    public Mono<Void> deleteCalendarHome(Mono<HttpClient> httpClientPublisher, OpenPaaSId calendarHomeId) {
+        Preconditions.checkArgument(httpClientPublisher != null, "httpClientPublisher must not be null");
+        Preconditions.checkArgument(calendarHomeId != null, "calendarHomeId must not be null");
+
+        String uri = CalendarURL.CALENDAR_URL_PATH_PREFIX + "/" + calendarHomeId.value();
+        return httpClientPublisher.flatMap(client -> client
+            .headers(headers -> headers.add(HttpHeaderNames.CONTENT_TYPE, CONTENT_TYPE_JSON))
+            .request(HttpMethod.DELETE)
+            .uri(uri)
+            .responseSingle((response, responseContent) -> {
+                if (response.status().code() == HttpStatus.SC_NO_CONTENT || response.status().code() == HttpStatus.SC_NOT_FOUND) {
+                    return Mono.empty();
+                } else {
+                    if (response.status().code() == HttpStatus.SC_NOT_IMPLEMENTED) {
+                        LOGGER.info("Could not delete calendar home {}", calendarHomeId.value());
+                        return Mono.empty();
+                    }
+                    return responseContent.asString(StandardCharsets.UTF_8)
+                        .switchIfEmpty(Mono.just(StringUtils.EMPTY))
+                        .flatMap(responseBody -> Mono.error(new DavClientException("""
+                                Unexpected status code: %d when deleting calendar home '%s'
+                                %s
+                                """.formatted(response.status().code(), uri, responseBody))));
+                }
+            }));
     }
 
     public Mono<Void> createNewCalendar(Username username, OpenPaaSId userId, NewCalendar newCalendar) {
@@ -384,6 +471,10 @@ public class CalDavClient extends DavClient {
         );
     }
 
+    public Mono<Void> updateCalendarEvent(Username username, DavCalendarObject updatedCalendarObject) {
+        return updateCalendarEvent(Mono.just(httpClientWithImpersonation(username)), updatedCalendarObject);
+    }
+
     public Mono<DavCalendarObject> fetchCalendarEvent(Username username, URI calendarEventHref) {
         return fetchCalendarEvent(Mono.just(httpClientWithImpersonation(username)), calendarEventHref);
     }
@@ -474,6 +565,72 @@ public class CalDavClient extends DavClient {
                         %s
                         """.formatted(response.status().code(), uri, errorBody))));
             });
+    }
+
+    /**
+     * Updates calendar properties ({@code dav:name}, {@code apple:color}, {@code caldav:description})
+     * through a PROPPATCH on the calendar JSON endpoint.
+     */
+    public Mono<Void> updateCalendarProperties(Username username, CalendarURL calendarURL, CalendarPropertiesUpdate update) {
+        return updateCalendarProperties(Mono.just(httpClientWithImpersonation(username)), calendarURL, update);
+    }
+
+    public Mono<Void> updateCalendarProperties(OpenPaaSId domainId, CalendarURL calendarURL, CalendarPropertiesUpdate update) {
+        return updateCalendarProperties(httpClientWithTechnicalToken(domainId), calendarURL, update);
+    }
+
+    public Mono<Void> updateCalendarProperties(Mono<HttpClient> httpClientPublisher,
+                                               CalendarURL calendarURL,
+                                               CalendarPropertiesUpdate update) {
+        String uri = calendarURL.asUri() + ".json";
+        return httpClientPublisher.flatMap(client -> client
+            .headers(headers -> headers.add(HttpHeaderNames.CONTENT_TYPE, JSON_CHARSET_UTF_8)
+                .add(HttpHeaderNames.ACCEPT, DEFAULT_JSON_ACCEPT))
+            .request(HttpMethod.valueOf("PROPPATCH"))
+            .uri(uri)
+            .send(Mono.fromCallable(() -> Unpooled.wrappedBuffer(OBJECT_MAPPER.writeValueAsBytes(update))))
+            .responseSingle((response, responseContent) -> switch (response.status().code()) {
+                case 200, 204, 207 -> Mono.empty();
+                case 404 -> Mono.error(new CalendarNotFoundException(calendarURL));
+                default -> responseBodyAsString(responseContent)
+                    .flatMap(errorBody -> Mono.error(new DavClientException("""
+                        Unexpected status code: %d when updating properties of calendar '%s'
+                        %s
+                        """.formatted(response.status().code(), uri, errorBody))));
+            }));
+    }
+
+    /**
+     * Updates the sharees of a calendar, following the Sabre JSON sharing format:
+     * {@code {"share":{"set":[{"dav:href":"mailto:...","dav:read":true}],"remove":[{"dav:href":"mailto:..."}]}}}
+     */
+    public Mono<Void> updateCalendarShares(Username username, CalendarURL calendarURL, CalendarSharingUpdate sharingUpdate) {
+        return updateCalendarShares(Mono.just(httpClientWithImpersonation(username)), calendarURL, sharingUpdate);
+    }
+
+    public Mono<Void> updateCalendarShares(OpenPaaSId domainId, CalendarURL calendarURL, CalendarSharingUpdate sharingUpdate) {
+        return updateCalendarShares(httpClientWithTechnicalToken(domainId), calendarURL, sharingUpdate);
+    }
+
+    public Mono<Void> updateCalendarShares(Mono<HttpClient> httpClientPublisher,
+                                           CalendarURL calendarURL,
+                                           CalendarSharingUpdate sharingUpdate) {
+        String uri = calendarURL.asUri() + ".json";
+        return httpClientPublisher.flatMap(client -> client
+            .headers(headers -> headers.add(HttpHeaderNames.CONTENT_TYPE, JSON_CHARSET_UTF_8)
+                .add(HttpHeaderNames.ACCEPT, DEFAULT_JSON_ACCEPT))
+            .request(HttpMethod.POST)
+            .uri(uri)
+            .send(Mono.fromCallable(() -> Unpooled.wrappedBuffer(OBJECT_MAPPER.writeValueAsBytes(sharingUpdate))))
+            .responseSingle((response, responseContent) -> switch (response.status().code()) {
+                case 200, 204 -> Mono.empty();
+                case 404 -> Mono.error(new CalendarNotFoundException(calendarURL));
+                default -> responseBodyAsString(responseContent)
+                    .flatMap(errorBody -> Mono.error(new DavClientException("""
+                        Unexpected status code: %d when updating shares of calendar '%s'
+                        %s
+                        """.formatted(response.status().code(), uri, errorBody))));
+            }));
     }
 
     /**
@@ -649,6 +806,80 @@ public class CalDavClient extends DavClient {
             });
     }
 
+    public Mono<byte[]> propfindCalendarCollection(OpenPaaSId domainId, CalendarURL calendarUrl) {
+        return propfindCalendarCollection(httpClientWithTechnicalToken(domainId), calendarUrl);
+    }
+
+    public Mono<byte[]> propfindCalendarCollection(Mono<HttpClient> httpClientPublisher, CalendarURL calendarUrl) {
+        String uri = calendarUrl.asUri().toString();
+
+        return httpClientPublisher.flatMap(client -> client
+            .headers(headers -> headers.add("Depth", "0"))
+            .request(HttpMethod.valueOf("PROPFIND"))
+            .uri(uri)
+            .responseSingle((response, content) -> {
+                int status = response.status().code();
+                return content.asByteArray()
+                    .defaultIfEmpty(new byte[0])
+                    .flatMap(body -> switch (status) {
+                        case 207 -> Mono.just(body);
+                        case HttpStatus.SC_NOT_FOUND -> Mono.error(new CalendarNotFoundException(calendarUrl));
+                        default -> Mono.error(new DavClientException("""
+                            Unexpected response when PROPFIND calendar collection '%s'
+                            Status: %d
+                            Body: %s
+                            """.formatted(uri, status, new String(body, StandardCharsets.UTF_8))));
+                    });
+            }));
+    }
+
+    /**
+     * Access level the (impersonated) user holds on a calendar, resolved in a single
+     * {@code PROPFIND} on {@code DAV:current-user-privilege-set}.
+     */
+    public enum CalendarAccess {
+        /** The calendar does not exist, or the user may not even see it. */
+        NOT_FOUND,
+        /** The calendar is visible to the user, but grants no write-like privilege. */
+        READ_ONLY,
+        /** The user holds a write-like privilege on the calendar. */
+        WRITABLE
+    }
+
+    public Mono<CalendarAccess> resolveCalendarAccess(Username user, CalendarURL calendarUrl) {
+        String uri = calendarUrl.asUri().toString();
+        String requestBody = """
+            <?xml version="1.0" encoding="utf-8" ?>
+            <d:propfind xmlns:d="DAV:">
+              <d:prop>
+                <d:current-user-privilege-set/>
+              </d:prop>
+            </d:propfind>""";
+
+        return httpClientWithImpersonation(user)
+            .headers(headers -> headers.add(HttpHeaderNames.CONTENT_TYPE, "application/xml")
+                .add("Depth", "0"))
+            .request(HttpMethod.valueOf("PROPFIND"))
+            .uri(uri)
+            .send(Mono.fromCallable(() -> Unpooled.wrappedBuffer(requestBody.getBytes(StandardCharsets.UTF_8))))
+            .responseSingle((response, content) -> {
+                int status = response.status().code();
+                return content.asByteArray()
+                    .switchIfEmpty(Mono.just(new byte[0]))
+                    .flatMap(bytes -> switch (status) {
+                        case 207 -> Mono.fromCallable(() -> XMLUtil.hasWritePrivilege(bytes)
+                            ? CalendarAccess.WRITABLE
+                            : CalendarAccess.READ_ONLY);
+                        case HttpStatus.SC_UNAUTHORIZED, HttpStatus.SC_FORBIDDEN, HttpStatus.SC_NOT_FOUND -> Mono.just(CalendarAccess.NOT_FOUND);
+                        default -> Mono.error(new DavClientException("""
+                            Unexpected response when resolving calendar access for '%s'
+                            Status: %d
+                            Body: %s
+                            """.formatted(uri, status, new String(bytes, StandardCharsets.UTF_8))));
+                    });
+            });
+    }
+
     private Mono<SyncToken> parseSyncToken(String body, String uri) {
         return Mono.fromCallable(() -> OBJECT_MAPPER.readTree(body))
             .flatMap(jsonNode -> Mono.justOrEmpty(jsonNode.path(SYNC_TOKEN_PROPERTY).asText(null)))
@@ -659,35 +890,46 @@ public class CalDavClient extends DavClient {
 
     public Mono<CalendarReportXmlResponse> calendarQueryReportXml(Username username, CalendarURL calendarURL, CalendarQuery calendarQuery) {
         Preconditions.checkArgument(username != null, "username must not be null");
+        return calendarQueryReportXml(Mono.just(httpClientWithImpersonation(username)), calendarURL, calendarQuery);
+    }
+
+    // Use a domain technical token for resource calendars
+    public Mono<CalendarReportXmlResponse> calendarQueryReportXml(OpenPaaSId domainId, CalendarURL calendarURL, CalendarQuery calendarQuery) {
+        Preconditions.checkArgument(domainId != null, "domainId must not be null");
+        return calendarQueryReportXml(httpClientWithTechnicalToken(domainId), calendarURL, calendarQuery);
+    }
+
+    private Mono<CalendarReportXmlResponse> calendarQueryReportXml(Mono<HttpClient> httpClientPublisher, CalendarURL calendarURL, CalendarQuery calendarQuery) {
+        Preconditions.checkArgument(httpClientPublisher != null, "httpClientPublisher must not be null");
         Preconditions.checkArgument(calendarURL != null, "calendarURL must not be null");
         Preconditions.checkArgument(calendarQuery != null, "calendarQuery must not be null");
 
-        return httpClientWithImpersonation(username)
-            .headers(headers -> {
-                headers.add(HttpHeaderNames.CONTENT_TYPE, CONTENT_TYPE_XML);
-                headers.add(HEADER_DEPTH, "1");
-            })
-            .request(REPORT_METHOD)
-            .uri(calendarURL.asUri().toASCIIString())
-            .send(ByteBufMono.fromString(Mono.fromCallable(calendarQuery::toCalendarQueryReport)))
-            .responseSingle((response, body) -> {
-                int statusCode = response.status().code();
+        return httpClientPublisher.flatMap(client ->
+            client.headers(headers -> {
+                    headers.add(HttpHeaderNames.CONTENT_TYPE, CONTENT_TYPE_XML);
+                    headers.add(HEADER_DEPTH, "1");
+                })
+                .request(REPORT_METHOD)
+                .uri(calendarURL.asUri().toASCIIString())
+                .send(ByteBufMono.fromString(Mono.fromCallable(calendarQuery::toCalendarQueryReport)))
+                .responseSingle((response, body) -> {
+                    int statusCode = response.status().code();
 
-                if (statusCode == HttpStatus.SC_MULTI_STATUS) {
-                    return body.asByteArray()
-                        .map(CalendarReportXmlResponse::new);
-                }
+                    if (statusCode == HttpStatus.SC_MULTI_STATUS) {
+                        return body.asByteArray()
+                            .map(CalendarReportXmlResponse::new);
+                    }
 
-                return body.asString(StandardCharsets.UTF_8)
-                    .switchIfEmpty(Mono.just(StringUtils.EMPTY))
-                    .flatMap(errorBody -> Mono.error(new DavClientException("""
-                        Unexpected status code: %d when executing RFC 4791 calendar-query REPORT on '%s'
-                        %s
-                        """.formatted(
-                        statusCode,
-                        calendarURL.asUri().toASCIIString(),
-                        errorBody))));
-            });
+                    return body.asString(StandardCharsets.UTF_8)
+                        .switchIfEmpty(Mono.just(StringUtils.EMPTY))
+                        .flatMap(errorBody -> Mono.error(new DavClientException("""
+                            Unexpected status code: %d when executing RFC 4791 calendar-query REPORT on '%s'
+                            %s
+                            """.formatted(
+                            statusCode,
+                            calendarURL.asUri().toASCIIString(),
+                            errorBody))));
+                }));
     }
 
     public Flux<FreeBusyQueryResponseObject.BusyInterval> findBusyIntervals(Username username, CalendarURL calendarURL, Instant from, Instant to) {

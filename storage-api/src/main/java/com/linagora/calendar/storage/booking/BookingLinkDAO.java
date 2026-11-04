@@ -28,11 +28,6 @@ public interface BookingLinkDAO {
 
     Mono<BookingLink> findByPublicId(BookingLinkPublicId publicId);
 
-    default Mono<BookingLink> findActiveByPublicId(BookingLinkPublicId publicId) {
-        return findByPublicId(publicId)
-            .filter(BookingLink::active);
-    }
-
     Mono<BookingLink> findByPublicId(Username username, BookingLinkPublicId publicId);
 
     Flux<BookingLink> findByUsername(Username username);

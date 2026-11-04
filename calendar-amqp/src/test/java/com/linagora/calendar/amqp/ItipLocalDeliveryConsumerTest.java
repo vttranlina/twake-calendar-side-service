@@ -29,7 +29,10 @@ import static org.mockito.Mockito.when;
 
 import java.net.URI;
 import java.nio.charset.StandardCharsets;
+import java.time.Clock;
 import java.time.Duration;
+import java.time.Instant;
+import java.time.ZoneOffset;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
@@ -52,8 +55,8 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.RegisterExtension;
 import org.mockito.ArgumentMatchers;
-import org.testcontainers.shaded.org.awaitility.Awaitility;
-import org.testcontainers.shaded.org.awaitility.core.ConditionFactory;
+import org.awaitility.Awaitility;
+import org.awaitility.core.ConditionFactory;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -179,7 +182,8 @@ public class ItipLocalDeliveryConsumerTest {
             QueueArguments.Builder::new,
             calDavClient,
             localRecipientResolver,
-            DEFAULT_ITIP_EVENT_MESSAGES_PREFETCH_COUNT);
+            DEFAULT_ITIP_EVENT_MESSAGES_PREFETCH_COUNT,
+            Clock.fixed(Instant.parse("2026-01-01T00:00:00Z"), ZoneOffset.UTC));
 
         consumer.init();
         declareExchange(EventEmailConsumer.EXCHANGE_NAME);
@@ -430,35 +434,6 @@ public class ItipLocalDeliveryConsumerTest {
     }
 
     @Test
-    void shouldIgnoreDeliveryWhenRequestOrganizerChangedComparedToOldMessage() {
-        when(localRecipientResolver.resolve(Username.of(ALICE)))
-            .thenReturn(Mono.just(Optional.of(new LocalRecipientResolver.ResolvedRecipient.LocalUser(new OpenPaaSId(LOCAL_USER_ID)))));
-        declareQueueBoundToExchange(EventEmailConsumer.EXCHANGE_NAME, testEmailQueue);
-        List<JsonNode> emailMessages = consumeJsonMessages(testEmailQueue);
-        String oldMessageWithDifferentOrganizer = SIMPLE_ICAL.replace("mailto:" + BOB, "mailto:" + CEDRIC);
-
-        String payload = """
-            {
-              "sender": "mailto:%s",
-              "method": "REQUEST",
-              "uid": "%s",
-              "calendarId": "%s",
-              "message": %s,
-              "oldMessage": %s,
-              "hasChange": true,
-              "recipients": ["mailto:%s"]
-            }
-            """.formatted(BOB, EVENT_UID, CALENDAR_ID, jsonString(SIMPLE_ICAL), jsonString(oldMessageWithDifferentOrganizer), ALICE);
-
-        publishToConsumer(payload);
-
-        AWAIT_AT_MOST.untilAsserted(() -> {
-            WireMock.verify(0, WireMock.postRequestedFor(WireMock.urlEqualTo("/itip")));
-            assertThat(emailMessages).isEmpty();
-        });
-    }
-
-    @Test
     void shouldIgnoreDeliveryWhenRecurringRequestHasMultipleOrganizers() {
         when(localRecipientResolver.resolve(Username.of(ALICE)))
             .thenReturn(Mono.just(Optional.of(new LocalRecipientResolver.ResolvedRecipient.LocalUser(new OpenPaaSId(LOCAL_USER_ID)))));
@@ -477,36 +452,6 @@ public class ItipLocalDeliveryConsumerTest {
               "recipients": ["mailto:%s"]
             }
             """.formatted(BOB, EVENT_UID, CALENDAR_ID, jsonString(recurringMessage), ALICE);
-
-        publishToConsumer(payload);
-
-        AWAIT_AT_MOST.untilAsserted(() -> {
-            WireMock.verify(0, WireMock.postRequestedFor(WireMock.urlEqualTo("/itip")));
-            assertThat(emailMessages).isEmpty();
-        });
-    }
-
-    @Test
-    void shouldIgnoreDeliveryWhenRecurringRequestOrganizerChangedComparedToOldMessage() {
-        when(localRecipientResolver.resolve(Username.of(ALICE)))
-            .thenReturn(Mono.just(Optional.of(new LocalRecipientResolver.ResolvedRecipient.LocalUser(new OpenPaaSId(LOCAL_USER_ID)))));
-        declareQueueBoundToExchange(EventEmailConsumer.EXCHANGE_NAME, testEmailQueue);
-        List<JsonNode> emailMessages = consumeJsonMessages(testEmailQueue);
-        String recurringCurrentMessage = recurringIcal(BOB, BOB);
-        String recurringOldMessage = recurringIcal(CEDRIC, CEDRIC);
-
-        String payload = """
-            {
-              "sender": "mailto:%s",
-              "method": "REQUEST",
-              "uid": "%s",
-              "calendarId": "%s",
-              "message": %s,
-              "oldMessage": %s,
-              "hasChange": true,
-              "recipients": ["mailto:%s"]
-            }
-            """.formatted(BOB, EVENT_UID, CALENDAR_ID, jsonString(recurringCurrentMessage), jsonString(recurringOldMessage), ALICE);
 
         publishToConsumer(payload);
 
@@ -610,7 +555,6 @@ public class ItipLocalDeliveryConsumerTest {
             assertThat(emailPayload.at("/senderEmail").asText()).isEqualTo(BOB);
             assertThat(emailPayload.at("/recipientEmail").asText()).isEqualTo(ALICE);
             assertThat(emailPayload.at("/method").asText()).isEqualTo("REQUEST");
-            assertThat(emailPayload.at("/notify").asBoolean()).isTrue();
             assertThat(emailPayload.at("/calendarURI").asText()).isEqualTo(CALENDAR_ID);
         });
     }
@@ -639,6 +583,58 @@ public class ItipLocalDeliveryConsumerTest {
 
         AWAIT_AT_MOST.untilAsserted(() ->
             assertThat(channel.basicGet(ItipLocalDeliveryConsumer.DEAD_LETTER_QUEUE, true)).isNotNull());
+    }
+
+    @Test
+    void shouldIgnoreMessageWhenRecipientAddressIsInvalid() throws Exception {
+        String payload = """
+            {
+              "sender": "mailto:%s",
+              "method": "REQUEST",
+              "uid": "%s",
+              "calendarId": "%s",
+              "message": %s,
+              "hasChange": true,
+              "recipients": ["mailto:%s"]
+            }
+            """.formatted(BOB, EVENT_UID, CALENDAR_ID, jsonString(SIMPLE_ICAL), "invalid@domain@address");
+
+        publishToConsumer(payload);
+
+        // An invalid address is necessarily not local: the message is ignored (acked), not dead-lettered.
+        AWAIT_AT_MOST.during(Duration.ofSeconds(1))
+            .untilAsserted(() -> {
+                assertThat(channel.basicGet(ItipLocalDeliveryConsumer.DEAD_LETTER_QUEUE, true)).isNull();
+                WireMock.verify(0, WireMock.postRequestedFor(WireMock.urlEqualTo("/itip")));
+            });
+    }
+
+    @Test
+    void shouldStillProcessValidRecipientsWhenOneRecipientAddressIsInvalid() throws Exception {
+        when(localRecipientResolver.resolve(Username.of(ALICE)))
+            .thenReturn(Mono.just(Optional.of(new LocalRecipientResolver.ResolvedRecipient.LocalUser(new OpenPaaSId(LOCAL_USER_ID)))));
+        stubItipNoContent();
+
+        String payload = """
+            {
+              "sender": "mailto:%s",
+              "method": "REQUEST",
+              "uid": "%s",
+              "calendarId": "%s",
+              "message": %s,
+              "hasChange": true,
+              "recipients": ["mailto:%s", "mailto:%s"]
+            }
+            """.formatted(BOB, EVENT_UID, CALENDAR_ID, jsonString(SIMPLE_ICAL), ALICE, "invalid@domain@address");
+
+        publishToConsumer(payload);
+
+        AWAIT_AT_MOST.untilAsserted(() ->
+            WireMock.verify(WireMock.postRequestedFor(WireMock.urlEqualTo("/itip"))
+                .withRequestBody(WireMock.matchingJsonPath("$.recipient", WireMock.equalTo(ALICE)))));
+
+        // The invalid recipient is ignored (acked), not dead-lettered.
+        assertThat(channel.basicGet(ItipLocalDeliveryConsumer.DEAD_LETTER_QUEUE, true)).isNull();
     }
 
     @Test

@@ -54,7 +54,6 @@ import com.linagora.calendar.app.modules.CalendarDataProbe;
 import com.linagora.calendar.dav.CalDavClient;
 import com.linagora.calendar.dav.DavModuleTestHelper;
 import com.linagora.calendar.dav.DavTestHelper;
-import com.linagora.calendar.dav.DockerSabreDavSetup;
 import com.linagora.calendar.dav.SabreDavExtension;
 import com.linagora.calendar.dav.dto.SubscribedCalendarRequest;
 import com.linagora.calendar.restapi.RestApiConfiguration;
@@ -84,7 +83,7 @@ class DownloadCalendarRouteTest {
 
     @RegisterExtension
     @Order(1)
-    static SabreDavExtension sabreDavExtension = new SabreDavExtension(DockerSabreDavSetup.SINGLETON);
+    static SabreDavExtension sabreDavExtension = SabreDavExtension.shared();
 
     @RegisterExtension
     @Order(2)
@@ -187,6 +186,7 @@ class DownloadCalendarRouteTest {
             {
                 "error": {
                     "code": 403,
+                    "type": "Forbidden",
                     "message": "Forbidden",
                     "details": "Token validation failed"
                 }
@@ -217,6 +217,7 @@ class DownloadCalendarRouteTest {
         {
             "error": {
                 "code": 403,
+                "type": "Forbidden",
                 "message": "Forbidden",
                 "details": "Token validation failed"
             }
@@ -251,6 +252,7 @@ class DownloadCalendarRouteTest {
         {
             "error": {
                 "code": 400,
+                "type": "BadRequest",
                 "message": "Bad Request",
                 "details": "Invalid token: only letters, digits, hyphen, and underscore are allowed."
             }
@@ -294,6 +296,7 @@ class DownloadCalendarRouteTest {
         {
             "error": {
                 "code": 403,
+                "type": "Forbidden",
                 "message": "Forbidden",
                 "details": "Token validation failed"
             }
@@ -327,6 +330,7 @@ class DownloadCalendarRouteTest {
                 {
                     "error": {
                         "code": 503,
+                        "type": "ServiceUnavailable",
                         "message": "Service Unavailable",
                         "details": "Service Unavailable"
                     }
@@ -539,6 +543,7 @@ class DownloadCalendarRouteTest {
                 {
                     "error": {
                         "code": 404,
+                        "type": "NotFound",
                         "message": "Not Found",
                         "details": "${json-unit.ignore}"
                     }
@@ -729,6 +734,7 @@ class DownloadCalendarRouteTest {
                 {
                     "error": {
                         "code": 404,
+                        "type": "NotFound",
                         "message": "Not Found",
                         "details": "${json-unit.ignore}"
                     }

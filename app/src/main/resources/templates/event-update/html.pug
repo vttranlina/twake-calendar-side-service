@@ -193,7 +193,7 @@ div(style='')
                                             a.link(href=`//${content.event.location.value}` style='text-decoration: none; color: #4d91c9;') #{content.event.location.value}
                                         else
                                           | #{content.event.location.value} (
-                                          a(href=`https://www.openstreetmap.org/search?query=${content.event.location.value}`) #{translator.get('see_in_map')}
+                                          a(href=`https://www.openstreetmap.org/search?query=${content.event.location.urlEncodedValue}`) #{translator.get('see_in_map')}
                                           | )
                                   else if (content.changes && content.changes.location && content.changes.location.previous)
                                     tr
@@ -217,7 +217,7 @@ div(style='')
                                     tr
                                       td(valign='top')
                                         strong #{translator.get('notes')}
-                                      td
+                                      td(style='white-space: pre-line;')
                                         if (content.changes && content.changes.description)
                                           if (content.changes.description.previous)
                                             span(style="color: orange; font-weight: bold;") #{translator.get('changed')}:&nbsp;
@@ -230,7 +230,7 @@ div(style='')
                                     tr
                                       td(valign='top')
                                         strong #{translator.get('notes')}
-                                      td
+                                      td(style='white-space: pre-line;')
                                         span(style="color: red; font-weight: bold;") #{translator.get('removed')}:&nbsp;
                                         span(style="text-decoration: line-through;") #{content.changes.description.previous}
                             tr

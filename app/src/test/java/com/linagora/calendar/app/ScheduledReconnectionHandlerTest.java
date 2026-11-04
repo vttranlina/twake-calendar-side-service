@@ -31,8 +31,8 @@ import org.apache.james.utils.GuiceProbe;
 import org.junit.jupiter.api.Order;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.RegisterExtension;
-import org.testcontainers.shaded.org.awaitility.Awaitility;
-import org.testcontainers.shaded.org.awaitility.core.ConditionFactory;
+import org.awaitility.Awaitility;
+import org.awaitility.core.ConditionFactory;
 
 import com.google.common.collect.ImmutableList;
 import com.google.inject.multibindings.Multibinder;
@@ -133,8 +133,12 @@ public class ScheduledReconnectionHandlerTest {
                 "tcalendar:event:cancel:notification",
                 "tcalendar:event:request:notification",
                 "tcalendar:event:reply:notification",
+                "tcalendar:contact:created:notification",
+                "tcalendar:contact:updated:notification",
+                "tcalendar:contact:deleted:notification",
                 "tcalendar:calendar:delegated:created",
                 "tcalendar:calendar:list:notification",
-                "tcalendar:itip:localDelivery");
+                "tcalendar:itip:localDelivery",
+                "tcalendar:audit");
     }
 }
