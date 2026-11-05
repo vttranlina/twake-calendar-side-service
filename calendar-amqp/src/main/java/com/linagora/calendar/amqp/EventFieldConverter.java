@@ -27,6 +27,7 @@ import java.util.function.Function;
 import java.util.stream.Collectors;
 import java.util.stream.StreamSupport;
 
+import org.apache.commons.lang3.StringUtils;
 import org.apache.commons.lang3.Strings;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -62,12 +63,16 @@ public class EventFieldConverter {
         CalendarURL calendarURL = extractCalendarURL(paths, eventMessage.eventPath);
         String resourceName = paths.get(3);
 
-        return CalendarEvents.of(extractVEventProperties(eventMessage.calendarEvent).stream()
-            .map(listEventProperties -> from(listEventProperties)
-                .calendarURL(calendarURL)
-                .resourceName(resourceName)
-                .build())
-            .collect(Collectors.toSet()));
+        try {
+            return CalendarEvents.of(extractVEventProperties(eventMessage.calendarEvent).stream()
+                .map(listEventProperties -> from(listEventProperties)
+                    .calendarURL(calendarURL)
+                    .resourceName(resourceName)
+                    .build())
+                .collect(Collectors.toSet()));
+        } catch (CalendarEventDeserializeException e) {
+            throw new CalendarEventDeserializeException("Cannot extract calendar events from " + eventMessage.eventPath, e);
+        }
     }
 
     public static CalendarURL extractCalendarURL(String eventPath) {
@@ -126,7 +131,8 @@ public class EventFieldConverter {
                     builder.recurrenceId(property.value);
                 }
                 case EventProperty.RRULE_PROPERTY -> builder.isRecurrentMaster(true);
-                case EventProperty.SEQUENCE_PROPERTY -> builder.sequence(((SequenceProperty) property).getSequence());
+                // Like EventFields.fromVEvent, leave an unreadable SEQUENCE absent rather than fail indexing.
+                case EventProperty.SEQUENCE_PROPERTY -> Optional.ofNullable(((SequenceProperty) property).getSequence()).ifPresent(builder::sequence);
                 case EventProperty.VIDEOCONFERENCE -> builder.videoconferenceUrl(property.value);
                 case EventProperty.BOOKING_LINK -> builder.bookingLinkId(property.value);
                 default -> {
@@ -224,6 +230,12 @@ public class EventFieldConverter {
             JsonNode param = node.get(1);
             String valueType = node.get(2).asText();
             String value = Optional.ofNullable(node.get(3)).map(JsonNode::asText).orElse(null);
+
+            if (EventProperty.RECURRENCE_ID_PROPERTY.equals(name)
+                && (node.get(3) == null || !node.get(3).isTextual() || StringUtils.isBlank(value))) {
+                // Reject the whole snapshot: dropping an unidentified override could prune valid indexed occurrences.
+                throw new CalendarEventDeserializeException("RECURRENCE-ID must have a non-blank date value");
+            }
 
             EventProperty eventProperty = new EventProperty(name, param, valueType, value);
 
