@@ -775,6 +775,25 @@ class ItipEmailNotificationPublisherTest {
         }
 
         @Test
+        void addedExDateShouldStillCancelWhenMasterHasAnUnreadableDateInANestedComponent() {
+            // Relaxed parsing keeps this invalid nested VEVENT; it must not prevent cancelling an occurrence.
+            String previous = RECURRING_OLD_NO_EXDATE.replace("END:VEVENT", """
+                BEGIN:VEVENT
+                EXDATE;TZID=Europe/Paris:ple.com
+                END:VEVENT
+                END:VEVENT""");
+            String current = withExDate(previous, "20260408T100000Z");
+
+            List<NotificationEmailDTO> notifications = request(current, previous);
+
+            assertThat(notifications).singleElement().satisfies(notification -> {
+                assertThat(notification.method()).isEqualTo(Method.VALUE_CANCEL);
+                assertThat(notification.event()).contains("RECURRENCE-ID:20260408T100000Z")
+                    .doesNotContain(":ple.com");
+            });
+        }
+
+        @Test
         void requestWithOldAndNewExDateShouldGenerateCancelNotification() {
             String recurringNewWithExDate = """
                 BEGIN:VCALENDAR
